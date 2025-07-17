@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 
 	operatorpkg "github.com/awslabs/operatorpkg/test/expectations"
 	. "github.com/onsi/ginkgo/v2"
@@ -30,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -310,5 +312,45 @@ var _ = Describe("Liveness", func() {
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	Context("HighScale Profile", func() {
+		It("should use extended registration timeout for HighScale profile", func() {
+			ctxHighScale := options.ToContext(ctx, test.Options(test.OptionsFields{
+				ClusterProfile: lo.ToPtr(options.ClusterProfileHighScale),
+			}))
+			nodeClaim := test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey: nodePool.Name,
+					},
+				},
+				Spec: v1.NodeClaimSpec{
+					Resources: v1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:      resource.MustParse("2"),
+							corev1.ResourceMemory:   resource.MustParse("50Mi"),
+							corev1.ResourcePods:     resource.MustParse("5"),
+							fake.ResourceGPUVendorA: resource.MustParse("1"),
+						},
+					},
+				},
+			})
+			ExpectApplied(ctxHighScale, env.Client, nodePool, nodeClaim)
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+			ExpectApplied(ctxHighScale, env.Client, nodeClaim)
+			ExpectObjectReconciled(ctxHighScale, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctxHighScale, env.Client, nodeClaim)
+
+			// Step the clock (should not be deprovisioned with HighScale profile)
+			fakeClock.Step(time.Minute * 20)
+			ExpectObjectReconciled(ctxHighScale, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctxHighScale, env.Client, nodeClaim)
+
+			// Step the clock to total of 65 min (should be deprovisioned with HighScale profile)
+			fakeClock.Step(time.Minute * 45)
+			ExpectObjectReconciled(ctxHighScale, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctxHighScale, env.Client, nodeClaim)
+			ExpectNotFound(ctxHighScale, env.Client, nodeClaim)
+		})
 	})
 })

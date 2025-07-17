@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +33,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 type Liveness struct {
@@ -39,12 +41,10 @@ type Liveness struct {
 	kubeClient client.Client
 }
 
-// registrationTimeout is a heuristic time that we expect the node to register within
 // launchTimeout is a heuristic time that we expect to be able to launch within
 // If we don't see the node within this time, then we should delete the NodeClaim and try again
 
 const (
-	registrationTimeout       = time.Minute * 15
 	registrationTimeoutReason = "registration_timeout"
 	launchTimeout             = time.Minute * 5
 	launchTimeoutReason       = "launch_timeout"
@@ -55,16 +55,10 @@ type NodeClaimTimeout struct {
 	reason   string
 }
 
-var (
-	RegistrationTimeout = NodeClaimTimeout{
-		duration: registrationTimeout,
-		reason:   registrationTimeoutReason,
-	}
-	LaunchTimeout = NodeClaimTimeout{
-		duration: launchTimeout,
-		reason:   launchTimeoutReason,
-	}
-)
+var LaunchTimeout = NodeClaimTimeout{
+	duration: launchTimeout,
+	reason:   launchTimeoutReason,
+}
 
 //nolint:gocyclo
 func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
@@ -90,6 +84,14 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 	}
 	if registered == nil {
 		return reconcile.Result{Requeue: true}, nil
+	}
+	opts := options.FromContext(ctx)
+	highScaleProfile := opts.ClusterProfile == options.ClusterProfileHighScale
+	// registrationTimeout is a heuristic time that we expect the node to register within
+	registrationTimeout := lo.Ternary(highScaleProfile, time.Hour, time.Minute*15)
+	RegistrationTimeout := NodeClaimTimeout{
+		duration: registrationTimeout,
+		reason:   registrationTimeoutReason,
 	}
 	// If the Registered statusCondition hasn't gone True during the timeout since we first updated it, we should terminate the NodeClaim
 	// NOTE: Timeout has to be stored and checked in the same place since l.clock can advance after the check causing a race

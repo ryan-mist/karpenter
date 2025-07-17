@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/result"
 )
@@ -79,7 +80,21 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 	}
 }
 
-func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
+	opts := options.FromContext(ctx)
+	highScaleProfile := opts.ClusterProfile == options.ClusterProfileHighScale
+	maxConcurrentReconciles := lo.Ternary(highScaleProfile, 5000, 1000)
+	var rateLimiter workqueue.TypedRateLimiter[reconcile.Request]
+	if highScaleProfile {
+		rateLimiter = workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Second*10)
+	} else {
+		rateLimiter = workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
+			// back off until last attempt occurs ~90 seconds before nodeclaim expiration
+			workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Minute),
+			// 10 qps, 100 bucket size
+			&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+		)
+	}
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
@@ -88,13 +103,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
 		).
 		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
-				// back off until last attempt occurs ~90 seconds before nodeclaim expiration
-				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, time.Minute),
-				// 10 qps, 100 bucket size
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
-			),
-			MaxConcurrentReconciles: 1000, // higher concurrency limit since we want fast reaction to node syncing and launch
+			RateLimiter:             rateLimiter,
+			MaxConcurrentReconciles: maxConcurrentReconciles, // higher concurrency limit since we want fast reaction to node syncing and launch
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

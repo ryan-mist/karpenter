@@ -20,9 +20,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
@@ -412,6 +414,49 @@ var _ = Describe("Queue", func() {
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim2)
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
+		})
+	})
+	Context("HighScale Profile", func() {
+		It("should use higher timeout for HighScale profile", func() {
+			ctxHighScale := options.ToContext(ctx, test.Options(test.OptionsFields{
+				ClusterProfile: lo.ToPtr(options.ClusterProfileHighScale),
+			}))
+			ExpectApplied(ctxHighScale, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctxHighScale, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			replacements := []*disruption.Replacement{
+				{
+					NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct},
+				},
+			}
+
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder),
+				CreationTimestamp: fakeClock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode}},
+				Replacements:      replacements,
+			}
+			Expect(queue.StartCommand(ctxHighScale, cmd)).To(BeNil())
+
+			// Step the clock (should not timeout with HighScale profile)
+			fakeClock.Step(11 * time.Minute)
+
+			ExpectObjectReconciled(ctxHighScale, env.Client, queue, stateNode.NodeClaim)
+			node1 = ExpectNodeExists(ctxHighScale, env.Client, node1.Name)
+			// Node should still be tainted (as not timed out)
+			Expect(node1.Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
+
+			// Step the clock to total of 61 min (should timeout with HighScale profile)
+			fakeClock.Step(50 * time.Minute)
+
+			ExpectObjectReconciled(ctxHighScale, env.Client, queue, stateNode.NodeClaim)
+			node1 = ExpectNodeExists(ctxHighScale, env.Client, node1.Name)
+			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
 		})
 	})
 })

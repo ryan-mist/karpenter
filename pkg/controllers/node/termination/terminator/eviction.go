@@ -48,6 +48,7 @@ import (
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -108,7 +109,21 @@ func (q *Queue) Name() string {
 	return "eviction-queue"
 }
 
-func (q *Queue) Register(_ context.Context, m manager.Manager) error {
+func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
+	opts := options.FromContext(ctx)
+	highScaleProfile := opts.ClusterProfile == options.ClusterProfileHighScale
+	maxConcurrentReconciles := lo.Ternary(highScaleProfile, 5000, 100)
+	var rateLimiter workqueue.TypedRateLimiter[reconcile.Request]
+	if highScaleProfile {
+		rateLimiter = workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
+			workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
+		)
+	} else {
+		rateLimiter = workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
+			workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
+			&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(100), 1000)},
+		)
+	}
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(q.Name()).
 		WatchesRawSource(source.Channel(q.source, handler.TypedFuncs[*corev1.Pod, reconcile.Request]{
@@ -119,11 +134,8 @@ func (q *Queue) Register(_ context.Context, m manager.Manager) error {
 			},
 		})).
 		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
-				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(100), 1000)},
-			),
-			MaxConcurrentReconciles: 100,
+			RateLimiter:             rateLimiter,
+			MaxConcurrentReconciles: maxConcurrentReconciles,
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), q))
 }

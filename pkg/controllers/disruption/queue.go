@@ -46,6 +46,7 @@ import (
 
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -58,10 +59,8 @@ import (
 )
 
 const (
-	queueBaseDelay          = 1 * time.Second
-	queueMaxDelay           = 10 * time.Second
-	maxRetryDuration        = 10 * time.Minute
-	maxConcurrentReconciles = 100
+	queueBaseDelay = 1 * time.Second
+	queueMaxDelay  = 10 * time.Second
 )
 
 type UnrecoverableError struct {
@@ -109,7 +108,10 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 	return queue
 }
 
-func (q *Queue) Register(_ context.Context, m manager.Manager) error {
+func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
+	opts := options.FromContext(ctx)
+	highScaleProfile := opts.ClusterProfile == options.ClusterProfileHighScale
+	maxConcurrentReconciles := lo.Ternary(highScaleProfile, 1000, 100)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("disruption.queue").
 		WatchesRawSource(source.Channel(q.source, &handler.TypedEnqueueRequestForObject[*v1.NodeClaim]{})).
@@ -170,6 +172,9 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
+		opts := options.FromContext(ctx)
+		highScaleProfile := opts.ClusterProfile == options.ClusterProfileHighScale
+		maxRetryDuration := lo.Ternary(highScaleProfile, time.Hour, 10*time.Minute)
 		if q.clock.Since(cmd.CreationTimestamp) > maxRetryDuration {
 			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
 		}
