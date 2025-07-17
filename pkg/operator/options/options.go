@@ -44,6 +44,48 @@ const (
 	MinValuesPolicyBestEffort MinValuesPolicy = "BestEffort"
 )
 
+type ClusterProfile struct {
+	Name                      ClusterProfileName
+	MaxConcurrentReconciles   map[string]int
+	RegistrationTTL           time.Duration
+	GarbageCollectionInterval time.Duration
+}
+
+type ClusterProfileName string
+
+const (
+	ClusterProfileNameStandard  ClusterProfileName = "Standard"
+	ClusterProfileNameHighScale ClusterProfileName = "HighScale"
+)
+
+// TODO: will need to change values later on
+var (
+	ClusterConfigHighScale = ClusterProfile{
+		Name: ClusterProfileNameHighScale,
+		MaxConcurrentReconciles: map[string]int{
+			"nodepool":     50,
+			"nodeclaim":    2000,
+			"provisioning": 50,
+			"disruption":   1000,
+			"termination":  200,
+		},
+		RegistrationTTL:           30 * time.Minute,
+		GarbageCollectionInterval: 5 * time.Minute,
+	}
+	ClusterConfigStandard = ClusterProfile{
+		Name: ClusterProfileNameStandard,
+		MaxConcurrentReconciles: map[string]int{
+			"nodepool":     10,
+			"nodeclaim":    1000,
+			"provisioning": 10,
+			"disruption":   100,
+			"termination":  100,
+		},
+		RegistrationTTL:           15 * time.Minute,
+		GarbageCollectionInterval: 2 * time.Minute,
+	}
+)
+
 var (
 	validLogLevels          = []string{"", "debug", "info", "error"}
 	validPreferencePolicies = []PreferencePolicy{PreferencePolicyIgnore, PreferencePolicyRespect}
@@ -83,6 +125,8 @@ type Options struct {
 	PreferencePolicy        PreferencePolicy
 	minValuesPolicyRaw      string
 	MinValuesPolicy         MinValuesPolicy
+	clusterProfileRaw       string
+	ClusterProfile          ClusterProfile
 	FeatureGates            FeatureGates
 }
 
@@ -122,6 +166,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.DurationVar(&o.BatchIdleDuration, "batch-idle-duration", env.WithDefaultDuration("BATCH_IDLE_DURATION", time.Second), "The maximum amount of time with no new pending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately.")
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
+	fs.StringVar(&o.clusterProfileRaw, "cluster-profile", env.WithDefaultString("CLUSTER_PROFILE", string(ClusterProfileNameStandard)), "Cluster profile for tuning Karpenter's performance characteristics. 'Standard' uses default settings suitable for most clusters. 'HighScale' optimizes for large-scale clusters with many nodes.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, and SpotToSpotConsolidation.")
 }
 
@@ -141,6 +186,9 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if !lo.Contains([]MinValuesPolicy{MinValuesPolicyStrict, MinValuesPolicyBestEffort}, MinValuesPolicy(o.minValuesPolicyRaw)) {
 		return fmt.Errorf("validating cli flags / env vars, invalid MIN_VALUES_POLICY %q", o.minValuesPolicyRaw)
 	}
+	if !lo.Contains([]ClusterProfileName{ClusterProfileNameStandard, ClusterProfileNameHighScale}, ClusterProfileName(o.clusterProfileRaw)) {
+		return fmt.Errorf("validating cli flags / env vars, invalid CLUSTER_PROFILE %q", o.clusterProfileRaw)
+	}
 	if o.CPURequests <= 0 {
 		return fmt.Errorf("validating cli flags / env vars, invalid CPU_REQUESTS %d, must be positive", o.CPURequests)
 	}
@@ -151,7 +199,18 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	o.FeatureGates = gates
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
+	cpn := ClusterProfileName(o.clusterProfileRaw)
+	o.ClusterProfile = o.getClusterConfig(cpn)
 	return nil
+}
+
+func (o *Options) getClusterConfig(cpn ClusterProfileName) ClusterProfile {
+	switch cpn {
+	case ClusterProfileNameHighScale:
+		return ClusterConfigHighScale
+	default:
+		return ClusterConfigStandard
+	}
 }
 
 func (o *Options) ToContext(ctx context.Context) context.Context {

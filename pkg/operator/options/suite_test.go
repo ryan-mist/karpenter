@@ -62,6 +62,7 @@ var _ = Describe("Options", func() {
 		"BATCH_IDLE_DURATION",
 		"PREFERENCE_POLICY",
 		"MIN_VALUES_POLICY",
+		"CLUSTER_PROFILE",
 		"FEATURE_GATES",
 	}
 
@@ -116,6 +117,7 @@ var _ = Describe("Options", func() {
 				BatchIdleDuration:       lo.ToPtr(time.Second),
 				PreferencePolicy:        lo.ToPtr(options.PreferencePolicyRespect),
 				MinValuesPolicy:         lo.ToPtr(options.MinValuesPolicyStrict),
+				ClusterProfile:          lo.ToPtr(options.ClusterConfigStandard),
 				FeatureGates: test.FeatureGates{
 					ReservedCapacity:        lo.ToPtr(true),
 					NodeRepair:              lo.ToPtr(false),
@@ -146,6 +148,7 @@ var _ = Describe("Options", func() {
 				"--batch-idle-duration", "5s",
 				"--preference-policy", "Ignore",
 				"--min-values-policy", "BestEffort",
+				"--cluster-profile", "HighScale",
 				"--feature-gates", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true",
 			)
 			Expect(err).To(BeNil())
@@ -167,6 +170,7 @@ var _ = Describe("Options", func() {
 				BatchIdleDuration:       lo.ToPtr(5 * time.Second),
 				PreferencePolicy:        lo.ToPtr(options.PreferencePolicyIgnore),
 				MinValuesPolicy:         lo.ToPtr(options.MinValuesPolicyBestEffort),
+				ClusterProfile:          lo.ToPtr(options.ClusterConfigHighScale),
 				FeatureGates: test.FeatureGates{
 					ReservedCapacity:        lo.ToPtr(false),
 					NodeRepair:              lo.ToPtr(true),
@@ -193,6 +197,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("BATCH_IDLE_DURATION", "5s")
 			os.Setenv("PREFERENCE_POLICY", "Ignore")
 			os.Setenv("MIN_VALUES_POLICY", "BestEffort")
+			os.Setenv("CLUSTER_PROFILE", "HighScale")
 			os.Setenv("FEATURE_GATES", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true")
 			fs = &options.FlagSet{
 				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
@@ -218,6 +223,7 @@ var _ = Describe("Options", func() {
 				BatchIdleDuration:       lo.ToPtr(5 * time.Second),
 				PreferencePolicy:        lo.ToPtr(options.PreferencePolicyIgnore),
 				MinValuesPolicy:         lo.ToPtr(options.MinValuesPolicyBestEffort),
+				ClusterProfile:          lo.ToPtr(options.ClusterConfigHighScale),
 				FeatureGates: test.FeatureGates{
 					ReservedCapacity:        lo.ToPtr(false),
 					NodeRepair:              lo.ToPtr(true),
@@ -239,6 +245,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("BATCH_IDLE_DURATION", "5s")
 			os.Setenv("PREFERENCE_POLICY", "Ignore")
 			os.Setenv("MIN_VALUES_POLICY", "BestEffort")
+			os.Setenv("CLUSTER_PROFILE", "HighScale")
 			os.Setenv("FEATURE_GATES", "ReservedCapacity=false,SpotToSpotConsolidation=true,NodeRepair=true")
 			fs = &options.FlagSet{
 				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
@@ -251,6 +258,7 @@ var _ = Describe("Options", func() {
 				"--log-error-output-paths", "/etc/k8s/testerror",
 				"--preference-policy", "Respect",
 				"--min-values-policy", "Strict",
+				"--cluster-profile", "Standard",
 			)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
@@ -271,6 +279,7 @@ var _ = Describe("Options", func() {
 				BatchIdleDuration:       lo.ToPtr(5 * time.Second),
 				PreferencePolicy:        lo.ToPtr(options.PreferencePolicyRespect),
 				MinValuesPolicy:         lo.ToPtr(options.MinValuesPolicyStrict),
+				ClusterProfile:          lo.ToPtr(options.ClusterConfigStandard),
 				FeatureGates: test.FeatureGates{
 					ReservedCapacity:        lo.ToPtr(false),
 					NodeRepair:              lo.ToPtr(true),
@@ -358,6 +367,7 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.BatchIdleDuration).To(Equal(optsB.BatchIdleDuration))
 	Expect(optsA.PreferencePolicy).To(Equal(optsB.PreferencePolicy))
 	Expect(optsA.MinValuesPolicy).To(Equal(optsB.MinValuesPolicy))
+	Expect(optsA.ClusterProfile).To(Equal(optsB.ClusterProfile))
 	Expect(optsA.FeatureGates.ReservedCapacity).To(Equal(optsB.FeatureGates.ReservedCapacity))
 	Expect(optsA.FeatureGates.NodeRepair).To(Equal(optsB.FeatureGates.NodeRepair))
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
