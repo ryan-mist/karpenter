@@ -483,42 +483,21 @@ func addVolumeRequirements(nodeRequirements scheduling.Requirements, volumeRequi
 	return nil
 }
 
-// computeEffectiveZoneFromSets calculates the effective zone constraint by intersecting:
-// 1. Zone requirements from combined pod + NodePool + volume + topology requirements
-// 2. Zones from instance type requirements (pre-collected during filtering)
-//
-// Returns:
-//   - Specific zone name (e.g., "us-west-2a") if constrained to exactly one zone
-//   - "flexible" if multiple zones are available or no specific zone requirements exist
-//   - "none" if there's no intersection (pod requirements and offerings have no common zones)
+// computeEffectiveZoneFromSets calculates the effective zone constraint by intersecting
+// zone requirements (from pod + NodePool + volume + topology) with the zones from the offerings.
 func computeEffectiveZoneFromSets(requirements scheduling.Requirements, offeringZones sets.Set[string]) string {
-	// Get zone requirements from combined requirements (pod + NodePool + volume + topology)
 	zoneReq := requirements.Get(corev1.LabelTopologyZone)
+	offeringZoneReq := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, offeringZones.UnsortedList()...)
+	effective := zoneReq.Intersection(offeringZoneReq)
 
-	// Extract required zones based on the operator
-	var requiredZones sets.Set[string]
-	if zoneReq.Operator() == corev1.NodeSelectorOpIn && len(zoneReq.Values()) > 0 {
-		requiredZones = sets.New(zoneReq.Values()...)
-	}
-	// If operator is Exists or no values, pod is zone-flexible (no specific requirements)
-
-	// Compute intersection
-	var effectiveZones sets.Set[string]
-	if requiredZones == nil || requiredZones.Len() == 0 {
-		// Pod has no specific zone requirements
-		effectiveZones = offeringZones
-	} else {
-		// Intersect required zones with offering zones
-		effectiveZones = requiredZones.Intersection(offeringZones)
-	}
-
-	// Determine the effective zone label
-	if effectiveZones.Len() == 0 {
-		return "none" // No intersection - misconfiguration
-	} else if effectiveZones.Len() == 1 {
-		// Return the specific zone name
-		return effectiveZones.UnsortedList()[0]
-	} else {
-		return "flexible" // Multiple zones available
+	// Len() gives the count of allowed zones because offeringZoneReq is always In (non-complement),
+	// guaranteeing the intersection result is also non-complement (a positive set of specific zones).
+	switch effective.Len() {
+	case 0:
+		return "none"
+	case 1:
+		return effective.Values()[0]
+	default:
+		return "flexible"
 	}
 }
