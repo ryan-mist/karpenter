@@ -431,8 +431,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		m.FinalizeScheduling()
 	}
 
-	// Track pending pods by effective zone constraint
-	s.trackPendingPodsByEffectiveZone(ctx, podErrors)
+	s.trackPendingPodsByEffectiveZone(ctx)
 
 	return Results{
 		NewNodeClaims: s.newNodeClaims,
@@ -590,9 +589,7 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 		return true
 	})
 	if inflightNodeClaim != nil {
-		if effectiveZonePriority(bestEffectiveZone) > effectiveZonePriority(s.podEffectiveZones[pod.UID]) {
-			s.podEffectiveZones[pod.UID] = bestEffectiveZone
-		}
+		s.podEffectiveZones[pod.UID] = bestEffectiveZone
 		inflightNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
 		return nil
 	}
@@ -677,16 +674,12 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "false"
 		}
 
-		// Capture the best-case effectiveZone (most flexible) on successful scheduling only
-		if effectiveZonePriority(effZone) > effectiveZonePriority(s.podEffectiveZones[pod.UID]) {
-			s.podEffectiveZones[pod.UID] = effZone
-		}
-
 		newNodeClaim = nodeClaim
 		updatedRequirements = r
 		updatedInstanceTypes = its
 		offeringsToReserve = ofs
 		idx = i
+		s.podEffectiveZones[pod.UID] = effZone
 		return false
 	})
 	if newNodeClaim != nil {
@@ -766,27 +759,13 @@ func (s *Scheduler) sortExistingNodes() {
 	})
 }
 
-// effectiveZonePriority returns a numeric priority for zone flexibility (higher = more flexible).
-// Used to select the "best case" effective zone across multiple NodeClaimTemplates.
-// Priority: flexible (2) > specific zone (1) > none/empty (0)
-func effectiveZonePriority(zone string) int {
-	switch zone {
-	case "flexible":
-		return 2
-	case "none", "":
-		return 0
-	default:
-		return 1 // specific zone name like "us-west-2a"
-	}
-}
-
 // trackPendingPodsByEffectiveZone tracks successfully scheduled pending pods dimensioned by their effective zone constraint.
 // The effective zone is computed by intersecting pod requirements (from pod, NodePool, volume, and topology)
 // with zones where instance type offerings exist. Only pods that successfully schedule (CanAdd returns no error)
 // have their effectiveZone captured. The effectiveZone is recorded during successful CanAdd() calls in
 // addToInflightNode and addToNewNodeClaim, leveraging the computation already performed in
 // filterInstanceTypesByRequirements with zero additional overhead.
-func (s *Scheduler) trackPendingPodsByEffectiveZone(ctx context.Context, podErrors map[*corev1.Pod]error) {
+func (s *Scheduler) trackPendingPodsByEffectiveZone(ctx context.Context) {
 	podCountByZone := make(map[string]int)
 
 	// Count ALL pods that have an effective zone computed (both scheduled and unscheduled)
