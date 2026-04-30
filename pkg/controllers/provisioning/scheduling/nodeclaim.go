@@ -111,23 +111,24 @@ func NewNodeClaim(
 
 // CanAdd returns whether the pod can be added to the NodeClaim
 // based on the taints/tolerations, host port compatibility,
-// requirements, resources, reserved capacity reservations, and topology requirements
-func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
+// requirements, resources, reserved capacity reservations, and topology requirements.
+// It also returns the effectiveZone computed by intersecting pod requirements with offering zones.
+func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, effectiveZone string, err error) {
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	// exposed host ports on the node
 	hostPorts := scheduling.GetHostPorts(pod)
 	if err := n.hostPortUsage.Conflicts(pod, hostPorts); err != nil {
-		return nil, nil, nil, fmt.Errorf("checking host port usage, %w", err)
+		return nil, nil, nil, "", fmt.Errorf("checking host port usage, %w", err)
 	}
 	nodeClaimRequirements := scheduling.NewRequirements(n.Requirements.Values()...)
 
 	// Check NodeClaim Affinity Requirements
 	if err := nodeClaimRequirements.Compatible(podData.Requirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, fmt.Errorf("incompatible requirements, %w", err)
+		return nil, nil, nil, "", fmt.Errorf("incompatible requirements, %w", err)
 	}
 	nodeClaimRequirements.Add(podData.Requirements.Values()...)
 
@@ -135,7 +136,7 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// This ensures NodeClaim is created in the correct zone for volumes,
 	// while TSC counting uses pod's original affinity.
 	if err := addVolumeRequirements(nodeClaimRequirements, podData.VolumeRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	// Check Topology Requirements
@@ -143,17 +144,17 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// ensuring TSC counting uses pod's original affinity.
 	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	if err = nodeClaimRequirements.Compatible(topologyRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
 	// Check instance type combinations
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
-	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests, relaxMinValues)
+	remaining, unsatisfiableKeys, effZone, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests, relaxMinValues)
 	if relaxMinValues {
 		// Update min values on the requirements if they are relaxed
 		for key, minValues := range unsatisfiableKeys {
@@ -163,13 +164,13 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	if err != nil {
 		// We avoid wrapping this err because calling String() on InstanceTypeFilterError is an expensive operation
 		// due to calls to resources.Merge and stringifying the nodeClaimRequirements
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	ofs, err := n.offeringsToReserve(ctx, remaining, nodeClaimRequirements)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
-	return nodeClaimRequirements, remaining, ofs, nil
+	return nodeClaimRequirements, remaining, ofs, effZone, nil
 }
 
 // Add updates the NodeClaim to schedule the pod to this NodeClaim, updating
@@ -324,16 +325,6 @@ type InstanceTypeFilterError struct {
 	podRequests corev1.ResourceList
 	// We capture daemonRequests since this contributes to the resources that are required to schedule to this NodePool
 	daemonRequests corev1.ResourceList
-
-	// effectiveZone represents the zone constraint after intersecting pod requirements with offering availability.
-	// This is computed by intersecting:
-	//   1. Zone requirements from pod + NodePool + volume + topology
-	//   2. Zones where instance type offerings exist (regardless of availability)
-	// Possible values:
-	//   - Specific zone name (e.g., "us-west-2a") - constrained to exactly one zone
-	//   - "flexible" - multiple zones available, or no specific zone requirements
-	//   - "none" - no intersection between required zones and offering zones (misconfiguration)
-	effectiveZone string
 }
 
 //nolint:gocyclo
@@ -390,7 +381,7 @@ func (e InstanceTypeFilterError) Error() string {
 }
 
 //nolint:gocyclo
-func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList, relaxMinValues bool) (cloudprovider.InstanceTypes, map[string]int, error) {
+func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList, relaxMinValues bool) (cloudprovider.InstanceTypes, map[string]int, string, error) {
 	unsatisfiableKeys := map[string]int{}
 	// We hold the results of our scheduling simulation inside of this InstanceTypeFilterError struct
 	// to reduce the CPU load of having to generate the error string for a failed scheduling simulation
@@ -463,12 +454,12 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 	}
 
 	// Compute effective zone by intersecting pod requirements with collected offering zones
-	err.effectiveZone = computeEffectiveZoneFromSets(requirements, offeringZones)
+	effectiveZone := computeEffectiveZoneFromSets(requirements, offeringZones)
 
 	if len(remaining) == 0 {
-		return nil, unsatisfiableKeys, err
+		return nil, unsatisfiableKeys, effectiveZone, err
 	}
-	return remaining, unsatisfiableKeys, nil
+	return remaining, unsatisfiableKeys, effectiveZone, nil
 }
 
 func compatible(instanceType *cloudprovider.InstanceType, requirements scheduling.Requirements) bool {

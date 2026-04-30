@@ -144,7 +144,7 @@ func NewScheduler(
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, corev1.ResourceList{}, corev1.ResourceList{}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+		nct.InstanceTypeOptions, _, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, corev1.ResourceList{}, corev1.ResourceList{}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
 		if len(nct.InstanceTypeOptions) == 0 {
 			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
 				recorder.Publish(NoCompatibleInstanceTypes(np, true))
@@ -167,6 +167,7 @@ func NewScheduler(
 		daemonHostPortUsage: getDaemonHostPortUsage(ctx, templates, daemonSetPods),
 		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
+		podEffectiveZones:   map[types.UID]string{},   // tracks effective zone per pod for metrics
 		recorder:            recorder,
 		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
@@ -201,6 +202,7 @@ type Scheduler struct {
 	daemonHostPortUsage     map[*NodeClaimTemplate]*scheduling.HostPortUsage
 	cachedPodData           map[types.UID]*PodData                // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID]scheduling.Requirements // Volume topology requirements per pod
+	podEffectiveZones       map[types.UID]string                  // tracks effective zone per pod for metrics (computed from offerings + requirements)
 	preferences             *Preferences
 	topology                *Topology
 	cluster                 *state.Cluster
@@ -440,7 +442,6 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 }
 
 func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
-	// i wonder if here we can track stuff here
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -496,10 +497,6 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
-	// TODO: maybe something here?
-	// -> get zonal requirements of the pod
-	// ->
-
 	// Check if pod has DRA requirements - if so, return DRA error when IgnoreDRARequests is enabled
 	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).IgnoreDRARequests {
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
@@ -571,8 +568,9 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 	var updatedRequirements scheduling.Requirements
 	var updatedInstanceTypes []*cloudprovider.InstanceType
 	var offeringsToReserve []*cloudprovider.Offering
+	var bestEffectiveZone string
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
-		r, its, ofr, err := s.newNodeClaims[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], false)
+		r, its, ofr, effZone, err := s.newNodeClaims[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], false)
 		if err == nil {
 			mu.Lock()
 			defer mu.Unlock()
@@ -585,12 +583,16 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 			updatedRequirements = r
 			updatedInstanceTypes = its
 			offeringsToReserve = ofr
+			bestEffectiveZone = effZone
 			idx = i
 			return false
 		}
 		return true
 	})
 	if inflightNodeClaim != nil {
+		if effectiveZonePriority(bestEffectiveZone) > effectiveZonePriority(s.podEffectiveZones[pod.UID]) {
+			s.podEffectiveZones[pod.UID] = bestEffectiveZone
+		}
 		inflightNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
 		return nil
 	}
@@ -631,7 +633,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			}
 		}
 		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverhead[s.nodeClaimTemplates[i]], s.daemonHostPortUsage[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
-		r, its, ofs, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+		r, its, ofs, effZone, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
 		if err != nil {
 			errs[i] = err
 
@@ -673,6 +675,11 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "true"
 		} else {
 			nodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "false"
+		}
+
+		// Capture the best-case effectiveZone (most flexible) on successful scheduling only
+		if effectiveZonePriority(effZone) > effectiveZonePriority(s.podEffectiveZones[pod.UID]) {
+			s.podEffectiveZones[pod.UID] = effZone
 		}
 
 		newNodeClaim = nodeClaim
@@ -759,24 +766,32 @@ func (s *Scheduler) sortExistingNodes() {
 	})
 }
 
-// trackPendingPodsByEffectiveZone tracks pending pods dimensioned by their effective zone constraint.
-// The effective zone is computed by intersecting pod requirements with instance type offering zones.
-// This method efficiently leverages the effectiveZone field that was already computed during
-// filterInstanceTypesByRequirements, avoiding redundant work.
+// effectiveZonePriority returns a numeric priority for zone flexibility (higher = more flexible).
+// Used to select the "best case" effective zone across multiple NodeClaimTemplates.
+// Priority: flexible (2) > specific zone (1) > none/empty (0)
+func effectiveZonePriority(zone string) int {
+	switch zone {
+	case "flexible":
+		return 2
+	case "none", "":
+		return 0
+	default:
+		return 1 // specific zone name like "us-west-2a"
+	}
+}
+
+// trackPendingPodsByEffectiveZone tracks successfully scheduled pending pods dimensioned by their effective zone constraint.
+// The effective zone is computed by intersecting pod requirements (from pod, NodePool, volume, and topology)
+// with zones where instance type offerings exist. Only pods that successfully schedule (CanAdd returns no error)
+// have their effectiveZone captured. The effectiveZone is recorded during successful CanAdd() calls in
+// addToInflightNode and addToNewNodeClaim, leveraging the computation already performed in
+// filterInstanceTypesByRequirements with zero additional overhead.
 func (s *Scheduler) trackPendingPodsByEffectiveZone(ctx context.Context, podErrors map[*corev1.Pod]error) {
-	// Group pods by effective zone
 	podCountByZone := make(map[string]int)
 
-	for _, err := range podErrors {
-		// Skip pods with special error types that don't indicate scheduling failures
-		if IsReservedOfferingError(err) || IsDRAError(err) {
-			continue
-		}
-
-		// Extract effective zone from the error
-		if instanceTypeErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeErr.effectiveZone != "" {
-			podCountByZone[instanceTypeErr.effectiveZone]++
-		}
+	// Count ALL pods that have an effective zone computed (both scheduled and unscheduled)
+	for _, zone := range s.podEffectiveZones {
+		podCountByZone[zone]++
 	}
 
 	// Set metrics for each zone
