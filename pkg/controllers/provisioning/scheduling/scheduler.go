@@ -388,6 +388,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	podErrors := map[*corev1.Pod]error{}
 	// Reset the metric for the controller, so we don't keep old ids around
 	UnschedulablePodsCount.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
+	PendingPodsByEffectiveZone.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
 	QueueDepth.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
 	for _, p := range pods {
 		s.updateCachedPodData(p)
@@ -428,6 +429,9 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		m.FinalizeScheduling()
 	}
 
+	// Track pending pods by effective zone constraint
+	s.trackPendingPodsByEffectiveZone(ctx, podErrors)
+
 	return Results{
 		NewNodeClaims: s.newNodeClaims,
 		ExistingNodes: s.existingNodes,
@@ -436,6 +440,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 }
 
 func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
+	// i wonder if here we can track stuff here
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -491,6 +496,10 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
+	// TODO: maybe something here?
+	// -> get zonal requirements of the pod
+	// ->
+
 	// Check if pod has DRA requirements - if so, return DRA error when IgnoreDRARequests is enabled
 	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).IgnoreDRARequests {
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
@@ -748,6 +757,39 @@ func (s *Scheduler) sortExistingNodes() {
 		}
 		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
 	})
+}
+
+// trackPendingPodsByEffectiveZone tracks pending pods dimensioned by their effective zone constraint.
+// The effective zone is computed by intersecting pod requirements with instance type offering zones.
+// This method efficiently leverages the effectiveZone field that was already computed during
+// filterInstanceTypesByRequirements, avoiding redundant work.
+func (s *Scheduler) trackPendingPodsByEffectiveZone(ctx context.Context, podErrors map[*corev1.Pod]error) {
+	// Group pods by effective zone
+	podCountByZone := make(map[string]int)
+
+	for _, err := range podErrors {
+		// Skip pods with special error types that don't indicate scheduling failures
+		if IsReservedOfferingError(err) || IsDRAError(err) {
+			continue
+		}
+
+		// Extract effective zone from the error
+		if instanceTypeErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeErr.effectiveZone != "" {
+			podCountByZone[instanceTypeErr.effectiveZone]++
+		}
+	}
+
+	// Set metrics for each zone
+	controllerName := injection.GetControllerName(ctx)
+	for zone, count := range podCountByZone {
+		PendingPodsByEffectiveZone.Set(
+			float64(count),
+			map[string]string{
+				ControllerLabel: controllerName,
+				"zone":          zone,
+			},
+		)
+	}
 }
 
 // parallelizeUntil is an implementation of workqueue.ParallelizeUntil that modifies the

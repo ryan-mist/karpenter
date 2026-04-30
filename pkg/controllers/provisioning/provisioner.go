@@ -285,6 +285,8 @@ func (p *Provisioner) NewScheduler(
 		instanceTypes[np.Name] = its
 	}
 
+	// TODO METRIC - maybe soemthing here?
+
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
 	// Pods that fail volume topology lookup are excluded from scheduling.
@@ -336,6 +338,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		return scheduler.Results{}, err
 	}
 
+	// TODO Metric: also, do we just want pending pods??
 	pods := append(pendingPods, deletingNodePods...)
 	// nothing to schedule, so just return success
 	if len(pods) == 0 {

@@ -324,6 +324,16 @@ type InstanceTypeFilterError struct {
 	podRequests corev1.ResourceList
 	// We capture daemonRequests since this contributes to the resources that are required to schedule to this NodePool
 	daemonRequests corev1.ResourceList
+
+	// effectiveZone represents the zone constraint after intersecting pod requirements with offering availability.
+	// This is computed by intersecting:
+	//   1. Zone requirements from pod + NodePool + volume + topology
+	//   2. Zones where instance type offerings exist (regardless of availability)
+	// Possible values:
+	//   - Specific zone name (e.g., "us-west-2a") - constrained to exactly one zone
+	//   - "flexible" - multiple zones available, or no specific zone requirements
+	//   - "none" - no intersection between required zones and offering zones (misconfiguration)
+	effectiveZone string
 }
 
 //nolint:gocyclo
@@ -399,7 +409,14 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 	}
 	remaining := cloudprovider.InstanceTypes{}
 
+	// Collect zones from instance type requirements during filtering
+	// (zones come from NodeClass subnets, stored in instance type requirements)
+	offeringZones := sets.New[string]()
+
 	for _, it := range instanceTypes {
+		// Collect zones from this instance type's requirements
+		zones := it.Requirements.Get(corev1.LabelTopologyZone).Values()
+		offeringZones.Insert(zones...)
 		// the tradeoff to not short-circuiting on the filtering is that we can report much better error messages
 		// about why scheduling failed
 		itCompat := compatible(it, requirements)
@@ -444,6 +461,10 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 			}
 		}
 	}
+
+	// Compute effective zone by intersecting pod requirements with collected offering zones
+	err.effectiveZone = computeEffectiveZoneFromSets(requirements, offeringZones)
+
 	if len(remaining) == 0 {
 		return nil, unsatisfiableKeys, err
 	}
@@ -469,4 +490,44 @@ func addVolumeRequirements(nodeRequirements scheduling.Requirements, volumeRequi
 	}
 	nodeRequirements.Add(volumeRequirements.Values()...)
 	return nil
+}
+
+// computeEffectiveZoneFromSets calculates the effective zone constraint by intersecting:
+// 1. Zone requirements from combined pod + NodePool + volume + topology requirements
+// 2. Zones from instance type requirements (pre-collected during filtering)
+//
+// Returns:
+//   - Specific zone name (e.g., "us-west-2a") if constrained to exactly one zone
+//   - "flexible" if multiple zones are available or no specific zone requirements exist
+//   - "none" if there's no intersection (pod requirements and offerings have no common zones)
+func computeEffectiveZoneFromSets(requirements scheduling.Requirements, offeringZones sets.Set[string]) string {
+	// Get zone requirements from combined requirements (pod + NodePool + volume + topology)
+	zoneReq := requirements.Get(corev1.LabelTopologyZone)
+
+	// Extract required zones based on the operator
+	var requiredZones sets.Set[string]
+	if zoneReq.Operator() == corev1.NodeSelectorOpIn && len(zoneReq.Values()) > 0 {
+		requiredZones = sets.New(zoneReq.Values()...)
+	}
+	// If operator is Exists or no values, pod is zone-flexible (no specific requirements)
+
+	// Compute intersection
+	var effectiveZones sets.Set[string]
+	if requiredZones == nil || requiredZones.Len() == 0 {
+		// Pod has no specific zone requirements
+		effectiveZones = offeringZones
+	} else {
+		// Intersect required zones with offering zones
+		effectiveZones = requiredZones.Intersection(offeringZones)
+	}
+
+	// Determine the effective zone label
+	if effectiveZones.Len() == 0 {
+		return "none" // No intersection - misconfiguration
+	} else if effectiveZones.Len() == 1 {
+		// Return the specific zone name
+		return effectiveZones.UnsortedList()[0]
+	} else {
+		return "flexible" // Multiple zones available
+	}
 }
