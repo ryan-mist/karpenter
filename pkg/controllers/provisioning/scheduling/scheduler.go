@@ -589,7 +589,9 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 		return true
 	})
 	if inflightNodeClaim != nil {
-		s.podEffectiveZones[pod.UID] = bestEffectiveZone
+		if pod.Status.Phase == corev1.PodPending {
+			s.podEffectiveZones[pod.UID] = bestEffectiveZone
+		}
 		inflightNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
 		return nil
 	}
@@ -679,7 +681,9 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 		updatedInstanceTypes = its
 		offeringsToReserve = ofs
 		idx = i
-		s.podEffectiveZones[pod.UID] = effZone
+		if pod.Status.Phase == corev1.PodPending {
+			s.podEffectiveZones[pod.UID] = effZone
+		}
 		return false
 	})
 	if newNodeClaim != nil {
