@@ -127,6 +127,7 @@ var _ = AfterEach(func() {
 	scheduling.QueueDepth.Reset()
 	scheduling.DurationSeconds.Reset()
 	scheduling.UnschedulablePodsCount.Reset()
+	scheduling.PendingPodsByEffectiveZone.Reset()
 })
 
 var _ = Context("Scheduling", func() {
@@ -4160,6 +4161,197 @@ var _ = Context("Scheduling", func() {
 			m, ok := FindMetricWithLabelValues("karpenter_pods_scheduling_decision_duration_seconds", nil)
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Histogram.SampleCount)).To(BeNumerically("==", val+3))
+		})
+		It("should report 'flexible' effective zone when pod can schedule to multiple zones", func() {
+			nodePool = test.NodePool()
+			ExpectApplied(ctx, env.Client, nodePool)
+			pod := test.UnschedulablePod(test.PodOptions{Phase: corev1.PodPending})
+			ExpectApplied(ctx, env.Client, pod)
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "flexible"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+		})
+		It("should report specific zone when pod is zone-pinned via nodeSelector", func() {
+			nodePool = test.NodePool()
+			ExpectApplied(ctx, env.Client, nodePool)
+			pod := test.UnschedulablePod(test.PodOptions{
+				Phase:        corev1.PodPending,
+				NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-1"},
+			})
+			ExpectApplied(ctx, env.Client, pod)
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+		})
+		It("should report specific zone when NodePool restricts to a single zone", func() {
+			nodePool = test.NodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Requirements: []v1.NodeSelectorRequirementWithMinValues{
+								{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-2"}},
+							},
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool)
+			pods := test.UnschedulablePods(test.PodOptions{Phase: corev1.PodPending}, 3)
+			for _, p := range pods {
+				ExpectApplied(ctx, env.Client, p)
+			}
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 3))
+		})
+		It("should track multiple pods with different effective zone constraints", func() {
+			// Create two NodePools restricted to different zones so pods land on separate NodeClaims
+			nodePoolZone1 := test.NodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Requirements: []v1.NodeSelectorRequirementWithMinValues{
+								{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-1"}},
+							},
+						},
+					},
+				},
+			})
+			nodePoolZone2 := test.NodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Requirements: []v1.NodeSelectorRequirementWithMinValues{
+								{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-2"}},
+							},
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePoolZone1, nodePoolZone2)
+			podZone1 := test.UnschedulablePod(test.PodOptions{
+				Phase:        corev1.PodPending,
+				NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-1"},
+			})
+			podZone2 := test.UnschedulablePod(test.PodOptions{
+				Phase:        corev1.PodPending,
+				NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-2"},
+			})
+			ExpectApplied(ctx, env.Client, podZone1, podZone2)
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+
+			m, ok = FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+		})
+		It("should report effective zone when instance offerings only exist in 2 zones (simulating subnet-limited nodeclass)", func() {
+			// Simulate a nodeclass that only has subnets in 2 zones by creating instance types
+			// with offerings only in test-zone-1 and test-zone-2 (no test-zone-3)
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+				fake.NewInstanceType(fake.InstanceTypeOptions{
+					Name: "two-zone-instance",
+					Resources: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:    resource.MustParse("4"),
+						corev1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+					Offerings: []*cloudprovider.Offering{
+						{
+							Available: true,
+							Requirements: pscheduling.NewLabelRequirements(map[string]string{
+								v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+								corev1.LabelTopologyZone: "test-zone-1",
+							}),
+							Price: 1.0,
+						},
+						{
+							Available: true,
+							Requirements: pscheduling.NewLabelRequirements(map[string]string{
+								v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+								corev1.LabelTopologyZone: "test-zone-2",
+							}),
+							Price: 1.0,
+						},
+					},
+				}),
+			}
+			nodePool = test.NodePool()
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			// Create 2 pods with a zonal topology spread constraint
+			labels := map[string]string{"app": "zone-spread"}
+			pods := test.UnschedulablePods(test.PodOptions{
+				Phase:      corev1.PodPending,
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+					TopologyKey:       corev1.LabelTopologyZone,
+					WhenUnsatisfiable: corev1.DoNotSchedule,
+					LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+					MaxSkew:           1,
+				}},
+			}, 2)
+			for _, p := range pods {
+				ExpectApplied(ctx, env.Client, p)
+			}
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			// TSC forces one pod per zone; with only 2 zones available, each pod is pinned to its zone
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+
+			m, ok = FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+		})
+		It("should report specific zone when PVC restricts pod to a single zone", func() {
+			nodePool = test.NodePool()
+			sc := test.StorageClass(test.StorageClassOptions{
+				ObjectMeta:        metav1.ObjectMeta{Name: "zone-restricted-sc"},
+				Provisioner:       lo.ToPtr(csiProvider),
+				VolumeBindingMode: lo.ToPtr(storagev1.VolumeBindingWaitForFirstConsumer),
+				Zones:             []string{"test-zone-1"},
+			})
+			pvc := test.PersistentVolumeClaim(test.PersistentVolumeClaimOptions{
+				ObjectMeta:       metav1.ObjectMeta{Name: "zone-pinned-claim"},
+				StorageClassName: lo.ToPtr("zone-restricted-sc"),
+			})
+			ExpectApplied(ctx, env.Client, nodePool, sc, pvc)
+
+			pod := test.UnschedulablePod(test.PodOptions{
+				Phase:                  corev1.PodPending,
+				PersistentVolumeClaims: []string{pvc.Name},
+			})
+			ExpectApplied(ctx, env.Client, pod)
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			// The PVC's StorageClass restricts to test-zone-1, so the pod should be pinned there
+			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+			Expect(ok).To(BeTrue())
+			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 		})
 	})
 
