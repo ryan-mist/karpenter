@@ -485,6 +485,9 @@ func addVolumeRequirements(nodeRequirements scheduling.Requirements, volumeRequi
 
 // computeEffectiveZoneFromSets calculates the effective zone constraint by intersecting
 // zone requirements (from pod + NodePool + volume + topology) with the zones from the offerings.
+// Returns the specific zone name if exactly one zone remains, or "flexible" otherwise.
+// Note: an empty intersection (0 zones) is unreachable when called from a successful CanAdd(),
+// because no offerings would match and the pod would fail to schedule before we record this value.
 func computeEffectiveZoneFromSets(requirements scheduling.Requirements, offeringZones sets.Set[string]) string {
 	zoneReq := requirements.Get(corev1.LabelTopologyZone)
 	offeringZoneReq := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, offeringZones.UnsortedList()...)
@@ -492,12 +495,8 @@ func computeEffectiveZoneFromSets(requirements scheduling.Requirements, offering
 
 	// Len() gives the count of allowed zones because offeringZoneReq is always In (non-complement),
 	// guaranteeing the intersection result is also non-complement (a positive set of specific zones).
-	switch effective.Len() {
-	case 0:
-		return "none"
-	case 1:
+	if effective.Len() == 1 {
 		return effective.Values()[0]
-	default:
-		return "flexible"
 	}
+	return "flexible"
 }

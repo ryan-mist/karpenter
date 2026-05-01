@@ -98,7 +98,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "pending_pods_by_effective_zone",
-			Help:      "Pending pods dimensioned by effective zone constraint. The effective zone is computed by intersecting pod requirements (from pod, NodePool, volume, and topology) with zones where instance type offerings exist. Values: specific zone name (e.g., 'us-west-2a'), 'flexible' (multiple zones), or 'none' (no intersection).",
+			Help:      "Pending pods dimensioned by effective zone constraint. The effective zone is computed by intersecting pod requirements (from pod, NodePool, volume, and topology) with zones where instance type offerings exist. Values: specific zone name (e.g., 'us-west-2a') or 'flexible' (multiple zones).",
 		},
 		[]string{
 			ControllerLabel,
