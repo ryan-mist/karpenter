@@ -104,7 +104,7 @@ func (n *ExistingNode) CanAdd(pod *v1.Pod, podData *PodData, volumes scheduling.
 	// Check Topology Requirements
 	// NOTE: podData.StrictRequirements does NOT include volume requirements,
 	// ensuring TSC counting uses pod's original affinity.
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.cachedTaints, podData.StrictRequirements, nodeRequirements)
+	topologyRequirements, _, err := n.topology.AddRequirements(pod, n.cachedTaints, podData.StrictRequirements, nodeRequirements)
 	if err != nil {
 		return nil, err
 	}

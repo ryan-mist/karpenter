@@ -142,8 +142,7 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// Check Topology Requirements
 	// NOTE: podData.StrictRequirements does NOT include volume requirements,
 	// ensuring TSC counting uses pod's original affinity.
-	// here
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	topologyRequirements, tscZoneValidDomainCount, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, "", err
 	}
@@ -170,6 +169,10 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	ofs, err := n.offeringsToReserve(ctx, remaining, nodeClaimRequirements)
 	if err != nil {
 		return nil, nil, nil, "", err
+	}
+	// If a zonal TSC had multiple valid domains before the greedy pick, override to "flexible"
+	if tscZoneValidDomainCount > 1 {
+		effZone = "flexible"
 	}
 	return nodeClaimRequirements, remaining, ofs, effZone, nil
 }

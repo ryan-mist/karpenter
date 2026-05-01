@@ -4314,16 +4314,23 @@ var _ = Context("Scheduling", func() {
 			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
 			Expect(err).To(BeNil())
 
-			// TSC forces one pod per zone; with only 2 zones available, each pod is pinned to its zone
+			// The first pod has 2 valid zones → flexible.
+			// After the first pod is placed in one zone, maxSkew=1 forces the second pod to the remaining zone → zone-pinned.
 			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
-				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+				map[string]string{"controller": "provisioner", "zone": "flexible"})
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 
-			m, ok = FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
-				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
-			Expect(ok).To(BeTrue())
-			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
+			// The second pod should be pinned to the remaining zone
+			total := 0
+			for _, zone := range []string{"test-zone-1", "test-zone-2"} {
+				zm, zok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+					map[string]string{"controller": "provisioner", "zone": zone})
+				if zok {
+					total += int(lo.FromPtr(zm.Gauge.Value))
+				}
+			}
+			Expect(total).To(Equal(1), "expected 1 pod pinned to a specific zone")
 		})
 		It("should report specific zone when PVC restricts pod to a single zone", func() {
 			nodePool = test.NodePool()
@@ -4353,10 +4360,11 @@ var _ = Context("Scheduling", func() {
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 		})
-		It("should report specific zones (not flexible) when TSC spreads 2 pods across 3 available zones", func() {
+		It("should report flexible when TSC spreads 2 pods across 3 available zones", func() {
 			// Default fake instance types have offerings in test-zone-1, test-zone-2, test-zone-3
-			// With 2 pods and maxSkew=1 DoNotSchedule, the scheduler must place them in different zones,
-			// which means each pod's NodeClaim is zone-committed — they should NOT be "flexible"
+			// With 2 pods and maxSkew=1 DoNotSchedule, the scheduler greedy-picks one zone per pod,
+			// but before the pick, each pod had multiple valid zones. The metric reports the pre-pick
+			// zone flexibility: pod 1 has 3 valid zones, pod 2 has 2 valid zones → both are "flexible".
 			nodePool = test.NodePool()
 			ExpectApplied(ctx, env.Client, nodePool)
 
@@ -4377,21 +4385,18 @@ var _ = Context("Scheduling", func() {
 			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
 			Expect(err).To(BeNil())
 
-			// Both pods should be zone-pinned (not "flexible") because TSC forces different zones
-			_, flexibleExists := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+			// Both pods should be "flexible" because each had multiple valid zones before the greedy TSC pick
+			m, flexibleExists := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
 				map[string]string{"controller": "provisioner", "zone": "flexible"})
-			Expect(flexibleExists).To(BeFalse(), "expected no pods to be 'flexible' — TSC pins each to a specific zone")
+			Expect(flexibleExists).To(BeTrue(), "expected pods to be 'flexible' — TSC had multiple valid zones")
+			Expect(lo.FromPtr(m.Gauge.Value)).To(Equal(float64(2)), "expected 2 flexible pods")
 
-			// Count total pods across all specific zone labels
-			total := 0
+			// No pods should be zone-pinned to specific zones
 			for _, zone := range []string{"test-zone-1", "test-zone-2", "test-zone-3"} {
-				m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				_, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
 					map[string]string{"controller": "provisioner", "zone": zone})
-				if ok {
-					total += int(lo.FromPtr(m.Gauge.Value))
-				}
+				Expect(ok).To(BeFalse(), fmt.Sprintf("expected no pods pinned to %s", zone))
 			}
-			Expect(total).To(Equal(2), "expected exactly 2 pods pinned to specific zones")
 		})
 	})
 
