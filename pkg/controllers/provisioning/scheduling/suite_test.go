@@ -4353,6 +4353,46 @@ var _ = Context("Scheduling", func() {
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 		})
+		It("should report specific zones (not flexible) when TSC spreads 2 pods across 3 available zones", func() {
+			// Default fake instance types have offerings in test-zone-1, test-zone-2, test-zone-3
+			// With 2 pods and maxSkew=1 DoNotSchedule, the scheduler must place them in different zones,
+			// which means each pod's NodeClaim is zone-committed — they should NOT be "flexible"
+			nodePool = test.NodePool()
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			labels := map[string]string{"app": "tsc-3zone"}
+			pods := test.UnschedulablePods(test.PodOptions{
+				Phase:      corev1.PodPending,
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+					TopologyKey:       corev1.LabelTopologyZone,
+					WhenUnsatisfiable: corev1.DoNotSchedule,
+					LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+					MaxSkew:           1,
+				}},
+			}, 2)
+			for _, p := range pods {
+				ExpectApplied(ctx, env.Client, p)
+			}
+			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
+			Expect(err).To(BeNil())
+
+			// Both pods should be zone-pinned (not "flexible") because TSC forces different zones
+			_, flexibleExists := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "flexible"})
+			Expect(flexibleExists).To(BeFalse(), "expected no pods to be 'flexible' — TSC pins each to a specific zone")
+
+			// Count total pods across all specific zone labels
+			total := 0
+			for _, zone := range []string{"test-zone-1", "test-zone-2", "test-zone-3"} {
+				m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+					map[string]string{"controller": "provisioner", "zone": zone})
+				if ok {
+					total += int(lo.FromPtr(m.Gauge.Value))
+				}
+			}
+			Expect(total).To(Equal(2), "expected exactly 2 pods pinned to specific zones")
+		})
 	})
 
 	Describe("Reserved Instance Types", func() {

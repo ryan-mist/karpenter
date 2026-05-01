@@ -234,6 +234,7 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		if nodeRequirements.Has(topology.Key) {
 			nodeDomains = nodeRequirements.Get(topology.Key)
 		}
+		// here
 		domains := topology.Get(p, podDomains, nodeDomains)
 		if domains.Len() == 0 {
 			return nil, topologyError{
