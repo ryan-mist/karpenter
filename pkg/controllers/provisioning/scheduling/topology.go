@@ -224,12 +224,12 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
 // cannot be satisfied.
 // AddRequirements returns the topology-constrained requirements along with the number of valid
-// zone domains from TSC spread constraints (tscZoneValidDomainCount). This count reflects how
-// many zones satisfied the maxSkew constraint before the greedy single-zone pick. It is 0 when
+// zone domains from TSC spread constraints (tscZoneValidDomains). This set contains the
+// zones that satisfied the maxSkew constraint before the greedy single-zone pick. It is nil when
 // there is no zonal TSC. The metric layer uses this to decide "flexible" vs a specific zone.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, int, error) {
+func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, sets.Set[string], error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
-	tscZoneValidDomainCount := 0
+	var tscZoneValidDomains sets.Set[string]
 	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if podRequirements.Has(topology.Key) {
@@ -239,21 +239,21 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		if nodeRequirements.Has(topology.Key) {
 			nodeDomains = nodeRequirements.Get(topology.Key)
 		}
-		domains, validCount := topology.Get(p, podDomains, nodeDomains)
+		domains, validDomains := topology.Get(p, podDomains, nodeDomains)
 		if domains.Len() == 0 {
-			return nil, 0, topologyError{
+			return nil, nil, topologyError{
 				topology:    topology,
 				podDomains:  podDomains,
 				nodeDomains: nodeDomains,
 			}
 		}
-		// Track the valid domain count for zonal TSC spread constraints
-		if topology.Type == TopologyTypeSpread && topology.Key == corev1.LabelTopologyZone && validCount > 0 {
-			tscZoneValidDomainCount = validCount
+		// Track the valid domains for zonal TSC spread constraints
+		if topology.Type == TopologyTypeSpread && topology.Key == corev1.LabelTopologyZone && validDomains != nil && validDomains.Len() > 0 {
+			tscZoneValidDomains = validDomains
 		}
 		requirements.Add(domains)
 	}
-	return requirements, tscZoneValidDomainCount, nil
+	return requirements, tscZoneValidDomains, nil
 }
 
 // Register is used to register a domain as available across topologies for the given topology key.

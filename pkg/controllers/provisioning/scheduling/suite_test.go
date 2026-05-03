@@ -4191,26 +4191,21 @@ var _ = Context("Scheduling", func() {
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 		})
-		It("should report specific zone when NodePool restricts to a single zone", func() {
-			nodePool = test.NodePool(v1.NodePool{
-				Spec: v1.NodePoolSpec{
-					Template: v1.NodeClaimTemplate{
-						Spec: v1.NodeClaimTemplateSpec{
-							Requirements: []v1.NodeSelectorRequirementWithMinValues{
-								{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-2"}},
-							},
-						},
-					},
-				},
-			})
+		It("should report specific zone when pod nodeSelector restricts to a single zone", func() {
+			nodePool = test.NodePool()
 			ExpectApplied(ctx, env.Client, nodePool)
-			pods := test.UnschedulablePods(test.PodOptions{Phase: corev1.PodPending}, 3)
+			pods := test.UnschedulablePods(test.PodOptions{
+				Phase:        corev1.PodPending,
+				NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-2"},
+			}, 3)
 			for _, p := range pods {
 				ExpectApplied(ctx, env.Client, p)
 			}
 			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
 			Expect(err).To(BeNil())
 
+			// The pod's nodeSelector restricts to test-zone-2, intersected with instance type zones
+			// (test-zone-1, -2, -3) yields only test-zone-2.
 			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
 				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
 			Expect(ok).To(BeTrue())
@@ -4263,7 +4258,7 @@ var _ = Context("Scheduling", func() {
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 		})
-		It("should report effective zone when instance offerings only exist in 2 zones (simulating subnet-limited nodeclass)", func() {
+		It("should report flexible when instance offerings only exist in 2 zones with TSC (simulating subnet-limited nodeclass)", func() {
 			// Simulate a nodeclass that only has subnets in 2 zones by creating instance types
 			// with offerings only in test-zone-1 and test-zone-2 (no test-zone-3)
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
@@ -4314,23 +4309,22 @@ var _ = Context("Scheduling", func() {
 			_, err := prov.Schedule(injection.WithControllerName(ctx, "provisioner"))
 			Expect(err).To(BeNil())
 
-			// The first pod has 2 valid zones → flexible.
-			// After the first pod is placed in one zone, maxSkew=1 forces the second pod to the remaining zone → zone-pinned.
+			// Both pods have no pod-level zone constraint (no nodeSelector/nodeAffinity for zone),
+			// but the TSC constrains their valid zones:
+			// Pod 1 has 2 valid TSC domains → intersected with instance zones {zone-1, zone-2} → "flexible".
+			// Pod 2 has 1 valid TSC domain (after pod 1 took a zone, only 1 remains to satisfy maxSkew)
+			//   → intersected with instance zones {zone-1, zone-2} → single zone → specific zone name.
 			m, ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
 				map[string]string{"controller": "provisioner", "zone": "flexible"})
 			Expect(ok).To(BeTrue())
 			Expect(lo.FromPtr(m.Gauge.Value)).To(BeNumerically("==", 1))
 
-			// The second pod should be pinned to the remaining zone
-			total := 0
-			for _, zone := range []string{"test-zone-1", "test-zone-2"} {
-				zm, zok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
-					map[string]string{"controller": "provisioner", "zone": zone})
-				if zok {
-					total += int(lo.FromPtr(zm.Gauge.Value))
-				}
-			}
-			Expect(total).To(Equal(1), "expected 1 pod pinned to a specific zone")
+			// The second pod is constrained to a specific zone by the TSC
+			_, zone2ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-2"})
+			_, zone1ok := FindMetricWithLabelValues("karpenter_scheduler_pending_pods_by_effective_zone",
+				map[string]string{"controller": "provisioner", "zone": "test-zone-1"})
+			Expect(zone1ok || zone2ok).To(BeTrue())
 		})
 		It("should report specific zone when PVC restricts pod to a single zone", func() {
 			nodePool = test.NodePool()

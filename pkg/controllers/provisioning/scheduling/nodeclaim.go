@@ -142,7 +142,7 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// Check Topology Requirements
 	// NOTE: podData.StrictRequirements does NOT include volume requirements,
 	// ensuring TSC counting uses pod's original affinity.
-	topologyRequirements, tscZoneValidDomainCount, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	topologyRequirements, tscZoneValidDomains, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, "", err
 	}
@@ -154,7 +154,7 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// Check instance type combinations
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
-	remaining, unsatisfiableKeys, effZone, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests, relaxMinValues)
+	remaining, unsatisfiableKeys, offeringZones, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests, relaxMinValues)
 	if relaxMinValues {
 		// Update min values on the requirements if they are relaxed
 		for key, minValues := range unsatisfiableKeys {
@@ -170,10 +170,9 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	if err != nil {
 		return nil, nil, nil, "", err
 	}
-	// If a zonal TSC had multiple valid domains before the greedy pick, override to "flexible"
-	if tscZoneValidDomainCount > 1 {
-		effZone = "flexible"
-	}
+	// Compute effective zone from pod-level constraints only (pod requirements + volume + TSC),
+	// deliberately excluding NodePool requirements and instance offering zones.
+	effZone := computeEffectiveZoneFromPod(podData.Requirements, podData.VolumeRequirements, tscZoneValidDomains, offeringZones)
 	return nodeClaimRequirements, remaining, ofs, effZone, nil
 }
 
@@ -385,7 +384,7 @@ func (e InstanceTypeFilterError) Error() string {
 }
 
 //nolint:gocyclo
-func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList, relaxMinValues bool) (cloudprovider.InstanceTypes, map[string]int, string, error) {
+func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList, relaxMinValues bool) (cloudprovider.InstanceTypes, map[string]int, sets.Set[string], error) {
 	unsatisfiableKeys := map[string]int{}
 	// We hold the results of our scheduling simulation inside of this InstanceTypeFilterError struct
 	// to reduce the CPU load of having to generate the error string for a failed scheduling simulation
@@ -403,15 +402,15 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		daemonRequests: daemonRequests,
 	}
 	remaining := cloudprovider.InstanceTypes{}
-
-	// Collect zones from instance type requirements during filtering
-	// (zones come from NodeClass subnets, stored in instance type requirements)
+	// Collect zones from instance type requirements during filtering.
+	// These zones come from the instance type's zone requirements (e.g. NodeClass subnets),
+	// regardless of whether any offering is currently available.
 	offeringZones := sets.New[string]()
 
 	for _, it := range instanceTypes {
-		// Collect zones from this instance type's requirements
-		zones := it.Requirements.Get(corev1.LabelTopologyZone).Values()
-		offeringZones.Insert(zones...)
+		// Collect zones from this instance type's zone requirements
+		offeringZones.Insert(it.Requirements.Get(corev1.LabelTopologyZone).Values()...)
+
 		// the tradeoff to not short-circuiting on the filtering is that we can report much better error messages
 		// about why scheduling failed
 		itCompat := compatible(it, requirements)
@@ -457,13 +456,10 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		}
 	}
 
-	// Compute effective zone by intersecting pod requirements with collected offering zones
-	effectiveZone := computeEffectiveZoneFromSets(requirements, offeringZones)
-
 	if len(remaining) == 0 {
-		return nil, unsatisfiableKeys, effectiveZone, err
+		return nil, unsatisfiableKeys, offeringZones, err
 	}
-	return remaining, unsatisfiableKeys, effectiveZone, nil
+	return remaining, unsatisfiableKeys, offeringZones, nil
 }
 
 func compatible(instanceType *cloudprovider.InstanceType, requirements scheduling.Requirements) bool {
@@ -487,20 +483,38 @@ func addVolumeRequirements(nodeRequirements scheduling.Requirements, volumeRequi
 	return nil
 }
 
-// computeEffectiveZoneFromSets calculates the effective zone constraint by intersecting
-// zone requirements (from pod + NodePool + volume + topology) with the zones from the offerings.
-// Returns the specific zone name if exactly one zone remains, or "flexible" otherwise.
-// Note: an empty intersection (0 zones) is unreachable when called from a successful CanAdd(),
-// because no offerings would match and the pod would fail to schedule before we record this value.
-func computeEffectiveZoneFromSets(requirements scheduling.Requirements, offeringZones sets.Set[string]) string {
-	zoneReq := requirements.Get(corev1.LabelTopologyZone)
-	offeringZoneReq := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, offeringZones.UnsortedList()...)
-	effective := zoneReq.Intersection(offeringZoneReq)
+// computeEffectiveZoneFromPod calculates the effective zone constraint by intersecting
+// pod-level zone signals (nodeSelector/nodeAffinity, PVC zones, TSC valid domains) with
+// the zones from instance type requirements (where instances exist, regardless of availability).
+// Returns: specific zone name if exactly one zone, "flexible" if multiple zones, "none" if no intersection.
+func computeEffectiveZoneFromPod(podRequirements scheduling.Requirements, volumeRequirements scheduling.Requirements, tscZoneValidDomains sets.Set[string], instanceZones sets.Set[string]) string {
+	// Start with the pod's own zone requirement
+	zoneReq := podRequirements.Get(corev1.LabelTopologyZone)
 
-	// Len() gives the count of allowed zones because offeringZoneReq is always In (non-complement),
-	// guaranteeing the intersection result is also non-complement (a positive set of specific zones).
-	if effective.Len() == 1 {
-		return effective.Values()[0]
+	// Intersect with volume zone requirements if present
+	if volZoneReq, ok := volumeRequirements[corev1.LabelTopologyZone]; ok {
+		zoneReq = zoneReq.Intersection(volZoneReq)
 	}
-	return "flexible"
+
+	// Intersect with TSC valid domains if a zonal TSC exists
+	if len(tscZoneValidDomains) > 0 {
+		tscZoneReq := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, sets.List(tscZoneValidDomains)...)
+		zoneReq = zoneReq.Intersection(tscZoneReq)
+	}
+
+	// Intersect with instance type zone requirements (zones where instances exist,
+	// regardless of current availability)
+	if len(instanceZones) > 0 {
+		instanceZoneReq := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, sets.List(instanceZones)...)
+		zoneReq = zoneReq.Intersection(instanceZoneReq)
+	}
+
+	switch {
+	case zoneReq.Len() == 1:
+		return zoneReq.Values()[0]
+	case zoneReq.Len() == 0:
+		return "none"
+	default:
+		return "flexible"
+	}
 }
