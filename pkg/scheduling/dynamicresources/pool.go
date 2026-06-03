@@ -131,11 +131,11 @@ func filterPool(pool *Pool, requirements scheduling.Requirements) *Pool {
 		for _, d := range s.Devices() {
 			p.Devices = append(p.Devices, DeviceWithID{
 				Device: d,
-				ID: DeviceID{
+				ID: DeviceID{DeviceID: cloudprovider.DeviceID{
 					Driver: pool.Key.Driver,
 					Pool:   pool.Key.Pool,
 					Device: d.Name,
-				},
+				}},
 				TopologyRequirements: topoReqs,
 			})
 		}
@@ -265,11 +265,11 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
 			seen.Insert(d.Name)
 			pool.Devices = append(pool.Devices, DeviceWithID{
 				Device: d,
-				ID: DeviceID{
+				ID: DeviceID{DeviceID: cloudprovider.DeviceID{
 					Driver: key.Driver,
 					Pool:   key.Pool,
 					Device: d.Name,
-				},
+				}},
 				TopologyRequirements: topoReqs,
 			})
 		}

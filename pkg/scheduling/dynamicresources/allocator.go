@@ -20,60 +20,138 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"unique"
 
-	corev1 "k8s.io/api/core/v1"
+	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	dracel "k8s.io/dynamic-resource-allocation/cel"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
+// DRA device allocation involves a DFS traversal of a decision tree that can be arbitrarily deep. We set an upper
+// limit on the time spent per pod allocation to ensure the scheduler makes progress.
 const allocateTimeout = 5 * time.Second
-
-// ClaimAllocationMetadata records per-claim allocation state from a prior pod's allocation
-// within the same scheduling loop. This enables in-memory claim reuse when multiple pods
-// reference the same ResourceClaim.
-type ClaimAllocationMetadata struct {
-	// NodeClaimID is the NodeClaim that this claim was allocated for.
-	NodeClaimID NodeClaimID
-	// UsedTemplateDevices is true if the allocation used any template (potential) devices,
-	// making the claim node-local to the original NodeClaim.
-	UsedTemplateDevices bool
-	// Requirements contains the accumulated topology requirements from the allocation.
-	// Nil if no topology requirements were produced (e.g., all devices were AllNodes).
-	Requirements scheduling.Requirements
-}
 
 // Allocator manages DRA device allocation across a single scheduling loop. It is shared across
 // all per-pod allocation requests and is read-only during Allocate() calls. Mutation occurs only
 // during initialization and Commit().
 type Allocator struct {
-	inClusterSlices          []ResourceSlice
-	allocatedDevices         sets.Set[DeviceID]
-	inFlightAllocatedDevices map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]
-	inMemoryAllocations      map[string]*ClaimAllocationMetadata // keyed by claim name
-	attributeBindings        AttributeBindings
-	poolCache                map[NodeClaimID][]*Pool
-	kubeClient               client.Client
+	allocationTracker *AllocationTracker
+	attributeBindings AttributeBindings
+	kubeClient        client.Client
+
+	// inClusterSlices represents the set of ResourceSlices that are already present on the API server.
+	inClusterSlices []ResourceSlice
+	// poolCache contains the filtered set of available pools for each NodeClaim. Each time a NodeClaim is constrained,
+	// the set of pools available to that NodeClaim is also constrained. This cache tracks the last set of constrained
+	// pools to use as a baseline for subsequent filtering operations.
+	poolCache map[NodeClaimID][]*Pool
+	// claimAllocationMetadata contains metadata for in-memory ResourceClaim allocations, including the allocated devices
+	// and the scheduling requirements.
+	claimAllocationMetadata map[ResourceClaimID]*resourceClaimAllocationMetadata
+}
+
+// ResourceClaimAllocationMetadata returns a copy of the allocator's internal ResourceClaim allocation metadata. A nil
+// result will be returned if the claim hasn't been allocated by the allocator, i.e. both unallocated claims and claims
+// allocated in-cluster will return nil.
+func (a *Allocator) ResourceClaimAllocationMetadata(claimName string) *ResourceClaimAllocationMetadata {
+	meta, ok := a.claimAllocationMetadata[unique.Make(claimName)]
+	if !ok {
+		return nil
+	}
+	copiedDevices := make(map[InstanceTypeID][]DeviceID, len(meta.Devices))
+	for it, devices := range meta.Devices {
+		copiedDevices[it] = make([]DeviceID, len(devices))
+		copy(copiedDevices[it], devices)
+	}
+	return &ResourceClaimAllocationMetadata{
+		NodeClaimID:  meta.NodeClaimID,
+		Requirements: copyRequirements(meta.TotalRequirements),
+		Devices:      copiedDevices,
+	}
+}
+
+// ResourceClaimAllocationMetadata is a view into the Allocator's internal ResourceClaim allocation state. It provides
+// the current topology requirements associated with the claim, the NodeClaim the ResourceClaim was transitively
+// allocated for, and the allocated devices dependent on the instance type selected for the NodeClaim.
+type ResourceClaimAllocationMetadata struct {
+	NodeClaimID  NodeClaimID
+	Requirements scheduling.Requirements
+	Devices      map[InstanceTypeID][]DeviceID
+}
+
+// resourceClaimAllocationMetadata represents thte current allocation state for a given ResourceClaim. This includes
+// the NodeClaim the ResourceClaim was transitively allocated for, the topology requirements that will be associated
+// with the ResourceClaim, and the set of devices allocated to the ResourceClaim on a per-instance type basis.
+type resourceClaimAllocationMetadata struct {
+	// NodeClaimID is the NodeClaim that is transitively associated with the ResourceClaim's allocation, via the pod it
+	// was allocated for. If the ResourceClaim was satisifed using any template devices, pods referencing this
+	// ResourceClaim may not be bound to any other NodeClaim.
+	NodeClaimID NodeClaimID
+
+	// contributedRequirements represents the requirements that are contributed by each instance type. Each ResourceClaim
+	// is transitively associated with a single NodeClaim, via the pod it was allocated for. For each instance type the
+	// NodeClaim is superposed across, a different device may be selected to satisfy the claim. In this scenario,
+	// depending on the instance type the NodeClaim collapses to, the topology requirements associated with the
+	// ResourceClaim may differ. To account for this, we pessimistically treat the ResourceClaim's topology requirements
+	// as the intersection of contributed requirements.
+	//
+	// Consider the following example: a device available in zones A and B is allocated when simulating instance type A
+	// and a device available in zone B is allocated for instance type B. While both instance types are candidates, we
+	// consider the ResourceClaim to only be available in zone B. If instance type B is released, we'll consider it
+	// available in both A and B.
+	//
+	// It is the responsibility of the allocator to prune instance types that would result in an empty requirement set.
+	// For example, let's say we have two instance types A and B. Instance type A is evaluated first and contributes a
+	// zone IN A requirement. Instance type B is evaluated second and would contribute a zone IN B requirement. Since this
+	// would result in an empty set when intersected with A's requirement, instance type B should be pruned by the
+	// allocator. This accounts for an existing limitation in NodeClaim modeling - we can't say "instance type A in zone A
+	// OR instance type B in zone B". We may evaluate options for removing this restriction in the future.
+	//
+	// TODO: Currently contributed requirements aren't reflected in the NodeClaims themselves. When an instance type is
+	// released, a NodeClaim's requirements aren't relaxed in the same way as the ResourceClaim's. This is a future
+	// optimization we could make to increase the flexibility of generated NodeClaims.
+	ContributedRequirements map[InstanceTypeID]scheduling.Requirements
+
+	// totalRequirements represents the intersection of the contributed requirements. These requirements are updated each
+	// time instance types are released. If a pod referencing this ResourceClaim is to schedule to a different NodeClaim,
+	// that NodeClaim must be compatible with these requirements. We take the set intersection because we don't know which
+	// instance type will be selected for the "source" NodeClaim (the NodeClaim represented by NodeClaimID).
+	TotalRequirements scheduling.Requirements
+
+	// UsedTemplateDevices is true if the allocation used any template (potential) devices,
+	// making the claim node-local to the original NodeClaim.
+	UsedTemplateDevices bool
+
+	// devices represents the devices that will be allocated if the original allocating NodeClaim collapses to a given
+	// InstanceType. It isn't strictly necessary to retain this information, but it's used in integration testing to form
+	// binidngs.
+	Devices map[InstanceTypeID][]DeviceID
 }
 
 // NewAllocator constructs an Allocator for a single scheduling loop.
+// allocatedDevices contains the set of in-cluster devices that are already allocated;
+// these are converted internally to the scheduling DeviceID type.
 func NewAllocator(
 	inClusterSlices []ResourceSlice,
-	allocatedDevices sets.Set[DeviceID],
+	allocatedDevices sets.Set[cloudprovider.DeviceID],
 	attributeBindings AttributeBindings,
 	kubeClient client.Client,
 ) *Allocator {
 	return &Allocator{
-		inClusterSlices:          inClusterSlices,
-		allocatedDevices:         allocatedDevices,
-		inFlightAllocatedDevices: make(map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]),
-		inMemoryAllocations:      make(map[string]*ClaimAllocationMetadata),
-		attributeBindings:        attributeBindings,
-		poolCache:                make(map[NodeClaimID][]*Pool),
-		kubeClient:               kubeClient,
+		allocationTracker:       NewAllocationTracker(allocatedDevices.UnsortedList()...),
+		attributeBindings:       attributeBindings,
+		kubeClient:              kubeClient,
+		inClusterSlices:         inClusterSlices,
+		poolCache:               make(map[NodeClaimID][]*Pool),
+		claimAllocationMetadata: make(map[ResourceClaimID]*resourceClaimAllocationMetadata),
 	}
 }
 
@@ -90,38 +168,46 @@ type AllocationResult struct {
 
 // Allocation is the interface for committing a successful allocation to the Allocator's shared state.
 type Allocation interface {
-	Commit()
+	Commit(context.Context)
 }
 
 // allocation commits per-instance-type device allocations (both in-cluster and template).
 type allocation struct {
-	allocator           *Allocator
-	nodeClaimID         NodeClaimID
-	deviceIDsByIT       map[InstanceTypeID][]DeviceID
-	deviceIDsByClaimIT  map[int]map[InstanceTypeID][]DeviceID // per-claim, per-IT device IDs
-	pools               []*Pool
-	claimMetadata       map[string]*ClaimAllocationMetadata // per-claim metadata to record on commit
+	// allocator is a reference to the top-level allocator that will be mutated when this allocation is commited.
+	allocator *Allocator
+
+	// nodeClaimID represents the source NodeClaim the devices were transitvely allocated for
+	nodeClaimID NodeClaimID
+	// deviceIDsByIT represents the devices that will be allocated for each instance type. Both in-cluster and template
+	// devices are included.
+	deviceIDsByIT map[InstanceTypeID][]DeviceID
+	// claimMetadata represents the allocation metadata for each ResourceClaim, keyed by the ResourceClaim name. This
+	// tracks both devices (for observability / testing) and topology requirements (for non-node local binding).
+	claimMetadata map[ResourceClaimID]*resourceClaimAllocationMetadata
+	// filteredPools represents the set of pools that will be available from the NodeClaim if this allocation is commited.
+	// This reduces the number of pools we need to filter during subsequent allocations for the NodeClaim.
+	filteredPools []*Pool
 }
 
-func (a *allocation) Commit() {
-	for itID, deviceIDs := range a.deviceIDsByIT {
-		ncDevices, ok := a.allocator.inFlightAllocatedDevices[a.nodeClaimID]
-		if !ok {
-			ncDevices = make(map[InstanceTypeID]sets.Set[DeviceID])
-			a.allocator.inFlightAllocatedDevices[a.nodeClaimID] = ncDevices
-		}
-		itDevices, ok := ncDevices[itID]
-		if !ok {
-			itDevices = sets.New[DeviceID]()
-			ncDevices[itID] = itDevices
-		}
-		for _, id := range deviceIDs {
-			itDevices.Insert(id)
-		}
+func (a *allocation) Commit(ctx context.Context) {
+	if log.FromContext(ctx).V(1).Enabled() {
+		log.FromContext(ctx).V(1).Info(
+			"allocated devices",
+			"nodeClaimID", a.nodeClaimID.Value(),
+			"devicesByResourceClaim", lo.MapEntries(a.claimMetadata, func(claimID ResourceClaimID, meta *resourceClaimAllocationMetadata) (string, map[string][]string) {
+				return claimID.Value(), lo.MapEntries(meta.Devices, func(it InstanceTypeID, ids []DeviceID) (string, []string) {
+					return it.Value(), lo.Map(ids, func(id DeviceID, _ int) string { return id.String() })
+				})
+			}),
+		)
 	}
-	a.allocator.poolCache[a.nodeClaimID] = a.pools
-	for claimName, meta := range a.claimMetadata {
-		a.allocator.inMemoryAllocations[claimName] = meta
+	a.allocator.allocationTracker.Commit(a)
+	a.allocator.poolCache[a.nodeClaimID] = a.filteredPools
+	for claimID, meta := range a.claimMetadata {
+		if _, ok := a.allocator.claimAllocationMetadata[claimID]; ok {
+			panic("attempted to commit claim which was already allocated")
+		}
+		a.allocator.claimAllocationMetadata[claimID] = meta
 	}
 }
 
@@ -129,54 +215,37 @@ func (a *allocation) Commit() {
 // Called by the scheduler when an instance type is pruned from a NodeClaim's candidate set.
 // Once all instance types referencing a device are released, the device becomes available
 // to other NodeClaims.
-func (a *Allocator) ReleaseInstanceType(nodeClaimID NodeClaimID, itID InstanceTypeID) {
-	if ncDevices, ok := a.inFlightAllocatedDevices[nodeClaimID]; ok {
-		delete(ncDevices, itID)
-		if len(ncDevices) == 0 {
-			delete(a.inFlightAllocatedDevices, nodeClaimID)
+func (a *Allocator) ReleaseInstanceType(ctx context.Context, nodeClaimID NodeClaimID, instanceTypeIDs ...InstanceTypeID) {
+	a.allocationTracker.ReleaseInstanceTypes(ctx, nodeClaimID, instanceTypeIDs...)
+
+	for _, meta := range a.claimAllocationMetadata {
+		if meta.NodeClaimID != nodeClaimID {
+			continue
+		}
+
+		needsRecomputation := false
+		for _, it := range instanceTypeIDs {
+			if len(meta.ContributedRequirements[it]) != 0 {
+				needsRecomputation = true
+			}
+			delete(meta.ContributedRequirements, it)
+			delete(meta.Devices, it)
+		}
+
+		// If any of the pruned instance types contributed to the total requirements for the ResourceClaim, we should
+		// recompute the requirements. Although this is not strictly necessary, it may unblock placement of subsequent pods
+		// in the simulation which were previously blocked due to these constraints. Doing this in a single simulation
+		// increases the upper-bound for binpacking efficency.
+		if needsRecomputation {
+			updatedReqs := scheduling.NewRequirements()
+			for _, itReqs := range meta.ContributedRequirements {
+				for _, req := range itReqs {
+					updatedReqs.Add(req)
+				}
+			}
+			meta.TotalRequirements = updatedReqs
 		}
 	}
-}
-
-// matchKey is used to cache CEL selector evaluation results per (device, claim, request) tuple.
-type matchKey struct {
-	DeviceID     DeviceID
-	ClaimIndex   int
-	RequestIndex int
-}
-
-// reqPoolSnapshot captures the incremental requirements and pool set at a point during the DFS,
-// enabling restoration on backtrack when a non-node-local device tightens requirements.
-type reqPoolSnapshot struct {
-	reqs  scheduling.Requirements
-	pools []*Pool
-}
-
-// deviceAllocation records a single device allocation during the DFS.
-type deviceAllocation struct {
-	claimIndex   int
-	requestIndex int
-	slotIndex    int
-	deviceID     DeviceID
-}
-
-// allocator is the per-Allocate() child struct that holds mutable state for the current DFS.
-type allocator struct {
-	*Allocator
-	ctx                  context.Context
-	nodeClaim            NodeClaim
-	pools                []*Pool
-	claimData            []*ClaimData
-	templateDevicesByIT  map[InstanceTypeID][]DeviceWithID
-	celCache             *dracel.Cache
-	allocatingDevices    sets.Set[DeviceID]
-	deviceMatchesRequest map[matchKey]bool
-	incrementalReqs      scheduling.Requirements
-	baselineReqs         scheduling.Requirements
-	reqPoolSnapshots     []reqPoolSnapshot
-	allocated            []deviceAllocation
-	// itID is the current instance type being evaluated in the DFS.
-	itID InstanceTypeID
 }
 
 // Allocate attempts to satisfy the given ResourceClaims for the specified NodeClaim. It returns
@@ -208,74 +277,30 @@ func (a *Allocator) Allocate(
 	// tightened as each already-allocated claim contributes topology. Each claim is checked
 	// against the effective requirements at the time it is processed, so mutually incompatible
 	// claims (e.g., one pinned to zone A and another to zone B) are detected immediately.
-	effectiveReqs := copyRequirements(nodeClaim.Requirements())
-	var unallocatedClaims []*resourcev1.ResourceClaim
-	newClaimMetadata := make(map[string]*ClaimAllocationMetadata)
-
-	for _, claim := range claims {
-		// In-cluster allocated: status.allocation is set.
-		if claim.Status.Allocation != nil {
-			reqs, err := nodeSelectorsToRequirements(claim.Status.Allocation.NodeSelector)
-			if err != nil {
-				return nil, fmt.Errorf("claim %q: %w", claim.Name, err)
-			}
-			if reqs != nil {
-				if !effectiveReqs.IsCompatible(*reqs, scheduling.AllowUndefinedWellKnownLabels) {
-					return nil, fmt.Errorf("claim %q: in-cluster allocation topology is incompatible with NodeClaim requirements", claim.Name)
-				}
-				effectiveReqs.Add(reqs.Values()...)
-			}
-			continue
-		}
-
-		// In-memory allocated: a prior pod already allocated this claim in this loop.
-		if meta, ok := a.inMemoryAllocations[claim.Name]; ok {
-			if meta.UsedTemplateDevices {
-				// Template-allocated claims are node-local to the original NodeClaim.
-				if meta.NodeClaimID != nodeClaim.ID() {
-					return nil, fmt.Errorf("claim %q: template-allocated claim is bound to a different NodeClaim", claim.Name)
-				}
-				// Same NodeClaim — claim is already satisfied, no requirements to add.
-			} else {
-				// In-cluster only — check topology compatibility.
-				if meta.Requirements != nil {
-					if !effectiveReqs.IsCompatible(meta.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
-						return nil, fmt.Errorf("claim %q: in-memory allocation topology is incompatible with NodeClaim requirements", claim.Name)
-					}
-					effectiveReqs.Add(meta.Requirements.Values()...)
-				}
-			}
-			continue
-		}
-
-		// Unallocated — will proceed through DFS.
-		unallocatedClaims = append(unallocatedClaims, claim)
+	classifyRes, err := a.ClassifyClaims(nodeClaim, claims)
+	if err != nil {
+		return nil, err
 	}
-
-	// Compute the baseline additions (topology from already-allocated claims, excluding
-	// the NodeClaim's original requirements). This is what gets merged into the AllocationResult.
-	baselineReqs := scheduling.NewRequirements()
-	for _, v := range effectiveReqs.Values() {
-		baselineReqs.Add(v)
-	}
-
-	// If there are no unallocated claims, return early with baseline requirements.
-	if len(unallocatedClaims) == 0 {
+	// If there are no unallocated claims, return early with the requirements from the preallocated claims
+	if len(classifyRes.unallocatedClaims) == 0 {
 		return &AllocationResult{
 			InstanceTypes: nodeClaim.InstanceTypes(),
-			Requirements:  baselineReqs,
+			Requirements:  classifyRes.requirements,
 		}, nil
 	}
 
 	// Phase 2: Pool gathering with cache, using the tightened effective requirements.
 	var pools []*Pool
 	if cached, ok := a.poolCache[nodeClaim.ID()]; ok {
-		pools = FilterPools(cached, effectiveReqs)
+		pools = FilterPools(cached, classifyRes.requirements)
 	} else {
-		pools = GatherPools(a.inClusterSlices, effectiveReqs)
+		pools = GatherPools(a.inClusterSlices, classifyRes.requirements)
 	}
 
 	// Build template devices by instance type.
+	// TODO: Ideally, these devices should be tracked globally across the allocator. They currently aren't because we're
+	// modeling a subset of the total possible slices - we exclude those from drivers that have already had pools
+	// published. Let's consider a new interface to model this (e.g. outstanding drivers / pools?)
 	resourceSlices := nodeClaim.ResourceSlices()
 	templateDevicesByIT := make(map[InstanceTypeID][]DeviceWithID, len(resourceSlices))
 	for itID, slices := range resourceSlices {
@@ -284,9 +309,12 @@ func (a *Allocator) Allocate(
 				templateDevicesByIT[itID] = append(templateDevicesByIT[itID], DeviceWithID{
 					Device: d,
 					ID: DeviceID{
-						Driver: s.Driver(),
-						Pool:   s.Pool().Name,
-						Device: d.Name,
+						DeviceID: cloudprovider.DeviceID{
+							Driver: s.Driver(),
+							Pool:   s.Pool().Name,
+							Device: d.Name,
+						},
+						Template: true,
 					},
 				})
 			}
@@ -301,16 +329,15 @@ func (a *Allocator) Allocate(
 		pools:                pools,
 		templateDevicesByIT:  templateDevicesByIT,
 		celCache:             dracel.NewCache(0, dracel.Features{}),
-		allocatingDevices:    sets.New[DeviceID](),
+		allocatedDevices:     sets.New[DeviceID](),
 		deviceMatchesRequest: make(map[matchKey]bool),
-		incrementalReqs:      scheduling.NewRequirements(),
-		baselineReqs:         baselineReqs,
+		requirements:         classifyRes.requirements,
 	}
 
 	// Validate unallocated claims and build ClaimData. Binding fallback is nil here — it is
 	// set per-IT before each DFS run since it depends on the instance type.
-	child.claimData = make([]*ClaimData, len(unallocatedClaims))
-	for i, claim := range unallocatedClaims {
+	child.claimData = make([]*ClaimData, len(classifyRes.unallocatedClaims))
+	for i, claim := range classifyRes.unallocatedClaims {
 		cd, err := ValidateClaimRequest(ctx, a.kubeClient, claim, i, pools, templateDevicesByIT, child.celCache, nil)
 		if err != nil {
 			return nil, fmt.Errorf("validating claim %q: %w", claim.Name, err)
@@ -322,57 +349,121 @@ func (a *Allocator) Allocate(
 	if err != nil {
 		return nil, err
 	}
-
-	// Merge baseline requirements (from already-allocated claims) into the DFS result.
-	result.Requirements.Add(baselineReqs.Values()...)
-
-	// Build per-claim metadata for newly allocated claims.
-	// Build a lookup set of template device IDs for UsedTemplateDevices detection.
-	templateDeviceIDs := sets.New[DeviceID]()
-	for _, devices := range templateDevicesByIT {
-		for _, d := range devices {
-			templateDeviceIDs.Insert(d.ID)
-		}
-	}
-	alloc := result.Allocation.(*allocation)
-	for i, claim := range unallocatedClaims {
-		usedTemplate := false
-		if claimITs, ok := alloc.deviceIDsByClaimIT[i]; ok {
-			for _, ids := range claimITs {
-				for _, id := range ids {
-					if templateDeviceIDs.Has(id) {
-						usedTemplate = true
-						break
-					}
-				}
-				if usedTemplate {
-					break
-				}
-			}
-		}
-		newClaimMetadata[claim.Name] = &ClaimAllocationMetadata{
-			NodeClaimID:         nodeClaim.ID(),
-			UsedTemplateDevices: usedTemplate,
-			Requirements:        result.Requirements,
-		}
-	}
-	alloc.claimMetadata = newClaimMetadata
-
 	return result, nil
 }
 
-// nodeSelectorsToRequirements extracts scheduling requirements from a NodeSelector.
-// Returns nil if the NodeSelector is nil (no topology constraints).
-func nodeSelectorsToRequirements(ns *corev1.NodeSelector) (*scheduling.Requirements, error) {
-	if ns == nil {
-		return nil, nil
+type classificationResult struct {
+	// unallocatedClaims is the set of claims that haven't already been allocated, either in-cluster or via previous
+	// invocations of the allocator.
+	unallocatedClaims []*resourcev1.ResourceClaim
+	// requirements is the intersection of the NodeClaim's requiremnts and the requirements derived from allocated claims.
+	requirements scheduling.Requirements
+}
+
+// ClassifyClaims evaluates the set of claims for the NodeClaims. It checks allocation status and ensures compatibility.
+// If any of claim is already allocated and incompatible with the NodeClaim, it returns an error. The result is the set
+// of unallocated claims and the cumalative requirements derived from the base NodeClaim and the allocated claims.
+func (a *Allocator) ClassifyClaims(nodeClaim NodeClaim, claims []*resourcev1.ResourceClaim) (classificationResult, error) {
+	result := classificationResult{
+		requirements: copyRequirements(nodeClaim.Requirements()),
 	}
-	reqs := scheduling.NewRequirements()
-	for _, term := range ns.NodeSelectorTerms {
-		termReqs := scheduling.NewNodeSelectorRequirements(term.MatchExpressions...)
-		reqs.Add(termReqs.Values()...)
+
+	for _, claim := range claims {
+		// In-cluster allocated: status.allocation is set.
+		if claim.Status.Allocation != nil {
+			reqs, err := nodeSelectorsToRequirements(claim.Status.Allocation.NodeSelector)
+			if err != nil {
+				return classificationResult{}, serrors.Wrap(fmt.Errorf("building requirements from node selector, %w", err), "ResourceClaim", klog.KObj(claim))
+			}
+			if reqs != nil {
+				if !result.requirements.IsCompatible(*reqs, scheduling.AllowUndefinedWellKnownLabels) {
+					return classificationResult{}, serrors.Wrap(fmt.Errorf("in-cluster allocation topology is incompatible with NodeClaim requirements"), "ResourceClaim", klog.KObj(claim))
+				}
+				result.requirements.Add(reqs.Values()...)
+			}
+			continue
+		}
+
+		// In-memory allocated: a prior pod already allocated this claim in this loop.
+		if meta, ok := a.claimAllocationMetadata[unique.Make(claim.Name)]; ok {
+			// Template-allocated claims are node-local to the original NodeClaim.
+			if meta.UsedTemplateDevices {
+				if meta.NodeClaimID != nodeClaim.ID() {
+					return classificationResult{}, serrors.Wrap(fmt.Errorf("claim is bound to a different in-flight NodeClaim"), "ResourceClaim", klog.KObj(claim))
+				}
+				// Same NodeClaim — claim is already satisfied, no requirements to add.
+			} else {
+				// In-cluster only — check topology compatibility.
+				if len(meta.TotalRequirements) != 0 {
+					if !result.requirements.IsCompatible(meta.TotalRequirements, scheduling.AllowUndefinedWellKnownLabels) {
+						return classificationResult{}, serrors.Wrap(fmt.Errorf("in-memory allocation topology is incompatible with NodeClaim requirements"), "ResourceClaim", klog.KObj(claim))
+					}
+					result.requirements.Add(meta.TotalRequirements.Values()...)
+				}
+
+			}
+			continue
+		}
+
+		// Unallocated — will proceed through DFS.
+		result.unallocatedClaims = append(result.unallocatedClaims, claim)
 	}
-	return &reqs, nil
+	return result, nil
+}
+
+// allocator is the per-Allocate() child struct that holds mutable state for the current DFS.
+type allocator struct {
+	*Allocator
+	ctx context.Context
+	// celCache caches compiled CEL expressions for device match evaluation. This isn't stored in the top-level allocator
+	// due to write-contention on cache misses. The performance tradeoff of an RWMutex should be evaluated.
+	celCache *dracel.Cache
+
+	// nodeClaim is the NodeClaim being evaluated during this allocator call
+	nodeClaim NodeClaim
+	// itID is the current instance type being evaluated in the DFS.
+	itID                 InstanceTypeID
+	templateDevicesByIT  map[InstanceTypeID][]DeviceWithID
+	claimData            []*ClaimData
+	deviceMatchesRequest map[matchKey]bool
+
+	// allocatedDevices represents the set of devices that have currently been allocated in the decision tree. Devices
+	// are added and removed from this set as we traverse the tree. This contains minimal allocation metadata and is used
+	// for quick lookups.
+	allocatedDevices sets.Set[DeviceID]
+	// allocatedDevicesMetadata contains additional allocation metadata about the device. Currently this only consists of
+	// the claim index.
+	allocatedDevicesMetadata []deviceAllocationMetadata
+
+	// requirements are the topology requirements that are incrementally built up by the DFS. Each time an in-cluster
+	// device with topology requirements is allocated, those requirements are added to these requirements. These are
+	// restored during backtracking from the snapshots.
+	requirements scheduling.Requirements
+	// pools represents the set of pools that we're currently evaluating. This can be constrained and relaxed as we
+	// traverse the decision tree based on allocated device topology requirements.
+	pools []*Pool
+	// TODO(jmdeal@): Evaluate using the call stack as the stack rather than an explicit stack, I can't recall why I didn't
+	snapshots []backtrackSnapshot
+}
+
+// matchKey is used to cache CEL selector evaluation results per (device, claim, request) tuple.
+type matchKey struct {
+	DeviceID     DeviceID
+	ClaimIndex   int
+	RequestIndex int
+}
+
+// backtrackSnapshot captures the incremental requirements and pool set at a point during the DFS,
+// enabling restoration on backtrack when a non-node-local device tightens requirements.
+type backtrackSnapshot struct {
+	reqs  scheduling.Requirements
+	pools []*Pool
+}
+
+// deviceAllocationMetadata records a single device allocation during the DFS.
+type deviceAllocationMetadata struct {
+	claimIndex   int
+	deviceWithID DeviceWithID
 }
 
 // allocate runs a per-instance-type DFS over in-cluster and template devices.
@@ -381,11 +472,20 @@ func nodeSelectorsToRequirements(ns *corev1.NodeSelector) (*scheduling.Requireme
 func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult, error) {
 	var survivingITs []InstanceTypeID
 	deviceIDsByIT := make(map[InstanceTypeID][]DeviceID)
-	deviceIDsByClaimIT := make(map[int]map[InstanceTypeID][]DeviceID)
-	var resultReqs scheduling.Requirements
 
 	// Snapshot initial state for restoration between IT attempts.
-	initPools := a.pools
+	initialPools := a.pools
+
+	claimAllocMeta := make([]*resourceClaimAllocationMetadata, len(a.claimData))
+	for i := range claimAllocMeta {
+		meta := &resourceClaimAllocationMetadata{
+			NodeClaimID:             a.nodeClaim.ID(),
+			ContributedRequirements: make(map[InstanceTypeID]scheduling.Requirements),
+			TotalRequirements:       scheduling.NewRequirements(),
+			Devices:                 make(map[InstanceTypeID][]DeviceID),
+		}
+		claimAllocMeta[i] = meta
+	}
 
 	for _, itID := range instanceTypes {
 		select {
@@ -395,7 +495,7 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 		}
 
 		// Restore to initial state.
-		a.restoreState(initPools)
+		a.restoreState(initialPools)
 
 		// Set binding fallback for this IT on all constraints.
 		a.setBindingFallback(&AttributeBindingFallback{
@@ -407,17 +507,37 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 		a.itID = itID
 		if a.dfs(0, 0, 0) {
 			survivingITs = append(survivingITs, itID)
-			// Collect device IDs globally and per-claim for this IT.
-			ids := make([]DeviceID, len(a.allocated))
-			for i, da := range a.allocated {
-				ids[i] = da.deviceID
-				if deviceIDsByClaimIT[da.claimIndex] == nil {
-					deviceIDsByClaimIT[da.claimIndex] = make(map[InstanceTypeID][]DeviceID)
+
+			deviceIDsByIT[itID] = make([]DeviceID, len(a.allocatedDevicesMetadata))
+			itReqs := scheduling.NewRequirements()
+			for di, da := range a.allocatedDevicesMetadata {
+				deviceIDsByIT[itID][di] = da.deviceWithID.ID
+				meta := claimAllocMeta[da.claimIndex]
+				// Update the contributed requirements for the device, each devices contributed requirements are intersected to
+				// find the contributed requirements for the instance type.
+				if reqs := da.deviceWithID.TopologyRequirements; reqs != nil {
+					claimITReqs, ok := meta.ContributedRequirements[itID]
+					if !ok {
+						claimITReqs = scheduling.NewRequirements()
+						meta.ContributedRequirements[itID] = itReqs
+					}
+					for _, req := range *reqs {
+						claimITReqs.Add(req)
+						itReqs.Add(req)
+					}
 				}
-				deviceIDsByClaimIT[da.claimIndex][itID] = append(deviceIDsByClaimIT[da.claimIndex][itID], da.deviceID)
+				if da.deviceWithID.ID.Template {
+					meta.UsedTemplateDevices = true
+				}
+				meta.Devices[itID] = append(meta.Devices[itID], da.deviceWithID.ID)
 			}
-			deviceIDsByIT[itID] = ids
-			resultReqs = a.incrementalReqs
+			// Update the baseline requirements for subsequent instance type simulations based on the contributed requirements
+			// from this instance type. This ensures that instance types don't require disjoint requirements to satisfy the same
+			// set of claims. This works around a current limitation in the NodeClaim representation - we can't express
+			// "instance type A in zone foo OR instance type B in zone bar"
+			for _, req := range itReqs {
+				a.requirements.Add(req)
+			}
 		}
 
 		// Clear binding fallback.
@@ -428,15 +548,31 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 		return nil, fmt.Errorf("no instance type can satisfy the allocation")
 	}
 
+	// Compute the total requirements based on the contributed requirements for each instance type
+	claimAllocMetaByRC := make(map[ResourceClaimID]*resourceClaimAllocationMetadata, len(claimAllocMeta))
+	nodeClaimRequirements := scheduling.NewRequirements()
+	for claimIdx, meta := range claimAllocMeta {
+		meta.TotalRequirements = scheduling.NewRequirements()
+		for _, itReqs := range meta.ContributedRequirements {
+			for _, req := range itReqs {
+				meta.TotalRequirements.Add(req)
+				// The requirements injected into the NodeClaim should be the set intersection of requirements across all instance
+				// types and resource claims
+				nodeClaimRequirements.Add(req)
+			}
+		}
+		claimAllocMetaByRC[a.claimData[claimIdx].ID] = meta
+	}
+
 	return &AllocationResult{
 		InstanceTypes: survivingITs,
-		Requirements:  resultReqs,
+		Requirements:  nodeClaimRequirements,
 		Allocation: &allocation{
-			allocator:          a.Allocator,
-			nodeClaimID:        a.nodeClaim.ID(),
-			deviceIDsByIT:      deviceIDsByIT,
-			deviceIDsByClaimIT: deviceIDsByClaimIT,
-			pools:              a.pools,
+			allocator:     a.Allocator,
+			nodeClaimID:   a.nodeClaim.ID(),
+			deviceIDsByIT: deviceIDsByIT,
+			filteredPools: a.pools,
+			claimMetadata: claimAllocMetaByRC,
 		},
 	}, nil
 }
@@ -532,10 +668,10 @@ func (a *allocator) tryDevice(
 	deviceID := dw.ID
 
 	// 1. Already allocated?
-	if a.isDeviceAllocated(deviceID) {
+	if a.allocationTracker.IsAllocated(deviceID, a.nodeClaim, a.itID) {
 		return false
 	}
-	if a.allocatingDevices.Has(deviceID) {
+	if a.allocatedDevices.Has(deviceID) {
 		return false
 	}
 
@@ -569,29 +705,27 @@ func (a *allocator) tryDevice(
 	// 4. Requirement compatibility (devices with topology requirements only).
 	pushedSnapshot := false
 	if dw.TopologyRequirements != nil {
-		if !a.incrementalReqs.IsCompatible(*dw.TopologyRequirements, scheduling.AllowUndefinedWellKnownLabels) {
+		if !a.requirements.IsCompatible(*dw.TopologyRequirements, scheduling.AllowUndefinedWellKnownLabels) {
 			for j := constraintsAdded - 1; j >= 0; j-- {
 				cd.Constraints[j].Remove(rd.Name, dw.Device, deviceID)
 			}
 			return false
 		}
 		// Push snapshot and update.
-		a.reqPoolSnapshots = append(a.reqPoolSnapshots, reqPoolSnapshot{
-			reqs:  copyRequirements(a.incrementalReqs),
+		a.snapshots = append(a.snapshots, backtrackSnapshot{
+			reqs:  copyRequirements(a.requirements),
 			pools: a.pools,
 		})
-		a.incrementalReqs.Add(dw.TopologyRequirements.Values()...)
-		a.pools = FilterPools(a.pools, a.incrementalReqs)
+		a.requirements.Add(dw.TopologyRequirements.Values()...)
+		a.pools = FilterPools(a.pools, a.requirements)
 		pushedSnapshot = true
 	}
 
 	// Record allocation.
-	a.allocatingDevices.Insert(deviceID)
-	a.allocated = append(a.allocated, deviceAllocation{
+	a.allocatedDevices.Insert(deviceID)
+	a.allocatedDevicesMetadata = append(a.allocatedDevicesMetadata, deviceAllocationMetadata{
 		claimIndex:   claimIdx,
-		requestIndex: reqIdx,
-		slotIndex:    slotIdx,
-		deviceID:     deviceID,
+		deviceWithID: dw,
 	})
 
 	// Recurse.
@@ -601,13 +735,13 @@ func (a *allocator) tryDevice(
 
 	// Backtrack — undo in reverse order of application: allocation, then requirements/pools,
 	// then constraints.
-	a.allocated = a.allocated[:len(a.allocated)-1]
-	a.allocatingDevices.Delete(deviceID)
+	a.allocatedDevicesMetadata = a.allocatedDevicesMetadata[:len(a.allocatedDevicesMetadata)-1]
+	a.allocatedDevices.Delete(deviceID)
 
 	if pushedSnapshot {
-		snapshot := a.reqPoolSnapshots[len(a.reqPoolSnapshots)-1]
-		a.reqPoolSnapshots = a.reqPoolSnapshots[:len(a.reqPoolSnapshots)-1]
-		a.incrementalReqs = snapshot.reqs
+		snapshot := a.snapshots[len(a.snapshots)-1]
+		a.snapshots = a.snapshots[:len(a.snapshots)-1]
+		a.requirements = snapshot.reqs
 		a.pools = snapshot.pools
 	}
 
@@ -618,43 +752,13 @@ func (a *allocator) tryDevice(
 	return false
 }
 
-// isDeviceAllocated checks whether a device is unavailable for allocation.
-//
-// Device allocation constraints:
-//  1. Blocked if allocated in real cluster state (seed allocatedDevices set).
-//  2. Blocked if allocated for a different NodeClaim (any IT on that NC).
-//  3. Allowed if allocated for the same NodeClaim on a different IT (only one IT
-//     will be provisioned, so the device is only actually consumed once).
-//  4. Blocked if allocated for the same NodeClaim on the same IT (prior pod).
-func (a *allocator) isDeviceAllocated(deviceID DeviceID) bool {
-	if a.allocatedDevices.Has(deviceID) {
-		return true
-	}
-	for ncID, ncDevices := range a.inFlightAllocatedDevices {
-		if ncID == a.nodeClaim.ID() {
-			// Same NC: only blocked if the current IT already allocated this device.
-			if itDevices, ok := ncDevices[a.itID]; ok && itDevices.Has(deviceID) {
-				return true
-			}
-		} else {
-			// Different NC: blocked if any IT allocated this device.
-			for _, itDevices := range ncDevices {
-				if itDevices.Has(deviceID) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 // restoreState resets the child allocator's mutable DFS state for a new IT attempt.
 func (a *allocator) restoreState(pools []*Pool) {
-	a.allocated = nil
-	a.incrementalReqs = scheduling.NewRequirements()
+	a.allocatedDevicesMetadata = nil
+	a.requirements = scheduling.NewRequirements()
 	a.pools = pools
-	a.allocatingDevices = sets.New[DeviceID]()
-	a.reqPoolSnapshots = nil
+	a.allocatedDevices = sets.New[DeviceID]()
+	a.snapshots = nil
 }
 
 // copyRequirements creates a shallow copy of a Requirements map.

@@ -17,8 +17,10 @@ limitations under the License.
 package dynamicresources
 
 import (
+	"fmt"
 	"unique"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 
@@ -28,15 +30,25 @@ import (
 
 // ID types used throughout the allocator. These use unique.Handle for efficient comparison.
 type (
-	DriverID       = unique.Handle[string]
-	PoolID         = unique.Handle[string]
-	InstanceTypeID = unique.Handle[string]
-	NodeClaimID    = unique.Handle[string]
-	NodePoolID     = unique.Handle[string]
+	DriverID        = unique.Handle[string]
+	PoolID          = unique.Handle[string]
+	InstanceTypeID  = unique.Handle[string]
+	NodeClaimID     = unique.Handle[string]
+	NodePoolID      = unique.Handle[string]
+	ResourceClaimID = unique.Handle[string]
 )
 
-// DeviceID is an alias for cloudprovider.DeviceID.
-type DeviceID = cloudprovider.DeviceID
+// DeviceID wraps cloudprovider.DeviceID with scheduling-specific metadata.
+// Template indicates whether the device comes from a cloud provider template
+// (potential device) rather than an in-cluster published ResourceSlice.
+type DeviceID struct {
+	cloudprovider.DeviceID
+	Template bool
+}
+
+func (id *DeviceID) String() string {
+	return fmt.Sprintf("%s%s/%s/%s", lo.Ternary(id.Template, "virtual/", ""), id.Driver.Value(), id.Pool.Value(), id.Device.Value())
+}
 
 // NodeClaim abstracts over existing nodes, pre-initialized nodes, and in-flight NodeClaims
 // for the allocator. This allows the allocator to work uniformly regardless of the NodeClaim's
@@ -192,4 +204,18 @@ func (s *templateSlice) Generation() int64 {
 
 func (s *templateSlice) ResourceSliceCount() int64 {
 	return 1
+}
+
+// nodeSelectorsToRequirements extracts scheduling requirements from a NodeSelector.
+// Returns nil if the NodeSelector is nil (no topology constraints).
+func nodeSelectorsToRequirements(ns *corev1.NodeSelector) (*scheduling.Requirements, error) {
+	if ns == nil {
+		return nil, nil
+	}
+	reqs := scheduling.NewRequirements()
+	for _, term := range ns.NodeSelectorTerms {
+		termReqs := scheduling.NewNodeSelectorRequirements(term.MatchExpressions...)
+		reqs.Add(termReqs.Values()...)
+	}
+	return &reqs, nil
 }
