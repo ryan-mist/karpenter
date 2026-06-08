@@ -138,20 +138,19 @@ Pools are built from in-cluster `ResourceSlice` objects published to the API ser
 4. Filters slices by node affinity compatibility with the NodeClaim's requirements. Only matching slices contribute devices; non-matching slices still participate in generation tracking and completeness checks.
 5. Detects **invalid** pools with duplicate device names across slices.
 
-For in-flight NodeClaims, a pool is included if it is compatible with *any* remaining candidate instance type. Pool-to-instance-type compatibility is tracked so the DFS can prune correctly.
+For in-flight NodeClaims, a pool is included if it is compatible with *any* remaining candidate instance type.
 
 ```go
 type Pool struct {
-    ID        PoolID
-    Slices    []*resourcev1.ResourceSlice
-    Devices   []DeviceWithID
+    Key        PoolKey  // {Driver DriverID, Pool PoolID}
+    Slices     []ResourceSlice
+    Devices    []DeviceWithID
     Incomplete bool
     Invalid    bool
-    // For in-flight NodeClaims: which instance types can see this pool.
-    // nil means all instance types (in-cluster pool).
-    InstanceTypes sets.Set[InstanceTypeID]
 }
 ```
+
+Template devices are not tracked in pools — they are provided separately per instance type via the `NodeClaim.ResourceSlices()` interface and iterated after in-cluster pool devices during the DFS.
 
 ### Pool Filtering
 
@@ -199,7 +198,25 @@ Before the DFS begins, each ResourceClaim is validated and parsed into internal 
 
 **Entry point**: `ValidateClaimRequest(ctx, kubeClient, claim, claimIndex, pools, templateDevicesByIT, celCache, bindingFallback) → (*ClaimData, error)`
 
-**Output**: `ClaimData` containing `Requests []RequestData` (one per device request) and `Constraints []Constraint` (one per claim-level constraint).
+**Output**:
+
+```go
+type ClaimData struct {
+    ID          ResourceClaimID  // unique.Handle[string] from claim name
+    Requests    []RequestData
+    Constraints []Constraint
+}
+
+type RequestData struct {
+    Name           string
+    Class          *resourcev1.DeviceClass
+    NumDevices     int                                    // For ExactCount mode
+    AllocationMode resourcev1.DeviceAllocationMode       // ExactCount or All
+    AllDevices     []DeviceWithID                         // Pre-computed eligible in-cluster devices (All mode)
+    AllTemplateDevicesByIT map[InstanceTypeID][]DeviceWithID  // Pre-computed eligible templates per IT (All mode)
+    Selectors      []resourcev1.DeviceSelector           // Combined from class + request
+}
+```
 
 ### Step 1: Constraint Parsing
 
@@ -331,6 +348,10 @@ For each slot, the algorithm tries candidate devices in iteration order: **in-cl
 
 This ordering ensures in-cluster devices are preferred. In the common case, in-cluster devices satisfy requests without touching template devices. When in-cluster devices are insufficient, the DFS naturally falls through to template devices — all in a single traversal per instance type.
 
+**Requirement accumulation across instance types:** Between instance type iterations, `allocatedDevices`, `pools`, and `snapshots` are reset, but `requirements` is **not** reset. Each instance type's contributed topology requirements tighten the baseline for subsequent instance types. This prevents disjoint requirement scenarios (e.g., "instance type A in zone-A OR instance type B in zone-B") that are not representable by a single NodeClaim. An instance type whose DFS would need requirements incompatible with the accumulated set from prior instance types is naturally pruned.
+
+**Binding fallback lifecycle:** The attribute binding fallback is `nil` during initial claim validation (`ValidateClaimRequest`). Before each instance type's DFS, `setBindingFallback()` configures all `MatchAttributeConstraint` instances with the correct `(nodePool, instanceType)` context. Binding paths are not evaluated during validation — only during DFS.
+
 ### Device Eligibility Checks
 
 For each candidate device, four checks are performed in order:
@@ -343,7 +364,7 @@ For each candidate device, four checks are performed in order:
 
 4. **Topology compatibility?** For non-node-local in-cluster devices with a `NodeSelector`, the device's implied topology requirements must be compatible with the NodeClaim's accumulated requirements. If compatible, the requirements are tightened and the pool set is re-filtered to reflect the narrower topology (see [Pool Filtering](#pool-filtering)). This state is snapshotted so it can be restored on backtrack.
 
-   > **Simplification**: Rather than tracking the full NodeClaim requirement set at each tree node, only the *incremental* requirements added by each allocated device are tracked. Since all devices are guaranteed compatible with the base NodeClaim (validated during gather), each new device's requirements need only be compatible with the *accumulated incremental requirements* from devices allocated earlier in the DFS. This avoids copying the full requirement set at each node.
+   > **Snapshot-based tracking**: A single `requirements` field holds the current accumulated topology constraints. When a non-node-local device tightens requirements, a `backtrackSnapshot{requirements, pools}` is pushed and both fields are mutated. On backtrack, the snapshot is popped and both are restored. Since all devices in the gathered pools are guaranteed compatible with the base requirements (validated during gather), each new device's requirements need only be compatible with the *accumulated* requirements from devices allocated earlier in the DFS path.
 
 ### Allocation Modes
 
@@ -371,7 +392,7 @@ The DFS is bounded by a 5-second context timeout. If the timeout fires during se
 
 The `Allocate()` method returns an `(AllocationResult, error)` tuple. A non-nil error indicates the allocation failed entirely (e.g., all instance types pruned, invalid claims, or context cancellation).
 
-1. **`InstanceTypes []InstanceTypeID`**: The set of instance types whose DFS succeeded. For existing initialized nodes, this field may be empty even on success. For in-flight NodeClaims, this must be a non-empty subset of the NodeClaim's current candidate instance types on success.
+1. **`InstanceTypes []InstanceTypeID`**: The set of instance types whose DFS succeeded. When there are no unallocated claims (all claims already satisfied), this returns the NodeClaim's full instance type set. For existing initialized nodes, this is the single known instance type. For in-flight NodeClaims with unallocated claims, this must be a non-empty subset of the NodeClaim's current candidate instance types on success.
 
 2. **`Requirements scheduling.Requirements`**: The accumulated topology requirements from all sources — both already-allocated claims and newly allocated non-node-local devices.
 
@@ -387,54 +408,57 @@ The `Allocator` struct is scoped to a single scheduling loop and is shared acros
 
 ```go
 type Allocator struct {
-    // The pre-filtered set of in-cluster ResourceSlices, provided at construction
-    // time. The caller is responsible for excluding slices from deleting/excluded
-    // nodes before passing them in. The allocator treats this as the complete
-    // universe of in-cluster slices and does not query cluster state directly.
-    inClusterSlices []*resourcev1.ResourceSlice
-
-    // In-cluster devices that have been allocated. Initialized from the
-    // deviceallocation controller's tracking state, then appended as devices
-    // are committed during the scheduling simulation.
-    allocatedDevices sets.Set[DeviceID]
-
-    // Per-NodeClaim, per-InstanceType in-flight device allocations. Built up as
-    // pods are committed to NodeClaims.
-    inFlightAllocatedDevices map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]
-
-    // Per-claim allocation metadata for in-memory claim reuse. Records the
-    // NodeClaim ID, whether template devices were used, and accumulated topology
-    // requirements for each claim allocated during the scheduling loop. Enables
-    // subsequent pods referencing the same claim to skip re-running the DFS.
-    claimAllocations map[types.UID]*ClaimAllocationMetadata
+    // Encapsulates device allocation state: pre-allocated devices (immutable seed
+    // set), inflight cluster allocations (by device and by NodeClaim/InstanceType),
+    // and inflight template allocations.
+    allocationTracker *AllocationTracker
 
     // The attribute binding adjacency graph. Built once at allocator construction
     // from the cloud provider's instance type metadata.
     attributeBindings AttributeBindings
 
+    // Used for DeviceClass resolution during claim validation.
+    kubeClient client.Client
+
+    // The pre-filtered set of in-cluster ResourceSlices, provided at construction
+    // time. The caller is responsible for excluding slices from deleting/excluded
+    // nodes before passing them in. The allocator treats this as the complete
+    // universe of in-cluster slices and does not query cluster state directly.
+    // Uses the ResourceSlice interface to abstract over API server slices.
+    inClusterSlices []ResourceSlice
+
     // Cached pool sets per NodeClaim. Stores the pre-filter pool superset from the
     // most recent allocation. On subsequent allocations, this set is re-filtered
     // against the NodeClaim's current (tightened) requirements, avoiding a full
     // scan of inClusterSlices.
-    poolCache map[NodeClaimID][]Pool
+    poolCache map[NodeClaimID][]*Pool
 
-    // Shared CEL compilation cache. The cel.Cache implementation is internally
-    // synchronized (RWMutex), allowing compiled expressions to be reused across
-    // parallel Allocate() calls without an external lock.
-    celCache cel.Cache
+    // Per-claim allocation metadata for in-memory claim reuse. Records the
+    // NodeClaim ID, whether template devices were used, and accumulated topology
+    // requirements for each claim allocated during the scheduling loop. Enables
+    // subsequent pods referencing the same claim to skip re-running the DFS.
+    // Keyed by claim name (interned as unique.Handle[string]).
+    claimAllocationMetadata map[ResourceClaimID]*ResourceClaimAllocationMetadata
 }
 ```
 
-**Initialization**:
-- `inClusterSlices`: Provided by the caller at construction time. See [Scheduler Initialization](#scheduler-initialization).
-- `allocatedDevices`: Sourced from the `deviceallocation` controller. Filtered to exclude devices allocated exclusively by **deleting pods** — this includes all pods on deleting nodes and disruption candidates, as well as pods that are individually deleting (observed `deletionTimestamp`). Devices allocated exclusively by such pods are excluded, making them available for reallocation.
-- `inFlightAllocatedDevices`: Starts empty. Populated via `Commit()`.
-- `claimAllocations`: Starts empty. Populated via `Commit()` with per-claim metadata.
-- `attributeBindings`: Call `BuildAttributeBindings(instanceTypesByNodePool)` with the cloud provider's instance type data, grouped by NodePool.
-- `poolCache`: Starts empty. Populated via `Commit()`.
-- `celCache`: Initialized empty, populated lazily, shared across all `Allocate()` calls.
+**AllocationTracker** encapsulates the device allocation state machine:
+- `PreallocatedDevices sets.Set[DeviceID]` — immutable seed set of devices already allocated in the cluster.
+- `InflightClusterAllocations map[DeviceID]*InflightAllocationMetadata` — tracks which NodeClaim/InstanceTypes have reserved each in-cluster device. A device allocated for a different NodeClaim is unavailable; a device allocated for the same NodeClaim on a different instance type is allowed (since the NodeClaim will collapse to a single IT).
+- `InflightClusterAllocationsByNodeClaim map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]` — inverse index for efficient release when instance types are pruned.
+- `InflightTemplateAllocations map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]` — template device allocations are NodeClaim+IT-local.
 
-**Thread safety**: The scheduler evaluates a pod against multiple NodeClaims in parallel. All parallel `Allocate()` calls are **read-only** with respect to top-level state. The `celCache` uses RWMutex protection for concurrent reads with exclusive writes. Mutation of `allocatedDevices`, `inFlightAllocatedDevices`, `claimAllocations`, and `poolCache` occurs only in `Commit()` and `ReleaseInstanceType()`, which are called sequentially after a placement decision is finalized.
+The `IsAllocated()` method implements the visibility rules described in [Device Eligibility Checks](#device-eligibility-checks) step 1. `Commit()` records device allocations from committed allocations. `ReleaseInstanceTypes()` frees devices when ITs are pruned.
+
+**Initialization**:
+- `allocationTracker`: Constructed via `NewAllocationTracker(allocatedDevices...)` with the pre-allocated device IDs sourced from the `deviceallocation` controller. Filtered to exclude devices allocated exclusively by **deleting pods** — this includes all pods on deleting nodes and disruption candidates, as well as pods that are individually deleting (observed `deletionTimestamp`). Devices allocated exclusively by such pods are excluded, making them available for reallocation.
+- `attributeBindings`: Call `BuildAttributeBindings(instanceTypesByNodePool)` with the cloud provider's instance type data, grouped by NodePool.
+- `kubeClient`: The controller-runtime client, used to resolve `DeviceClass` references during claim validation.
+- `inClusterSlices`: Provided by the caller at construction time. See [Scheduler Initialization](#scheduler-initialization).
+- `poolCache`: Starts empty. Populated via `Commit()`.
+- `claimAllocationMetadata`: Starts empty. Populated via `Commit()` with per-claim metadata.
+
+**Thread safety**: The scheduler evaluates a pod against multiple NodeClaims in parallel. All parallel `Allocate()` calls are **read-only** with respect to top-level state. Mutation of `allocationTracker`, `claimAllocationMetadata`, and `poolCache` occurs only in `Commit()` and `ReleaseInstanceType()`, which are called sequentially after a placement decision is finalized.
 
 ### Per-Request Allocator State
 
@@ -444,32 +468,39 @@ The child `allocator` struct is created per `Allocate()` call. It embeds a point
 type allocator struct {
     *Allocator  // read-only access to shared state
 
-    ctx       context.Context
+    ctx      context.Context
+    // Created per-Allocate() call to avoid write-contention on the top-level allocator.
+    celCache *dracel.Cache
+
+    // The NodeClaim being evaluated.
     nodeClaim NodeClaim
-    claims    []*resourcev1.ResourceClaim
-    pools     []Pool
-
-    // Per-claim constraint sets.
-    constraints [][]constraint
-
-    // Per-request metadata (device count, class, selectors, predetermined devices).
-    requestData map[requestIndices]requestData
-
-    // Devices being allocated in the current DFS path.
-    // Maps deviceID → set of claim indices using it.
-    allocatingDevices map[DeviceID]sets.Set[int]
-
+    // The current instance type being evaluated in the DFS.
+    itID InstanceTypeID
+    // Template devices indexed by instance type, built from NodeClaim.ResourceSlices().
+    templateDevicesByIT map[InstanceTypeID][]DeviceWithID
+    // Validated claim data: contains requests (with selectors, class, mode, predetermined
+    // devices) and constraints. Replaces raw claims, separate constraint/request maps.
+    claimData []*ClaimData
     // Cache: does device X match request Y's selectors?
     deviceMatchesRequest map[matchKey]bool
 
-    // The incremental requirements accumulated from non-node-local device allocations.
-    // Pushed/popped during DFS.
-    incrementalRequirements []scheduling.Requirements
+    // Devices allocated in the current DFS path (quick lookup set).
+    allocatedDevices sets.Set[DeviceID]
+    // Ordered metadata for allocated devices (claim index, device details).
+    // Used for result construction and topology requirement accumulation.
+    allocatedDevicesMetadata []deviceAllocationMetadata
 
-    // The allocation result, populated when a solution is found.
-    result []internalAllocationResult
+    // The accumulated topology requirements, progressively tightened as non-node-local
+    // devices are allocated. Restored from snapshots on backtrack.
+    requirements scheduling.Requirements
+    // The current filtered pool set. Narrowed when requirements tighten; restored on backtrack.
+    pools []*Pool
+    // Stack of {requirements, pools} pairs pushed on requirement tightening, popped on backtrack.
+    snapshots []backtrackSnapshot
 }
 ```
+
+The `ClaimData` type produced by validation contains both `Requests []RequestData` and `Constraints []Constraint`, replacing the separate `constraints` and `requestData` maps from the original design. Results are constructed in the `allocate()` method's return path rather than accumulated in a `result` field.
 
 ---
 
@@ -481,17 +512,17 @@ Allocation results are not applied to the allocator's shared state until explici
 
 When `Commit()` is called on an allocation result:
 
+`Allocation` is an interface returned in `AllocationResult`. The scheduler calls `Commit()` directly on the allocation handle:
+
 ```go
-func (a *Allocator) Commit(ctx context.Context, nodeClaim NodeClaim, allocations []Allocation) {
-    for _, alloc := range allocations {
-        alloc.Commit()
-    }
+type Allocation interface {
+    Commit(context.Context)
 }
 ```
 
-Each `Allocation` implementation updates the top-level allocator:
+The scheduler invokes `allocationResult.Allocation.Commit(ctx)` after deciding to proceed with placement. Internally, the `Commit()` implementation updates the top-level allocator:
 
-1. **Device reservation.** All device IDs from the allocation are recorded in the allocator's in-flight tracking, indexed by `(nodeClaimID, instanceTypeID)`. This makes them visible to `isDeviceAllocated()` checks in subsequent allocations.
+1. **Device reservation.** All device IDs from the allocation are recorded in the `AllocationTracker`, indexed by `(nodeClaimID, instanceTypeID)`. This makes them visible to `IsAllocated()` checks in subsequent allocations.
 
 2. **Pool cache update.** The pool set used during allocation is cached for the NodeClaim, enabling faster pool resolution in subsequent allocations. The cache stores the pre-filter pool superset — the next allocation will re-filter against the NodeClaim's newly tightened requirements.
 
@@ -514,7 +545,7 @@ At scheduler construction (`NewScheduler`), build the DRA allocator:
 1. **Collect and filter in-cluster ResourceSlices**: Gather all `ResourceSlice` objects from the cluster. Filter out slices owned by nodes that are not in the stateNode set passed to the scheduler (i.e., deleting nodes, disruption candidates). Non-node-owned slices (no node owner reference) are always included. This filtering uses `metadata.ownerReferences` to determine node ownership — `spec.nodeName` indicates accessibility, not ownership.
 2. Obtain the set of allocated devices from the `deviceallocation` controller's tracking state, filtered for deleting pods. The `deviceallocation.Controller` is injected directly into the provisioner (not accessed through an interface). Devices with no consumers (unowned) are treated as releasable. Deleting pods should include all pods on deleting nodes and disruption candidates.
 3. Build `AttributeBindings` from instance type metadata grouped by NodePool.
-4. Construct the `Allocator` with the filtered slice set, allocated device set, empty `inFlightAllocatedDevices`, empty `claimAllocations`, empty `poolCache`, and empty `celCache`.
+4. Construct the `Allocator` via `NewAllocator(inClusterSlices, allocatedDevices, attributeBindings, kubeClient)`. The `allocationTracker`, `poolCache`, and `claimAllocationMetadata` start empty and are populated via `Commit()` during the scheduling loop.
 
 The allocator is stored on the `Scheduler` struct and passed through to NodeClaim evaluation.
 
@@ -537,7 +568,7 @@ For existing (initialized) nodes:
 2. `NodeClaim.ResourceSlices()` returns an empty map — all published slices are already in the allocator's in-cluster pool set.
 3. Call `Allocator.Allocate(ctx, nodeClaim, pod.ResourceClaims)`.
 4. If allocation succeeds, the pod can be placed. The `AllocationResult.Allocation` is held until `Add()` is called. **Note**: `AllocationResult.Requirements` are **not** merged into the existing node's requirements — existing node requirements are immutable (already set in stone). The allocator validates compatibility internally; if claims could not be satisfied with the node's requirements, the allocation would have failed.
-5. On `Add()`, call `Allocator.Commit()` to mark the devices as consumed.
+5. On `Add()`, call `AllocationResult.Allocation.Commit(ctx)` to mark the devices as consumed.
 
 For pre-initialized nodes (existing but not yet fully initialized):
 1. The NodeClaim wraps a real node with a known instance type, but some drivers have not yet published complete pools.
@@ -593,11 +624,11 @@ When the scheduling loop completes and NodeClaims are finalized:
 
 2. **DFS timeout**: 5 second per-pod timeout, with the overall scheduling loop timeout as a hard upper bound.
 
-3. **CEL cache scope**: Shared on the top-level `Allocator` with RWMutex protection, following the upstream approach.
+3. **CEL cache scope**: Created per `Allocate()` call (per child allocator) to avoid write-contention on cache misses. Sharing on the top-level allocator with RWMutex protection was considered but the performance tradeoff has not been validated as worthwhile.
 
 4. **Pool cache strategy**: Incrementally narrowed. On commit, the cache stores the pre-filter pool superset. On subsequent allocations, this superset is re-filtered against tightened requirements.
 
-5. **All-mode device handling**: Pre-compute the predetermined device set per instance type during validation and store in `requestData`.
+5. **All-mode device handling**: Pre-compute the predetermined device set per instance type during validation and store in `RequestData` (within `ClaimData.Requests`).
 
 6. **Unsupported constraint types**: Fail the allocation for the claim, following upstream behavior. Unknown constraint types indicate API version skew.
 

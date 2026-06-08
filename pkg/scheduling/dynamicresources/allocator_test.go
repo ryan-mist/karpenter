@@ -976,7 +976,7 @@ var _ = Describe("Allocator", func() {
 			expectedZone := result.Requirements.Get(corev1.LabelTopologyZone).Values()[0]
 
 			result.Allocation.Commit(ctx)
-			meta := alloc.ResourceClaimAllocationMetadata("c1")
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
 			Expect(meta).ToNot(BeNil())
 			Expect(meta.Devices).To(HaveKey(unique.Make("it-1")))
 			Expect(meta.Devices[unique.Make("it-1")]).To(HaveLen(1))
@@ -1783,6 +1783,797 @@ var _ = Describe("Allocator", func() {
 		})
 	})
 
+	Describe("Cross-IT requirement accumulation", func() {
+		It("should prune later instance types when earlier IT pins topology via in-cluster device", func() {
+			// Two zone pools: zone-A has 2 devices, zone-B has 2 devices.
+			// Request 2 devices. IT ordering: [it-a, it-b].
+			// it-a evaluates first: DFS picks zone-A devices (first in pool order).
+			// This tightens accumulated requirements to zone-A.
+			// it-b evaluates second: zone-B devices are now excluded by requirements.
+			// But it-b can still use zone-A devices (same pool). So it-b also succeeds.
+			//
+			// To demonstrate pruning, we need IT-B to ONLY have access to zone-B devices.
+			// We can achieve this by giving IT-B template devices in a pool that doesn't
+			// overlap with zone-A, and having no in-cluster devices available for IT-B
+			// (all zone-A devices consumed by IT-A is not the case since state resets per IT).
+			//
+			// Actually, per allocator.go:487, state resets per IT (restoreState), but requirements
+			// are NOT reset (line 748 comment). So IT-B starts fresh on devices but with tightened reqs.
+			// Zone-B in-cluster devices are filtered out by FilterPools using the tightened requirements.
+			// If zone-A has exactly 2 devices and IT-B needs 2, it will find zone-A devices too.
+			//
+			// The only way to prune IT-B is if zone-A doesn't have enough devices for IT-B,
+			// and zone-B is excluded. Let's set: zone-A has 1 device, zone-B has 1 device.
+			// Request 1 device. IT-A picks zone-A, tightens to zone-A. IT-B also picks zone-A. Both pass.
+			//
+			// For pruning: zone-A has 1 device. Request 2 devices. IT-A has 1 template + 1 in-cluster = 2.
+			// Requirements tighten to zone-A. IT-B has 1 template too but the in-cluster zone-B device
+			// is now filtered out, leaving only 1 in-cluster (zone-A) + 1 template = 2. So IT-B also passes.
+			//
+			// Hmm - the issue is that in-cluster devices are shared across ITs and templates are per-IT.
+			// The pruning happens when after tightening, an IT can't find enough devices.
+			//
+			// Simplest approach: use ONLY in-cluster devices, 1 per zone. Request 2.
+			// IT-A tries zone-A first, picks it. Needs 1 more. Zone-B still available at this point
+			// (requirements haven't tightened yet during DFS for the same IT). IT-A picks zone-B too.
+			// Wait - but zone-A device tightens requirements, zone-B device would be incompatible.
+			// So IT-A picks zone-A (tightens to A), then zone-B fails compatibility check, backtracks.
+			// IT-A can't satisfy 2 with only 1 zone-A device. IT-A fails.
+			// Then IT-B tries similarly and also fails. Both pruned = error.
+			//
+			// Let me try: zone-A has 2 devices, zone-B has 2 devices. Request 2.
+			// IT-A picks zone-A gpu-a0 (tightens to A), picks zone-A gpu-a1. IT-A succeeds with zone-A.
+			// Requirements now tightened to zone-A for subsequent ITs.
+			// IT-B starts with tightened requirements (zone-A only). FilterPools returns only zone-A pool.
+			// IT-B picks zone-A gpu-a0, gpu-a1. IT-B succeeds. Both pass. No pruning.
+			//
+			// To force pruning of IT-B: make zone-A have only 1 device, give IT-A a template.
+			// zone-A: 1 device. IT-A has 1 template. Request 2. IT-A: 1 in-cluster (zone-A) + 1 template = 2. Success.
+			// Requirements tighten to zone-A. IT-B has 1 template too. IT-B: 1 in-cluster (zone-A) + 1 template = 2. Also passes.
+			//
+			// The cross-IT tightening prevents the scenario where IT-A would choose zone-A and IT-B would choose zone-B.
+			// The test should verify that IT-B CAN'T choose zone-B after IT-A chose zone-A.
+			// With 2 devices per zone and request=2, without cross-IT tightening both could succeed independently,
+			// but with tightening IT-B is forced to also use zone-A.
+			//
+			// Best approach for demonstrating pruning:
+			// zone-A: 1 device. zone-B: 1 device. IT-A gets 1 template. IT-B gets NO template.
+			// Request 2. IT-A: 1 zone-A in-cluster + 1 template = 2. Succeeds (zone-A tightened).
+			// IT-B: requirements tightened to zone-A. Only zone-A pool visible. Only 1 device. No template. Fails. Pruned.
+			inClusterSlices2 := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0"),
+					withGeneration(1, 1),
+				),
+				makeAPISlice("s2", "gpu.example.com", "pool-zone-b",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2b"),
+					withAPIDevices("gpu-b0"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices2, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc2 := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes: []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b")},
+				resourceSlices: map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice{
+					unique.Make("it-a"): {dynamicresources.NewTemplateSlice(makeTemplate("gpu.example.com", "pool-tmpl", "tgpu-0"))},
+					unique.Make("it-b"): {},
+				},
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 2))
+
+			result, err := alloc.Allocate(ctx, nc2, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			// Only IT-A should survive (it has template to supplement zone-A).
+			// IT-B is pruned because after zone-A tightening it only has 1 device.
+			Expect(result.InstanceTypes).To(HaveLen(1))
+			Expect(result.InstanceTypes[0].Value()).To(Equal("it-a"))
+		})
+
+		It("should allow instance types with compatible topology after prior IT contributions", func() {
+			// Both ITs can use zone-A devices. After IT-A tightens to zone-A, IT-B also succeeds.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0", "gpu-a1"),
+					withGeneration(1, 1),
+				),
+				makeAPISlice("s2", "gpu.example.com", "pool-zone-b",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2b"),
+					withAPIDevices("gpu-b0", "gpu-b1"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 2))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			// Both ITs succeed using zone-A (or zone-B, whichever is first).
+			// Either way, both survive because there are 2 devices in the pinned zone.
+			Expect(result.InstanceTypes).To(HaveLen(2))
+		})
+	})
+
+	Describe("ReleaseInstanceType requirement recomputation", func() {
+		It("should relax TotalRequirements when a restricting instance type is released", func() {
+			// Both ITs allocate the same zone-A in-cluster device and contribute zone-A.
+			// After releasing one IT, TotalRequirements still has zone-A from the remaining IT.
+			// After releasing both, TotalRequirements is empty.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.InstanceTypes).To(HaveLen(2))
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
+			Expect(meta).ToNot(BeNil())
+			// Both ITs contributed zone-A from the in-cluster device.
+			Expect(meta.TotalRequirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
+			Expect(meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+
+			// Release IT-A. IT-B still contributes zone-A.
+			alloc.ReleaseInstanceType(ctx, unique.Make("test-nc"), unique.Make("it-a"))
+			Expect(meta.TotalRequirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
+			Expect(meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+
+			// Release IT-B. No ITs remain → TotalRequirements should be empty.
+			alloc.ReleaseInstanceType(ctx, unique.Make("test-nc"), unique.Make("it-b"))
+			Expect(meta.TotalRequirements).To(BeEmpty())
+		})
+
+		It("should empty TotalRequirements when all instance types are released", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0", "gpu-a1"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
+			Expect(meta).ToNot(BeNil())
+			Expect(meta.TotalRequirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
+
+			// Release both ITs.
+			alloc.ReleaseInstanceType(ctx, unique.Make("test-nc"), unique.Make("it-a"))
+			alloc.ReleaseInstanceType(ctx, unique.Make("test-nc"), unique.Make("it-b"))
+
+			Expect(meta.TotalRequirements).To(BeEmpty())
+		})
+
+		It("should correctly intersect remaining ContributedRequirements after partial release", func() {
+			// Three ITs all allocating zone-A devices. Release middle IT. TotalRequirements remains zone-A.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0", "gpu-a1", "gpu-a2"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes: []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b"), unique.Make("it-c")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.InstanceTypes).To(HaveLen(3))
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
+			Expect(meta).ToNot(BeNil())
+			Expect(meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+
+			// Release IT-B. IT-A and IT-C remain, both contributed zone-A.
+			alloc.ReleaseInstanceType(ctx, unique.Make("test-nc"), unique.Make("it-b"))
+
+			// TotalRequirements should still be zone-A.
+			Expect(meta.TotalRequirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
+			Expect(meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+		})
+	})
+
+	Describe("Validation errors through Allocate()", func() {
+		It("should return error when DeviceClass does not exist", func() {
+			alloc = dynamicresources.NewAllocator(nil, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplate("gpu.example.com", "pool-a", "tgpu-0"),
+			)
+			claim := makeClaim("c1", exactRequest("req-1", "nonexistent-class", 1))
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not found"))
+		})
+
+		It("should return error for unsupported selector type", func() {
+			// Use a request-level non-CEL selector (API server validates class selectors).
+			alloc = dynamicresources.NewAllocator(nil, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplate("gpu.example.com", "pool-a", "tgpu-0"),
+			)
+			// A claim with a request that has a non-CEL selector (empty DeviceSelector).
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+				Spec: resourcev1.ResourceClaimSpec{
+					Devices: resourcev1.DeviceClaim{
+						Requests: []resourcev1.DeviceRequest{
+							{
+								Name: "req-1",
+								Exactly: &resourcev1.ExactDeviceRequest{
+									DeviceClassName: "gpu",
+									Count:           1,
+									Selectors: []resourcev1.DeviceSelector{
+										{}, // No CEL field
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("unsupported selector"))
+		})
+
+		It("should return error for FirstAvailable request", func() {
+			alloc = dynamicresources.NewAllocator(nil, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplate("gpu.example.com", "pool-a", "tgpu-0"),
+			)
+			// A request with no Exactly field (FirstAvailable).
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+				Spec: resourcev1.ResourceClaimSpec{
+					Devices: resourcev1.DeviceClaim{
+						Requests: []resourcev1.DeviceRequest{
+							{Name: "req-1"},
+						},
+					},
+				},
+			}
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("only Exactly requests"))
+		})
+
+		It("should return error for unsupported constraint type", func() {
+			alloc = dynamicresources.NewAllocator(nil, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplate("gpu.example.com", "pool-a", "tgpu-0"),
+			)
+			// A claim with an empty constraint (no MatchAttribute set).
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+				Spec: resourcev1.ResourceClaimSpec{
+					Devices: resourcev1.DeviceClaim{
+						Constraints: []resourcev1.DeviceConstraint{
+							{}, // No MatchAttribute
+						},
+						Requests: []resourcev1.DeviceRequest{
+							{Name: "req-1", Exactly: &resourcev1.ExactDeviceRequest{
+								DeviceClassName: "gpu",
+								Count:           1,
+							}},
+						},
+					},
+				},
+			}
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("unsupported constraint"))
+		})
+	})
+
+	Describe("Constraint path exclusion during DFS", func() {
+		It("should fail when no consistent constraint evaluation path exists across devices", func() {
+			// Device-A (in-cluster) has numa attribute concretely.
+			// Device-B (template) does NOT have the attribute but IS bound via AttributeBindings.
+			// The MatchAttribute constraint has two mutually exclusive paths:
+			//   - Concrete: first device pins value, subsequent must match concretely
+			//   - Binding: first device establishes binding, subsequent must be bound
+			// If device-A is tried first → concrete path → device-B rejected (no attribute, can't use binding).
+			// If device-B is tried first → binding path → device-A rejected (has concrete attribute, can't mix).
+			// Result: no valid pair exists.
+			devA := deviceID("gpu.example.com", "pool-tmpl", "tgpu-0")
+			devB := deviceID("gpu.example.com", "pool-tmpl", "tgpu-1")
+
+			bindings := dynamicresources.BuildAttributeBindings(map[string][]*cloudprovider.InstanceType{
+				"test-np": {
+					&cloudprovider.InstanceType{
+						Name: "it-1",
+						DynamicResources: cloudprovider.DynamicResources{
+							AttributeBindings: []*cloudprovider.AttributeBinding{
+								{
+									Attribute: "gpu.example.com/numa",
+									Devices:   []cloudprovider.DeviceID{devA.DeviceID, devB.DeviceID},
+								},
+							},
+						},
+					},
+				},
+			})
+
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					withAPIDevicesWithAttrs(
+						deviceWithAttrs("dev-concrete", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+					),
+				),
+			}
+
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), bindings, env.Client)
+			// Template device WITHOUT the numa attribute (will use binding fallback path).
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplateWithAttrs("gpu.example.com", "pool-tmpl",
+					deviceWithAttrs("tgpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{}),
+				),
+			)
+
+			// Request 2 devices with MatchAttribute on numa.
+			// dev-concrete has the attribute → concrete path.
+			// tgpu-0 lacks attribute → binding path.
+			// Paths are mutually exclusive → no valid pair.
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa"))},
+				},
+				exactRequest("req-1", "gpu", 2),
+			)
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should succeed when all devices use binding path consistently", func() {
+			// Both template devices lack the attribute but are bound to each other.
+			devA := deviceID("gpu.example.com", "pool-tmpl", "tgpu-0")
+			devB := deviceID("gpu.example.com", "pool-tmpl", "tgpu-1")
+
+			bindings := dynamicresources.BuildAttributeBindings(map[string][]*cloudprovider.InstanceType{
+				"test-np": {
+					&cloudprovider.InstanceType{
+						Name: "it-1",
+						DynamicResources: cloudprovider.DynamicResources{
+							AttributeBindings: []*cloudprovider.AttributeBinding{
+								{
+									Attribute: "gpu.example.com/numa",
+									Devices:   []cloudprovider.DeviceID{devA.DeviceID, devB.DeviceID},
+								},
+							},
+						},
+					},
+				},
+			})
+
+			alloc = dynamicresources.NewAllocator(nil, sets.New[cloudprovider.DeviceID](), bindings, env.Client)
+			nc := makeNodeClaimWithTemplates("it-1",
+				makeTemplateWithAttrs("gpu.example.com", "pool-tmpl",
+					deviceWithAttrs("tgpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{}),
+					deviceWithAttrs("tgpu-1", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{}),
+				),
+			)
+
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa"))},
+				},
+				exactRequest("req-1", "gpu", 2),
+			)
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+
+		It("should succeed when all devices use concrete path consistently", func() {
+			// Both in-cluster devices have the attribute concretely with the same value.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					withAPIDevicesWithAttrs(
+						deviceWithAttrs("gpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-1", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+					),
+				),
+			}
+
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa"))},
+				},
+				exactRequest("req-1", "gpu", 2),
+			)
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+	})
+
+	Describe("All-mode + ExactCount under shared constraint", func() {
+		It("should satisfy MatchAttribute spanning All-mode and ExactCount requests", func() {
+			// 2 in-cluster devices marked as "compute" with same NUMA.
+			// 1 in-cluster device marked as "extra" with same NUMA.
+			// Constraint on NUMA applies to both requests (All-mode "compute" + ExactCount "extra").
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					withAPIDevicesWithAttrs(
+						deviceWithAttrs("gpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("compute")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-1", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("compute")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-2", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("extra")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+					),
+				),
+			}
+			ExpectApplied(ctx, env.Client,
+				&resourcev1.DeviceClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "compute-class"},
+					Spec: resourcev1.DeviceClassSpec{
+						Selectors: []resourcev1.DeviceSelector{
+							{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["gpu.example.com"].type == "compute"`}},
+						},
+					},
+				},
+				&resourcev1.DeviceClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "extra-class"},
+					Spec: resourcev1.DeviceClassSpec{
+						Selectors: []resourcev1.DeviceSelector{
+							{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["gpu.example.com"].type == "extra"`}},
+						},
+					},
+				},
+			)
+
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+
+			// All "compute" devices + 1 "extra" device, all sharing NUMA constraint.
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa"))},
+				},
+				allRequest("all-compute", "compute-class"),
+				exactRequest("one-extra", "extra-class", 1),
+			)
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+
+		It("should fail when mixed-mode requests cannot share constraint value", func() {
+			// All-mode devices have NUMA node-0, ExactCount device has NUMA node-1.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					withAPIDevicesWithAttrs(
+						deviceWithAttrs("gpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("compute")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-1", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("compute")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-2", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/type": {StringValue: ptr.To("extra")},
+							"gpu.example.com/numa": {StringValue: ptr.To("node-1")},
+						}),
+					),
+				),
+			}
+			ExpectApplied(ctx, env.Client,
+				&resourcev1.DeviceClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "compute-class2"},
+					Spec: resourcev1.DeviceClassSpec{
+						Selectors: []resourcev1.DeviceSelector{
+							{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["gpu.example.com"].type == "compute"`}},
+						},
+					},
+				},
+				&resourcev1.DeviceClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "extra-class2"},
+					Spec: resourcev1.DeviceClassSpec{
+						Selectors: []resourcev1.DeviceSelector{
+							{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["gpu.example.com"].type == "extra"`}},
+						},
+					},
+				},
+			)
+
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa"))},
+				},
+				allRequest("all-compute", "compute-class2"),
+				exactRequest("one-extra", "extra-class2", 1),
+			)
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("ContributedRequirements tracking", func() {
+		It("should track ContributedRequirements independently per instance type", func() {
+			// Both ITs allocate from the same zone-A pool (same in-cluster device).
+			// Each IT should have its own entry in ContributedRequirements.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-a0"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-a"), unique.Make("it-b")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.InstanceTypes).To(HaveLen(2))
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
+			Expect(meta).ToNot(BeNil())
+			// Both ITs should have independent entries.
+			Expect(meta.ContributedRequirements).To(HaveKey(unique.Make("it-a")))
+			Expect(meta.ContributedRequirements).To(HaveKey(unique.Make("it-b")))
+			// Both contributed zone-A.
+			Expect(meta.ContributedRequirements[unique.Make("it-a")].Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+			Expect(meta.ContributedRequirements[unique.Make("it-b")].Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+			// TotalRequirements is the intersection: zone-A.
+			Expect(meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("us-west-2a"))
+		})
+
+		It("should have empty TotalRequirements when IT uses non-topology device", func() {
+			// IT allocates from an AllNodes pool (no topology). ContributedRequirements empty for that IT.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-global",
+					withAllNodes(),
+					withAPIDevices("gpu-g0"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim("c1")
+			Expect(meta).ToNot(BeNil())
+			// AllNodes device has no topology → TotalRequirements should be empty.
+			Expect(meta.TotalRequirements).To(BeEmpty())
+		})
+	})
+
+	Describe("All-mode validation failures through Allocate()", func() {
+		It("should return error when All-mode pool has duplicate device names", func() {
+			// Create two slices for the same pool with duplicate device names.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 2), withAPIDevices("gpu-0", "gpu-1")),
+				makeAPISlice("s2", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 2), withAPIDevices("gpu-0", "gpu-2")),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", allRequest("req-1", "gpu"))
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid"))
+		})
+
+		It("should return error when All-mode pool is incomplete", func() {
+			// Slice declares sliceCount=2 but only 1 slice exists.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 2), withAPIDevices("gpu-0", "gpu-1")),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", allRequest("req-1", "gpu"))
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("incomplete"))
+		})
+	})
+
+	Describe("Constraint scoped to request subset", func() {
+		It("should allow non-scoped requests to cross constraint boundaries", func() {
+			// 3 requests, constraint scoped to [req-a, req-b].
+			// req-a and req-b must share NUMA. req-c can use a different NUMA.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					withAPIDevicesWithAttrs(
+						deviceWithAttrs("gpu-0", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-1", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-0")},
+						}),
+						deviceWithAttrs("gpu-2", map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+							"gpu.example.com/numa": {StringValue: ptr.To("node-1")},
+						}),
+					),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+
+			claim := makeClaimWithConstraints("c1",
+				[]resourcev1.DeviceConstraint{
+					{
+						MatchAttribute: ptr.To(resourcev1.FullyQualifiedName("gpu.example.com/numa")),
+						Requests:       []string{"req-a", "req-b"},
+					},
+				},
+				exactRequest("req-a", "gpu", 1),
+				exactRequest("req-b", "gpu", 1),
+				exactRequest("req-c", "gpu", 1),
+			)
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+	})
+
+	Describe("Multiple pools in All-mode", func() {
+		It("should aggregate devices from multiple pools in All-mode", func() {
+			// 3 pools with same driver, 1 device each.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices("gpu-0")),
+				makeAPISlice("s2", "gpu.example.com", "pool-b", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices("gpu-1")),
+				makeAPISlice("s3", "gpu.example.com", "pool-c", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices("gpu-2")),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", allRequest("req-1", "gpu"))
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+	})
+
+	Describe("Empty pool set", func() {
+		It("should fail when no pools match and no templates available", func() {
+			// NC requires zone-C but all pools are zone-A/B.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-zone-a",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2a"),
+					withAPIDevices("gpu-0"),
+					withGeneration(1, 1),
+				),
+				makeAPISlice("s2", "gpu.example.com", "pool-zone-b",
+					withNodeSelector(corev1.LabelTopologyZone, "us-west-2b"),
+					withAPIDevices("gpu-1"),
+					withGeneration(1, 1),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, sets.New[cloudprovider.DeviceID](), nil, env.Client)
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2c"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-1")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
 	Describe("In-memory allocated claim handling", func() {
 		It("should skip DFS for an in-memory allocated claim on the same NodeClaim (in-cluster only)", func() {
 			inClusterSlices := []dynamicresources.ResourceSlice{
@@ -2054,13 +2845,13 @@ var _ = Describe("Allocator", func() {
 			Expect(err).ToNot(HaveOccurred())
 			result1.Allocation.Commit(ctx)
 
-			claim1Meta := alloc.ResourceClaimAllocationMetadata("zonal-claim")
+			claim1Meta := alloc.ResourceClaimAllocationMetadataForClaim("zonal-claim")
 			Expect(claim1Meta).ToNot(BeNil())
-			Expect(claim1Meta.Requirements).ToNot(BeEmpty())
-			Expect(claim1Meta.Requirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
-			Expect(claim1Meta.Requirements.Get(corev1.LabelTopologyZone).Values()).To(HaveLen(1))
+			Expect(claim1Meta.TotalRequirements).ToNot(BeEmpty())
+			Expect(claim1Meta.TotalRequirements.Has(corev1.LabelTopologyZone)).To(BeTrue())
+			Expect(claim1Meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()).To(HaveLen(1))
 
-			expectedZone := claim1Meta.Requirements.Get(corev1.LabelTopologyZone).Values()[0]
+			expectedZone := claim1Meta.TotalRequirements.Get(corev1.LabelTopologyZone).Values()[0]
 
 			// The second pod we allocate references the previously allocated claim and a new claim. We should merge the
 			// previously allocated claim's requirements into the baseline and only allocate a devices which satisfies those
@@ -2086,7 +2877,7 @@ var _ = Describe("Allocator", func() {
 			Expect(result2.Requirements.Get(corev1.LabelTopologyZone).Values()).To(HaveLen(1))
 			Expect(result2.Requirements.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf(expectedZone))
 
-			claim2Meta := alloc.ResourceClaimAllocationMetadata("new-claim")
+			claim2Meta := alloc.ResourceClaimAllocationMetadataForClaim("new-claim")
 			Expect(claim2Meta).ToNot(BeNil())
 			Expect(claim2Meta.Devices).To(HaveKey(unique.Make("it-1")))
 			claim2Devices := claim2Meta.Devices[unique.Make("it-1")]

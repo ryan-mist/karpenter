@@ -55,48 +55,37 @@ type Allocator struct {
 	poolCache map[NodeClaimID][]*Pool
 	// claimAllocationMetadata contains metadata for in-memory ResourceClaim allocations, including the allocated devices
 	// and the scheduling requirements.
-	claimAllocationMetadata map[ResourceClaimID]*resourceClaimAllocationMetadata
+	claimAllocationMetadata map[ResourceClaimID]*ResourceClaimAllocationMetadata
 }
 
-// ResourceClaimAllocationMetadata returns a copy of the allocator's internal ResourceClaim allocation metadata. A nil
-// result will be returned if the claim hasn't been allocated by the allocator, i.e. both unallocated claims and claims
-// allocated in-cluster will return nil.
-func (a *Allocator) ResourceClaimAllocationMetadata(claimName string) *ResourceClaimAllocationMetadata {
+// ResourceClaimAllocationMetadataForClaim returns a copy of the allocator's internal ResourceClaim allocation metadata.
+// A nil result will be returned if the claim hasn't been allocated by the allocator, i.e. both unallocated claims and
+// claims allocated in-cluster will return nil.
+func (a *Allocator) ResourceClaimAllocationMetadataForClaim(claimName string) *ResourceClaimAllocationMetadata {
 	meta, ok := a.claimAllocationMetadata[unique.Make(claimName)]
 	if !ok {
 		return nil
 	}
-	copiedDevices := make(map[InstanceTypeID][]DeviceID, len(meta.Devices))
-	for it, devices := range meta.Devices {
-		copiedDevices[it] = make([]DeviceID, len(devices))
-		copy(copiedDevices[it], devices)
-	}
-	return &ResourceClaimAllocationMetadata{
-		NodeClaimID:  meta.NodeClaimID,
-		Requirements: copyRequirements(meta.TotalRequirements),
-		Devices:      copiedDevices,
-	}
+	return meta
 }
 
-// ResourceClaimAllocationMetadata is a view into the Allocator's internal ResourceClaim allocation state. It provides
-// the current topology requirements associated with the claim, the NodeClaim the ResourceClaim was transitively
-// allocated for, and the allocated devices dependent on the instance type selected for the NodeClaim.
-type ResourceClaimAllocationMetadata struct {
-	NodeClaimID  NodeClaimID
-	Requirements scheduling.Requirements
-	Devices      map[InstanceTypeID][]DeviceID
+// ResourceClaimAllocationMetadataForClaim returns a copy of the allocator's internal ResourceClaim allocation metadata.
+// A nil result will be returned if the claim hasn't been allocated by the allocator, i.e. both unallocated claims and
+// claims allocated in-cluster will return nil.
+func (a *Allocator) ResourceClaimAllocationMetadata() map[ResourceClaimID]*ResourceClaimAllocationMetadata {
+	return a.claimAllocationMetadata
 }
 
-// resourceClaimAllocationMetadata represents thte current allocation state for a given ResourceClaim. This includes
+// ResourceClaimAllocationMetadata represents thte current allocation state for a given ResourceClaim. This includes
 // the NodeClaim the ResourceClaim was transitively allocated for, the topology requirements that will be associated
 // with the ResourceClaim, and the set of devices allocated to the ResourceClaim on a per-instance type basis.
-type resourceClaimAllocationMetadata struct {
+type ResourceClaimAllocationMetadata struct {
 	// NodeClaimID is the NodeClaim that is transitively associated with the ResourceClaim's allocation, via the pod it
 	// was allocated for. If the ResourceClaim was satisifed using any template devices, pods referencing this
 	// ResourceClaim may not be bound to any other NodeClaim.
 	NodeClaimID NodeClaimID
 
-	// contributedRequirements represents the requirements that are contributed by each instance type. Each ResourceClaim
+	// ContributedRequirements represents the requirements that are contributed by each instance type. Each ResourceClaim
 	// is transitively associated with a single NodeClaim, via the pod it was allocated for. For each instance type the
 	// NodeClaim is superposed across, a different device may be selected to satisfy the claim. In this scenario,
 	// depending on the instance type the NodeClaim collapses to, the topology requirements associated with the
@@ -151,7 +140,7 @@ func NewAllocator(
 		kubeClient:              kubeClient,
 		inClusterSlices:         inClusterSlices,
 		poolCache:               make(map[NodeClaimID][]*Pool),
-		claimAllocationMetadata: make(map[ResourceClaimID]*resourceClaimAllocationMetadata),
+		claimAllocationMetadata: make(map[ResourceClaimID]*ResourceClaimAllocationMetadata),
 	}
 }
 
@@ -183,7 +172,7 @@ type allocation struct {
 	deviceIDsByIT map[InstanceTypeID][]DeviceID
 	// claimMetadata represents the allocation metadata for each ResourceClaim, keyed by the ResourceClaim name. This
 	// tracks both devices (for observability / testing) and topology requirements (for non-node local binding).
-	claimMetadata map[ResourceClaimID]*resourceClaimAllocationMetadata
+	claimMetadata map[ResourceClaimID]*ResourceClaimAllocationMetadata
 	// filteredPools represents the set of pools that will be available from the NodeClaim if this allocation is commited.
 	// This reduces the number of pools we need to filter during subsequent allocations for the NodeClaim.
 	filteredPools []*Pool
@@ -194,7 +183,7 @@ func (a *allocation) Commit(ctx context.Context) {
 		log.FromContext(ctx).V(1).Info(
 			"allocated devices",
 			"nodeClaimID", a.nodeClaimID.Value(),
-			"devicesByResourceClaim", lo.MapEntries(a.claimMetadata, func(claimID ResourceClaimID, meta *resourceClaimAllocationMetadata) (string, map[string][]string) {
+			"devicesByResourceClaim", lo.MapEntries(a.claimMetadata, func(claimID ResourceClaimID, meta *ResourceClaimAllocationMetadata) (string, map[string][]string) {
 				return claimID.Value(), lo.MapEntries(meta.Devices, func(it InstanceTypeID, ids []DeviceID) (string, []string) {
 					return it.Value(), lo.Map(ids, func(id DeviceID, _ int) string { return id.String() })
 				})
@@ -476,9 +465,9 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 	// Snapshot initial state for restoration between IT attempts.
 	initialPools := a.pools
 
-	claimAllocMeta := make([]*resourceClaimAllocationMetadata, len(a.claimData))
+	claimAllocMeta := make([]*ResourceClaimAllocationMetadata, len(a.claimData))
 	for i := range claimAllocMeta {
-		meta := &resourceClaimAllocationMetadata{
+		meta := &ResourceClaimAllocationMetadata{
 			NodeClaimID:             a.nodeClaim.ID(),
 			ContributedRequirements: make(map[InstanceTypeID]scheduling.Requirements),
 			TotalRequirements:       scheduling.NewRequirements(),
@@ -519,7 +508,7 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 					claimITReqs, ok := meta.ContributedRequirements[itID]
 					if !ok {
 						claimITReqs = scheduling.NewRequirements()
-						meta.ContributedRequirements[itID] = itReqs
+						meta.ContributedRequirements[itID] = claimITReqs
 					}
 					for _, req := range *reqs {
 						claimITReqs.Add(req)
@@ -539,9 +528,6 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 				a.requirements.Add(req)
 			}
 		}
-
-		// Clear binding fallback.
-		a.setBindingFallback(nil)
 	}
 
 	if len(survivingITs) == 0 {
@@ -549,7 +535,7 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 	}
 
 	// Compute the total requirements based on the contributed requirements for each instance type
-	claimAllocMetaByRC := make(map[ResourceClaimID]*resourceClaimAllocationMetadata, len(claimAllocMeta))
+	claimAllocMetaByRC := make(map[ResourceClaimID]*ResourceClaimAllocationMetadata, len(claimAllocMeta))
 	nodeClaimRequirements := scheduling.NewRequirements()
 	for claimIdx, meta := range claimAllocMeta {
 		meta.TotalRequirements = scheduling.NewRequirements()
@@ -755,10 +741,11 @@ func (a *allocator) tryDevice(
 // restoreState resets the child allocator's mutable DFS state for a new IT attempt.
 func (a *allocator) restoreState(pools []*Pool) {
 	a.allocatedDevicesMetadata = nil
-	a.requirements = scheduling.NewRequirements()
 	a.pools = pools
 	a.allocatedDevices = sets.New[DeviceID]()
 	a.snapshots = nil
+	// NOTE: Requirements are not reset since instance type requirements are accumulated to ensure the result is
+	// representable by a NodeClaim.
 }
 
 // copyRequirements creates a shallow copy of a Requirements map.
