@@ -263,13 +263,17 @@ With this fix, slot 2 checks "nic-0" against ALL prior values `["nic-0", "nic-1"
 
 ## DistinctAttribute with Template Devices
 
-DistinctAttribute is NOT limited to in-cluster devices. Two mechanisms:
+DistinctAttribute is NOT limited to in-cluster devices. Three mechanisms:
 
-1. **Device-name (primary use case):** Synthesize `resource.k8s.io/device-name` in `LookupAttribute` from `device.Name`. Device names are structurally unique within a pool. Works for both template and in-cluster devices with zero cloud provider burden.
+1. **Device-name (primary use case):** Synthesize `resource.k8s.io/device-name` inside `DistinctAttributeConstraint.Add()` from `deviceID.Device.Value()` when `LookupAttribute` returns nil. NOT placed in `LookupAttribute` because template device names are structural placeholders (unique within the simulation but not guaranteed to match published names). Exposing them via `LookupAttribute` would let `MatchAttributeConstraint` pin on meaningless placeholder values. Device names are unique within a pool by construction (in-cluster: validated; template: cloud provider contract). Uses the concrete evaluation path.
 
-2. **Topology attributes (physical-port, NUMA):** Cloud provider publishes concrete values on template devices. If it knows the topology, it knows the values.
+2. **Concrete topology attributes:** Cloud provider publishes concrete attribute values on template devices. If it knows the topology AND considers the values stable, it can publish them directly. Uses the concrete evaluation path.
 
-**Inverse-of-bindings explored and rejected:** Distinctness is not transitive (A≠B, B≠C ⊬ A≠C), so no closure is possible. In practice, knowing devices are distinct implies knowing their distinguishing values. Revisit if a concrete use case surfaces where the provider knows distinctness but not values.
+3. **Inverse-of-bindings (runtime-only topology):** Reuses the existing `AttributeBindings` graph. Two devices are guaranteed distinct on attribute X if they are in **different connected components** of the binding graph for X. Check: `!Bound(prior, new)`. Uses the binding fallback path.
+
+**Why inverse-of-bindings works (revised from initial rejection):** The initial objection was "distinctness is not transitive (A≠B, B≠C ⊬ A≠C), so no closure is possible." This framed the problem incorrectly. We don't need a transitive closure of pairwise distinctness — we need connected-component membership, which `BuildAttributeBindings` already computes. Devices in different components are guaranteed distinct by construction. The query is O(1) via `Bound()`, not O(N²).
+
+**Motivating use case:** PCIe root complex topology. A cloud provider knows that `{gpu-0, nic-0}` share a PCIe root and `{gpu-1, nic-1}` share a different root, but considers the actual root complex IDs an unstable implementation detail. The binding declarations encode this grouping without committing to specific values. A `distinctAttribute: "topology/pcie-root"` constraint can then be satisfied at scheduling time via the binding fallback path.
 
 ---
 

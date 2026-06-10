@@ -301,18 +301,48 @@ type DistinctAttributeConstraint struct {
     // allocatedValues tracks attribute values in insertion order.
     // Used for duplicate detection on Add() and LIFO removal on Remove().
     allocatedValues []resourcev1.DeviceAttribute
+
+    // AttributeBindingFallback, if non-nil, is consulted when a device does not have
+    // the attribute in its template. This enables DistinctAttribute constraints for
+    // runtime-only attributes using the inverse of the binding graph — devices in
+    // DIFFERENT connected components are guaranteed to have distinct values.
+    AttributeBindingFallback *AttributeBindingFallback
+    // UsedBinding is true when the constraint was established via the binding fallback
+    // path (first device lacked a concrete value). Once set, devices with concrete
+    // attribute values are rejected to prevent mixing evaluation paths.
+    UsedBinding bool
+    // AllocatedDeviceIDs tracks devices added via the binding fallback path, in order.
+    // Used for pairwise Bound() checks and LIFO removal on backtrack.
+    AllocatedDeviceIDs []DeviceID
 }
 ```
 
 **Add() logic:**
 1. If constraint doesn't apply to this request name → return `true` (no-op)
 2. Look up the named attribute on the device via `LookupAttribute`
-3. If attribute absent → return `false` (device cannot participate in uniqueness check)
-4. Iterate `allocatedValues` — if any entry matches the new value → return `false` (duplicate)
-5. Append value to `allocatedValues` → return `true`
+3. **Concrete path** (attribute present):
+   a. If `UsedBinding == true` → return `false` (paths are mutually exclusive)
+   b. Iterate `allocatedValues` — if any entry matches the new value → return `false` (duplicate)
+   c. Append value to `allocatedValues` → return `true`
+4. **Binding fallback path** (attribute absent):
+   a. If `len(allocatedValues) > 0 && !UsedBinding` → return `false` (concrete path already established)
+   b. If `AttributeBindingFallback == nil` → return `false` (no fallback available)
+   c. If `!HasBindings(deviceID)` → return `false` (device not in any binding group; distinctness unverifiable)
+   d. For each prior device in `AllocatedDeviceIDs`: if `Bound(prior, deviceID)` → return `false` (same connected component = same value = NOT distinct)
+   e. Set `UsedBinding = true`, append deviceID to `AllocatedDeviceIDs` → return `true`
 
 **Remove() logic:**
-1. Pop last entry from `allocatedValues` (LIFO, matching DFS backtracking order)
+1. If `UsedBinding`: pop last from `AllocatedDeviceIDs`; if empty, set `UsedBinding = false`
+2. Else: pop last entry from `allocatedValues` (LIFO, matching DFS backtracking order)
+
+**Reset() logic (for IT transitions):**
+```go
+func (d *DistinctAttributeConstraint) Reset() {
+    d.allocatedValues = d.allocatedValues[:0]
+    d.AllocatedDeviceIDs = d.AllocatedDeviceIDs[:0]
+    d.UsedBinding = false
+}
+```
 
 ### Upstream Bug: Map-Keyed State
 
@@ -350,24 +380,55 @@ All upstream tests avoid this by using separate requests each with `count: 1` (g
 
 ### Template Device Support
 
-DistinctAttribute works with template devices — there is no in-cluster limitation. The mechanism depends on the attribute being checked:
+DistinctAttribute works with template devices — there is no in-cluster limitation. Three mechanisms, depending on the attribute:
 
-**For device-name (primary use case):** `LookupAttribute` is extended to synthesize a `resource.k8s.io/device-name` attribute from `device.Name` when that well-known key is requested. Device names are structurally unique within a pool (pool validation rejects duplicates), so this is always sound and requires no cloud provider changes.
+**1. Device-name (primary use case):** `DistinctAttributeConstraint.Add()` synthesizes device-name internally when `AttributeName == "resource.k8s.io/device-name"` and `LookupAttribute` returns nil. This is NOT placed in `LookupAttribute` itself because device names on template devices are structural placeholders (unique within the simulation but not guaranteed to match names the driver will publish). Synthesizing in `LookupAttribute` would expose placeholder values to other consumers (e.g., `MatchAttributeConstraint`) that may incorrectly treat them as stable identity guarantees.
 
 ```go
-// In LookupAttribute, synthesize device-name:
-if attributeName == "resource.k8s.io/device-name" {
+// Inside DistinctAttributeConstraint.Add(), after LookupAttribute returns nil:
+if d.AttributeName == "resource.k8s.io/device-name" {
     v := deviceID.Device.Value()
-    return &resourcev1.DeviceAttribute{StringValue: &v}
+    attribute = &resourcev1.DeviceAttribute{StringValue: &v}
 }
 ```
 
-**For topology attributes (physical-port, NUMA, etc.):** Cloud providers publish concrete attribute values on template devices. If a provider knows "eni-0 is on port-A and eni-1 is on port-B," it knows the values and should publish them as attributes.
+Device names are unique within a pool by construction (in-cluster pools are validated for duplicates; template pools are unique by cloud provider contract). This makes device-name safe for distinctness checking — we only need "these are different slots," not "this value will persist after scheduling."
 
-**Why not inverse-of-bindings:** We explored using the inverse of `AttributeBindings` (which declare "these devices share a value") to infer distinctness. This is rejected because:
-- Distinctness is **not transitive**: A≠B and B≠C does NOT imply A≠C (unlike sameness: A=B, B=C → A=C)
-- Cannot build transitive closure like AttributeBindings does — would need O(N²) pairwise storage
-- In practice, if the cloud provider knows devices are distinct, it knows their values
+**2. Concrete topology attributes:** Cloud providers publish concrete attribute values on template devices when the values are stable and well-known. If a provider knows "eni-0 is on port-A and eni-1 is on port-B," it can publish those values directly. This uses the concrete path (no binding fallback).
+
+**3. Inverse-of-bindings (runtime-only topology):** For topology attributes where the cloud provider knows the grouping structure but considers concrete values an unstable implementation detail, the existing `AttributeBindings` graph is reused in inverse. Devices in the same connected component share a value (used by MatchAttribute). Devices in **different** connected components are guaranteed to have **distinct** values (used by DistinctAttribute). This requires zero new cloud provider API — the binding declarations already encode the group structure.
+
+**Example:** A p5.48xlarge has GPUs and NICs sharing PCIe roots:
+```go
+AttributeBindings: []*cloudprovider.AttributeBinding{
+    {Attribute: "topology/pcie-root", Devices: []DeviceID{gpu-0, nic-0}},  // Group A
+    {Attribute: "topology/pcie-root", Devices: []DeviceID{gpu-1, nic-1}},  // Group B
+}
+```
+
+A claim requesting a GPU and NIC with `distinctAttribute: "topology/pcie-root"`:
+- DFS allocates gpu-0 (in group A via binding fallback)
+- Tries nic-0: `Bound(gpu-0, nic-0)` → true → same group → REJECT (correct)
+- Tries nic-1: `Bound(gpu-0, nic-1)` → false → different group → ACCEPT (correct)
+- Result: {gpu-0, nic-1} — guaranteed different PCIe roots
+
+**Why this works despite non-transitivity:** The naive framing "distinctness is not transitive (A≠B, B≠C ⊬ A≠C)" is correct for raw pairwise distinctness but is the wrong abstraction. The binding graph encodes **group membership** (connected components), which IS a sound basis for distinctness: devices in different groups are guaranteed distinct by construction. The check is `!Bound(prior, new)` for each prior device — O(k) per device where k is the number of already-allocated devices, same cost as the concrete-value path.
+
+### Binding Fallback Edge Cases
+
+**Mixed concrete + binding paths (mutual exclusion):** Like MatchAttribute, the two evaluation paths are mutually exclusive. If the first device has a concrete attribute value, all subsequent devices must also have concrete values. If the first device uses binding fallback, all must use binding fallback. Mixing is rejected because we cannot determine whether a concrete value "root-1" corresponds to the same or different binding group — the binding graph stores device membership, not the values they map to.
+
+**Device not in any binding group:** If `HasBindings()` returns false, the device is rejected under the binding fallback path. We cannot assume "not in any group means unique" — the provider may have simply omitted the declaration. Two devices both lacking binding entries might share the same physical root. Conservative rejection is the only sound option.
+
+**All devices in one binding group:** If all devices on an instance type are in the same connected component for attribute X, then DistinctAttribute on X with `count > 1` is unsatisfiable — the DFS correctly fails. This reflects the physical reality: all devices share the same root, so distinct roots cannot be obtained.
+
+**count > 1 across limited groups:** If there are N connected components, at most N devices can satisfy a DistinctAttribute constraint (one per group). Requesting more than N is unsatisfiable. The DFS correctly exhausts candidates after selecting one device per group.
+
+**MatchAttribute + DistinctAttribute on same attribute:** These are contradictory for `count > 1`. MatchAttribute requires same value/group, DistinctAttribute requires different value/group. Both constraints evaluate independently — the second device fails one of them. Result: no allocation possible. For `count == 1`, there is no contradiction (nothing to compare against).
+
+**Cross-driver bindings:** Bindings key on `cloudprovider.DeviceID` which includes Driver, Pool, and Device. A GPU from `gpu.nvidia.com` and a NIC from `nic.aws.com` can participate in the same binding group. `Bound()` correctly resolves cross-driver edges.
+
+**Pool ordering and determinism:** The DFS iterates in-cluster devices before template devices (by design). If an in-cluster device has the concrete attribute, it is encountered first, establishing the concrete path. Template devices without the attribute are then rejected via mutual exclusion. This is deterministic — pool iteration order is fixed within a scheduling loop. The binding fallback path is only established when ALL candidate devices lack the concrete attribute (the pure runtime-only case).
 
 ### Scoping and Evaluation
 
@@ -381,9 +442,13 @@ The constraint is evaluated in the existing constraint loop in `tryDevice` (`all
 - `MatchAttribute: gpu.example.com/numa` — all devices must share NUMA node
 - `DistinctAttribute: resource.k8s.io/device-name` — all devices must be distinct
 
-There is no interaction between the two constraint types beyond both being evaluated in the same loop.
+There is no interaction between the two constraint types beyond both being evaluated in the same loop. Each maintains independent state (`allocatedValues`/`AllocatedDeviceIDs` vs. `AttributeValue`/`AllocatedDeviceIDs`).
 
-**No binding fallback needed.** Unlike `MatchAttribute` (which supports runtime-only attributes via `AttributeBindingFallback`), `DistinctAttribute` requires the attribute to be present on the device (either published explicitly or synthesized for `resource.k8s.io/device-name`). If a device lacks the attribute, it is simply rejected.
+**Binding fallback symmetry with MatchAttribute.** Both constraint types use the same `AttributeBindingFallback` struct and the same `AttributeBindings` graph. The difference is the check:
+- MatchAttribute: `Bound(prior, new)` → accept (same group = same value)
+- DistinctAttribute: `!Bound(prior, new)` → accept (different group = different value)
+
+Both share the `UsedBinding` mutual exclusion pattern to prevent mixing concrete and binding-based evaluation within a single constraint instance.
 
 ---
 
@@ -434,6 +499,20 @@ for _, c := range claim.Spec.Devices.Constraints {
         data.Constraints = append(data.Constraints, dac)
     default:
         return nil, fmt.Errorf("claim %q: unsupported constraint type", claim.Name)
+    }
+}
+```
+
+**Binding fallback wiring:** The `AttributeBindingFallback` field on `DistinctAttributeConstraint` is NOT populated during `ValidateClaimRequest` — it is set later by the allocator when the constraint is evaluated against a specific instance type. This matches the existing MatchAttribute pattern where the fallback context (NodePool, InstanceTypeID, Bindings) is instance-type-specific and set per IT attempt:
+
+```go
+// In the allocator, before evaluating constraints for a given IT:
+for _, constraint := range claimData.Constraints {
+    switch c := constraint.(type) {
+    case *MatchAttributeConstraint:
+        c.AttributeBindingFallback = &AttributeBindingFallback{...}
+    case *DistinctAttributeConstraint:
+        c.AttributeBindingFallback = &AttributeBindingFallback{...}
     }
 }
 ```
@@ -585,11 +664,19 @@ The controller exposes this via a new method that returns both pieces (or via th
 
 **Rationale:** A request may target a capacity dimension that exists on some devices but not others. This is valid — devices without the dimension are simply ineligible. Pre-validation would require iterating all devices at validation time, which is expensive and doesn't match the upstream pattern.
 
-### 6. No binding fallback for DistinctAttribute
+### 6. Binding fallback for DistinctAttribute via inverse-of-bindings
 
-**Decision:** If a device lacks the attribute referenced by a `DistinctAttribute` constraint, it is rejected. No `AttributeBindingFallback` path.
+**Decision:** DistinctAttribute supports `AttributeBindingFallback` using the inverse of the existing binding graph. Two devices are guaranteed distinct for attribute X if they are in **different connected components** of the binding graph for X. The check is `!Bound(prior, new)`.
 
-**Rationale:** The primary use case for `DistinctAttribute` is preventing the same multi-allocatable device from being selected multiple times (`distinctAttribute: resource.k8s.io/device-name`). Device name is always known. Runtime-only attributes that need binding fallback don't have a meaningful "distinct" use case — you can't verify uniqueness for values you don't know.
+**Rationale:** The same scenarios that motivate AttributeBindings for MatchAttribute (runtime-only topology attributes like PCIe root complex) also motivate distinctness verification. If a cloud provider declares `{gpu-0, nic-0}` share a PCIe root and `{gpu-1, nic-1}` share a different root, the group structure implicitly encodes which devices are distinct — devices NOT reachable from each other in the binding graph are guaranteed to have different values.
+
+This reuses the existing `AttributeBindings` data structure and `Bound()` query with no new cloud provider API. The cost is O(k) per device evaluation (where k = devices already in the constraint), identical to the concrete-value path.
+
+**Key insight:** The naive argument "distinctness is not transitive, so no closure is possible" frames the problem incorrectly. We don't need a transitive closure of pairwise distinctness. We need connected-component membership, which the binding graph already computes via BFS closure in `BuildAttributeBindings`. Devices in different components are distinct by construction.
+
+**Mutual exclusion:** Concrete values and binding fallback are mutually exclusive within a single constraint instance (same pattern as MatchAttribute). Once the first device establishes one path, all subsequent devices must use the same path. This prevents unsound cross-path reasoning — we cannot determine whether a concrete value "root-1" maps to a specific binding group.
+
+**Conservative rejection for ungrouped devices:** A device with no binding entry for the constrained attribute (`HasBindings() → false`) is rejected under the binding fallback path. We cannot assume "not in any group means unique" — two ungrouped devices might share the same physical topology. The provider must declare all participating devices in binding groups for the fallback to work.
 
 ### 7. Consumed capacity stored per allocation, not per device on metadata
 
@@ -607,13 +694,13 @@ This is a **pre-existing bug** that affects `MatchAttributeConstraint` today —
 
 **Alternative considered:** Clone `ClaimData` per-IT attempt instead of resetting. Rejected due to allocation overhead (constraints are rebuilt from scratch each time rather than cheaply cleared).
 
-### 9. Synthesize device-name for DistinctAttribute
+### 9. Synthesize device-name inside DistinctAttributeConstraint, not LookupAttribute
 
-**Decision:** Extend `LookupAttribute` to synthesize a `resource.k8s.io/device-name` attribute from `device.Name` when that well-known key is requested. This enables DistinctAttribute to work with template devices without requiring cloud providers to redundantly publish device name as an attribute.
+**Decision:** When `AttributeName == "resource.k8s.io/device-name"` and `LookupAttribute` returns nil, `DistinctAttributeConstraint.Add()` synthesizes the value from `deviceID.Device.Value()` internally. This synthesis is NOT placed in `LookupAttribute`.
 
-**Rationale:** Device names are structurally unique within a pool (pool validation rejects duplicates). The primary use case for DistinctAttribute is preventing same-device multi-allocation, which requires a device-identity attribute. Since names are always known (even on template devices), synthesizing the attribute is sound and requires zero cloud provider changes.
+**Rationale:** Template device names are structural placeholders — unique within the scheduling simulation but not guaranteed to match the names the driver will actually publish. Synthesizing in `LookupAttribute` would expose these placeholders to all consumers, including `MatchAttributeConstraint`, which would incorrectly pin on a placeholder value and constrain subsequent devices to share a name that has no stable meaning.
 
-**Alternative considered:** Inverse-of-bindings (cloud provider declares "these devices are guaranteed different"). Rejected because distinctness is not transitive (A≠B, B≠C does NOT imply A≠C), so no closure is possible. In practice, if a provider knows devices are distinct, it knows their values and should publish them as attributes.
+For DistinctAttribute the semantics are sound: we only need "these are different device slots," not "this value is a stable identity." In-cluster pools validate name uniqueness (duplicates mark the pool `Invalid`). Template pools are unique by cloud provider contract (same trust model as other template data).
 
 ### 10. Slice-based state tracking for DistinctAttribute
 
