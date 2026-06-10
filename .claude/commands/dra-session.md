@@ -15,7 +15,11 @@ For the rest of this session, when the user asks DRA-related questions or reques
 
 3. **After receiving agent results**, synthesize the answer concisely for the user. Don't just paste the raw agent output — interpret it in context.
 
-4. **For implementation tasks** (writing code, not just questions), read the relevant design docs yourself first (`designs/dra/scheduling.md`, `designs/dra/consumable-capacity.md`) then use agents for review/validation of your approach.
+4. **For implementation tasks** (writing code, not just questions), read the relevant design docs yourself first then use agents for review/validation of your approach:
+   - `designs/dra/scheduling.md` — Allocator design (DFS, pools, constraints, commit protocol)
+   - `designs/dra/consumable-capacity.md` — Upstream KEP-5075 semantics
+   - `designs/dra/consumable-capacity-integration.md` — Karpenter integration design (how CC maps into the allocator)
+   - `designs/dra/consumable-capacity-notes.md` — Scoping decisions, known upstream bugs, follow-ups
 
 5. **For non-DRA tasks**, proceed normally without delegation.
 

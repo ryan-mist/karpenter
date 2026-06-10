@@ -18,6 +18,9 @@ Read the following files to build context, then summarize what you've loaded:
 10. `pkg/scheduling/dynamicresources/attributebindings.go` - Attribute binding graph
 11. `pkg/cloudprovider/dynamicresources.go` - Cloud provider DRA types
 12. `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking controller
+13. `designs/dra/consumable-capacity.md` - Upstream KEP-5075 semantics
+14. `designs/dra/consumable-capacity-integration.md` - Integration design for Karpenter
+15. `designs/dra/consumable-capacity-notes.md` - Implementation notes and scoping decisions
 
 After reading, confirm context is loaded and summarize the architecture in 3-5 sentences. Then ask what DRA work the user wants to do.
 

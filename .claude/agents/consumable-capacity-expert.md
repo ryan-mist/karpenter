@@ -92,9 +92,19 @@ Contrast with MatchAttribute (requires all values to be **equal**).
 - In-flight tracking across backtrack?
   → Insert on tentative allocation, remove on backtrack, never leaked
 
+## Known Upstream Bugs
+
+### DistinctAttribute map-key collision (count > 1)
+The upstream `distinctAttributeConstraint` keys state by `requestName`. For a single request with `count > 1`, all slots share the same key — each `add()` overwrites the previous value. This allows duplicate attribute values to slip through. Full example in `designs/dra/consumable-capacity-notes.md`. Fix: use a slice instead of a map.
+
+### Constraint state not reset across IT transitions (Karpenter-specific)
+After a successful IT DFS, constraints retain pinned state. `restoreState()` between IT attempts doesn't reset them. The next IT inherits stale pins. Fix: add `Reset()` to the Constraint interface.
+
 ## Reference
 
-Full design doc: `designs/dra/consumable-capacity.md`
+Upstream KEP-5075 semantics: `designs/dra/consumable-capacity.md`
+Karpenter integration design: `designs/dra/consumable-capacity-integration.md`
+Implementation notes & scoping decisions: `designs/dra/consumable-capacity-notes.md`
 
 Upstream implementation: `k8s.io/dynamic-resource-allocation@v0.35.0/structured/internal/experimental/`
 - `consumable_capacity.go` — CmpRequestOverCapacity, rounding

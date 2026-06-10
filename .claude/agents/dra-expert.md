@@ -32,7 +32,9 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 - `pkg/scheduling/dynamicresources/attributebindings.go` - Binding graph
 - `pkg/cloudprovider/dynamicresources.go` - Cloud provider types
 - `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking
-- `designs/dra/scheduling.md` - Authoritative design doc
+- `designs/dra/scheduling.md` - Authoritative allocator design doc
+- `designs/dra/consumable-capacity-integration.md` - Consumable capacity integration design
+- `designs/dra/consumable-capacity-notes.md` - Implementation notes, known bugs, scoping decisions
 
 ## Design Principles
 
@@ -45,10 +47,15 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 
 ## Scope Exclusions (not yet implemented)
 
-- Admin access, partitionable devices, consumable capacity
+- Admin access, partitionable devices
 - Device taints, non-node-local in-flight devices
 - Multi-solution optimization, consolidation
 - FirstAvailable (sub-request) claims
+
+## Active Design Work
+
+- **Consumable capacity (KEP-5075)**: Integration design complete — see `designs/dra/consumable-capacity-integration.md`
+- **Known bug (constraint reset)**: After a successful IT DFS, constraints retain stale state across IT transitions. `restoreState()` doesn't reset them. Fix: add `Reset()` to `Constraint` interface.
 
 ## When Reviewing DRA Code
 
