@@ -53,7 +53,9 @@ Each allocation on a shared device:
 `DRAConsumableCapacity` — controls all new fields across kube-scheduler, kubelet, and kube-apiserver.
 
 - Alpha: Kubernetes 1.34 (disabled by default)
-- Beta target: Kubernetes 1.36
+- Beta: Kubernetes 1.36 (enabled by default, PR #136611)
+- Continues beta in Kubernetes 1.37 (KEP PR #6102)
+- GA: planned (referenced in 1.37 KEP PR)
 
 ---
 
@@ -119,8 +121,19 @@ DeviceRequestAllocationResult:
   ConsumedCapacity: map[QualifiedName]resource.Quantity  # NEW — actual consumed
 ```
 
+On `AllocatedDeviceStatus` (kubelet/driver status correlation):
+
+```
+AllocatedDeviceStatus:
+  Driver: string
+  Pool: string
+  Device: string
+  ShareID: *string                         # NEW — correlates with allocation result
+```
+
 **Key semantics:**
 - `ShareID` is a UUID generated for each allocation on a multi-allocatable device. It uniquely identifies this share among all allocations on the same device.
+- The combination of Driver, Pool, Device, and ShareID must match between `DeviceRequestAllocationResult` and `AllocatedDeviceStatus`
 - `ConsumedCapacity` records the actual consumed amounts (may differ from requested due to rounding)
 - For exclusive (non-multi-allocatable) devices, `ShareID` is nil and `ConsumedCapacity` is empty
 
@@ -322,6 +335,15 @@ constraints:
 
 This ensures that within the scope of "bandwidth-request", every allocated device has a **different** value for the named attribute. If two candidate devices share the same attribute value, only one can be selected.
 
+### List-Type Attributes (KEP-5491, post-v0.35.0)
+
+KEP-5491 extends `DeviceAttribute` with list fields (`IntValues`, `BoolValues`, `StringValues`, `VersionValues`). This changes DistinctAttribute semantics by attribute type:
+
+- **Scalar attributes:** "distinct" means values are not equal (unchanged)
+- **List-type attributes:** "distinct" means pairwise disjoint sets (non-empty intersection → constraint violation)
+
+This is not present in the vendored v0.35.0 code. When Karpenter upgrades the DRA dependency to a version containing KEP-5491, DistinctAttribute evaluation must be updated to handle list-type comparison.
+
 ### Primary Use Case
 
 Preventing the same multi-allocatable device from being allocated multiple times to fill multiple slots in a single claim. Without this constraint, if a claim requests `count: 2` on a multi-allocatable device pool with one device, the allocator could try to fill both slots with the same device.
@@ -386,6 +408,18 @@ In All mode (`allocationMode: All`), all matching devices are allocated. For mul
 ### With AdminAccess
 
 Devices with `adminAccess: true` on the claim bypass capacity tracking entirely — admin access implies exclusive control regardless of multi-allocatable status.
+
+### With List-Type Attributes (KEP-5491)
+
+List-type attributes change the semantics of `MatchAttribute` (scalar = equal, list = non-empty intersection) and `DistinctAttribute` (scalar = not-equal, list = pairwise disjoint). These changes apply uniformly to both exclusive and multi-allocatable devices. Not present in vendored v0.35.0 — forward-looking.
+
+### With Node Allocatable Resource Mappings (KEP-5517)
+
+`ResourceSlice.Spec.Devices.NodeAllocatableResourceMappings` maps device capacity dimensions to node-level resources (cpu, memory). This is architecturally adjacent to consumable capacity (both reason about device capacity dimensions) but operates at a different layer: node resource accounting vs. device-level scheduling. No direct interaction with the allocation algorithm — the mapping is consumed by kubelet for node status reporting.
+
+### With Sharing Affinity (KEP-5981)
+
+`SharingAffinity` acts as a structural gatekeeper before capacity subtraction — it constrains which existing shares a new allocation may coexist with on a multi-allocatable device. Still in development (PR #139507). The capacity verification step runs after sharing affinity passes.
 
 ---
 

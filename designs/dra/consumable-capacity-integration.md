@@ -298,24 +298,76 @@ The existing `allocation.Commit()` (`allocator.go:181-201`) calls `allocationTra
 type DistinctAttributeConstraint struct {
     RequestNames  sets.Set[string]
     AttributeName resourcev1.FullyQualifiedName
-    // seenValues tracks attribute values already allocated, mapping value → device count.
-    // Used to detect duplicates on Add() and clean up on Remove().
-    seenValues    map[string]int
-    // deviceValues tracks the attribute value per device (in insertion order) for removal.
-    deviceValues  []string
+    // allocatedValues tracks attribute values in insertion order.
+    // Used for duplicate detection on Add() and LIFO removal on Remove().
+    allocatedValues []resourcev1.DeviceAttribute
 }
 ```
 
 **Add() logic:**
 1. If constraint doesn't apply to this request name → return `true` (no-op)
-2. Look up the named attribute on the device
+2. Look up the named attribute on the device via `LookupAttribute`
 3. If attribute absent → return `false` (device cannot participate in uniqueness check)
-4. If attribute value already in `seenValues` → return `false` (duplicate)
-5. Record value in `seenValues` and `deviceValues` → return `true`
+4. Iterate `allocatedValues` — if any entry matches the new value → return `false` (duplicate)
+5. Append value to `allocatedValues` → return `true`
 
 **Remove() logic:**
-1. Pop last entry from `deviceValues`
-2. Decrement count in `seenValues`; delete entry if count reaches zero
+1. Pop last entry from `allocatedValues` (LIFO, matching DFS backtracking order)
+
+### Upstream Bug: Map-Keyed State
+
+The upstream implementation (`k8s.io/dynamic-resource-allocation@v0.35.0/structured/internal/experimental/constraint.go:44-84`) keys its constraint state by `requestName` in a `map[string]DeviceAttribute`. This causes a bug for requests with `count > 1`:
+
+**Example:** A pod requests 2Gi bandwidth on 3 NIC shares with `distinctAttribute` on device-name to ensure distinct physical NICs:
+
+```yaml
+requests:
+- name: nics
+  exactly:
+    deviceClassName: multi-homed-nic
+    count: 3
+    capacity:
+      requests:
+        networking.example.com/bandwidth: "2Gi"
+constraints:
+- requests: ["nics"]
+  distinctAttribute: "networking.example.com/device-name"
+```
+
+With 3 NICs (nic-0: "nic-0", nic-1: "nic-1", nic-2: "nic-0"):
+
+```
+Slot 0: add("nics", nic-0) → map["nics"] = "nic-0"
+Slot 1: add("nics", nic-1) → "nic-1" ≠ "nic-0" → accept
+         map["nics"] = "nic-1"  ← OVERWRITES "nic-0"
+Slot 2: add("nics", nic-2) → "nic-0" ≠ "nic-1" → accept ← BUG
+         (map forgot slot 0 already used "nic-0")
+```
+
+All upstream tests avoid this by using separate requests each with `count: 1` (giving unique map keys). The bug is latent but real for `count > 1`.
+
+**Our fix:** Use a slice (`allocatedValues []DeviceAttribute`) instead of a map. Each Add appends, each Remove pops. All prior values remain visible for duplicate checking regardless of whether slots share a request name.
+
+### Template Device Support
+
+DistinctAttribute works with template devices — there is no in-cluster limitation. The mechanism depends on the attribute being checked:
+
+**For device-name (primary use case):** `LookupAttribute` is extended to synthesize a `resource.k8s.io/device-name` attribute from `device.Name` when that well-known key is requested. Device names are structurally unique within a pool (pool validation rejects duplicates), so this is always sound and requires no cloud provider changes.
+
+```go
+// In LookupAttribute, synthesize device-name:
+if attributeName == "resource.k8s.io/device-name" {
+    v := deviceID.Device.Value()
+    return &resourcev1.DeviceAttribute{StringValue: &v}
+}
+```
+
+**For topology attributes (physical-port, NUMA, etc.):** Cloud providers publish concrete attribute values on template devices. If a provider knows "eni-0 is on port-A and eni-1 is on port-B," it knows the values and should publish them as attributes.
+
+**Why not inverse-of-bindings:** We explored using the inverse of `AttributeBindings` (which declare "these devices share a value") to infer distinctness. This is rejected because:
+- Distinctness is **not transitive**: A≠B and B≠C does NOT imply A≠C (unlike sameness: A=B, B=C → A=C)
+- Cannot build transitive closure like AttributeBindings does — would need O(N²) pairwise storage
+- In practice, if the cloud provider knows devices are distinct, it knows their values
 
 ### Scoping and Evaluation
 
@@ -331,7 +383,7 @@ The constraint is evaluated in the existing constraint loop in `tryDevice` (`all
 
 There is no interaction between the two constraint types beyond both being evaluated in the same loop.
 
-**No binding fallback needed.** Unlike `MatchAttribute` (which supports runtime-only attributes via `AttributeBindingFallback`), `DistinctAttribute` requires the attribute to be present on the device template. If a device lacks the attribute, it is simply rejected. This is simpler because the primary use case (preventing same-device multi-allocation) uses device name, which is always known.
+**No binding fallback needed.** Unlike `MatchAttribute` (which supports runtime-only attributes via `AttributeBindingFallback`), `DistinctAttribute` requires the attribute to be present on the device (either published explicitly or synthesized for `resource.k8s.io/device-name`). If a device lacks the attribute, it is simply rejected.
 
 ---
 
@@ -377,8 +429,7 @@ for _, c := range claim.Spec.Devices.Constraints {
     case c.DistinctAttribute != nil:
         dac := &DistinctAttributeConstraint{
             RequestNames:  sets.New(c.Requests...),
-            AttributeName: resourcev1.FullyQualifiedName(*c.DistinctAttribute),
-            seenValues:    make(map[string]int),
+            AttributeName: resourcev1.QualifiedName(*c.DistinctAttribute),
         }
         data.Constraints = append(data.Constraints, dac)
     default:
@@ -545,6 +596,30 @@ The controller exposes this via a new method that returns both pieces (or via th
 **Decision:** `deviceAllocationMetadata` carries the consumed capacity for *this specific allocation*, not a reference to the device's total consumed state.
 
 **Rationale:** Each allocation consumes a specific amount determined by the request and rounding. This amount must be recorded for backtracking (restore exactly what was consumed) and for the final result (populate `ConsumedCapacity` on the allocation result). Storing it per-allocation-entry is the natural fit.
+
+### 8. Constraint.Reset() for IT transitions
+
+**Decision:** Add a `Reset()` method to the `Constraint` interface. Call it in `restoreState()` before each IT attempt.
+
+**Rationale:** When `dfs()` returns `true` (IT succeeds), `tryDevice` returns without running the backtrack block — constraints are left in their "fully allocated" state (pinned values, allocated device IDs). Since `restoreState()` does NOT reset constraints, the next IT inherits stale state. For `MatchAttributeConstraint`, this means the next IT is forced to match the previous IT's pinned attribute value even though it's a completely independent evaluation.
+
+This is a **pre-existing bug** that affects `MatchAttributeConstraint` today — it is not specific to consumable capacity or DistinctAttribute. We fix it as part of this work because DistinctAttribute would be affected by the same issue.
+
+**Alternative considered:** Clone `ClaimData` per-IT attempt instead of resetting. Rejected due to allocation overhead (constraints are rebuilt from scratch each time rather than cheaply cleared).
+
+### 9. Synthesize device-name for DistinctAttribute
+
+**Decision:** Extend `LookupAttribute` to synthesize a `resource.k8s.io/device-name` attribute from `device.Name` when that well-known key is requested. This enables DistinctAttribute to work with template devices without requiring cloud providers to redundantly publish device name as an attribute.
+
+**Rationale:** Device names are structurally unique within a pool (pool validation rejects duplicates). The primary use case for DistinctAttribute is preventing same-device multi-allocation, which requires a device-identity attribute. Since names are always known (even on template devices), synthesizing the attribute is sound and requires zero cloud provider changes.
+
+**Alternative considered:** Inverse-of-bindings (cloud provider declares "these devices are guaranteed different"). Rejected because distinctness is not transitive (A≠B, B≠C does NOT imply A≠C), so no closure is possible. In practice, if a provider knows devices are distinct, it knows their values and should publish them as attributes.
+
+### 10. Slice-based state tracking for DistinctAttribute
+
+**Decision:** Use an append/pop slice (`allocatedValues []DeviceAttribute`) for DistinctAttribute constraint state, not a `map[requestName]value`.
+
+**Rationale:** The upstream implementation keys by `requestName`, which breaks for `count > 1` — all slots share the same key, causing map overwrites that destroy the history of previously seen values. Our slice approach preserves all values for duplicate checking and pops correctly during LIFO backtracking.
 
 ---
 

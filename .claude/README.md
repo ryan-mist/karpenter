@@ -33,8 +33,18 @@ Use at the start of a session when you need deep context on a topic.
 
 These are spawned by Claude automatically when appropriate, or you can ask for them:
 
-- **"use the dra-expert agent"** — Gets a subagent that knows Karpenter's DFS, AllocationTracker, pools, constraints, commit protocol
-- **"use the consumable-capacity-expert agent"** — Gets a subagent that knows KEP-5075 semantics, capacity accounting, rounding rules, DistinctAttribute
+| Agent | Purpose |
+|-------|---------|
+| `dra-expert` | Karpenter DRA allocator internals (DFS, AllocationTracker, pools, constraints, commit protocol) |
+| `consumable-capacity-expert` | Upstream KEP-5075 semantics (capacity accounting, rounding rules, DistinctAttribute) |
+| `cc-implementation-validator` | Validates Go code against `consumable-capacity-integration.md` spec |
+| `cc-design-validator` | Validates design docs against KEP-5075 and each other for consistency |
+
+**Expert agents** answer questions and help design. **Validator agents** check work for correctness.
+
+Example usage:
+- "use the cc-implementation-validator to check allocator.go"
+- "ask the cc-design-validator if the rounding rules are consistent between docs"
 
 ### CLAUDE.md
 
