@@ -70,6 +70,30 @@ You MUST be efficient with your context window. Follow this exact reading strate
    - Group related tests under Describe/Context blocks
 5. ADD tests to the existing test file for the target — return the COMPLETE additions (new Describe blocks only, not the whole file)
 
+## CRITICAL: Minimize Test Count — Maximize Fixture Density
+The goal is FEWER tests with RICHER fixtures, not more tests with thin fixtures.
+
+**Rules:**
+1. Put ALL fields on the BeforeEach fixture. If a struct has Attributes, Capacity, and AllowMultipleAllocations,
+   put all three on the shared fixture — don't create separate tests for each field.
+2. Merge assertions into existing It() blocks that already exercise the same code path.
+   Only create a new It() when testing a GENUINELY DIFFERENT code path (different error, different branch).
+3. A test for "capacity is converted" and a test for "attributes are converted" should be ONE test
+   ("should convert devices with attributes, capacity, and AllowMultipleAllocations") because they
+   exercise the same Devices() method on the same fixture.
+4. Separate It() blocks are justified ONLY for: distinct error paths, nil/empty edge cases that
+   exercise a different branch, or behaviors that require a different fixture setup (e.g. a zonal
+   nodeSelector vs allNodes).
+5. NEVER create a separate test just to assert a single field when you could add that assertion
+   to an existing test that already builds the same object.
+
+**Bad (5 tests for 1 code path):**
+- "should convert attributes" / "should convert capacity" / "should copy AllowMultiple" / "should handle both" / "should cache"
+
+**Good (2 tests):**
+- "should convert devices with attributes, capacity, and AllowMultipleAllocations" (one rich fixture, all field assertions inline)
+- "should cache devices on repeated calls" (distinct behavior: caching)
+
 ## Available Test Helpers (from pool_test.go and attributebindings_test.go)
 - makeAPISlice(name, driver, pool string, opts ...func(*resourcev1.ResourceSlice)) — builds an API ResourceSlice
 - withAllNodes() — marks slice as accessible from all nodes
