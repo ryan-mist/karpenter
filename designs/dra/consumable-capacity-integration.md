@@ -590,35 +590,111 @@ This enables downstream consumers (integration tests, finalization logic) to ver
 
 ## Controller Changes
 
-### Consumed Capacity Aggregation
+### Design Approach: Extend Existing Fields
 
-The device allocation controller (`pkg/controllers/dynamicresources/deviceallocation/controller.go`) currently tracks which devices are allocated from `ResourceClaim.Status.Allocation.Devices.Results`. For consumable capacity, it must also aggregate per-device consumed capacity across all claims.
+The controller already tracks per-device state via four coordinated maps (`allocatedDevices`, `claimsPerDevice`, `devicesPerClaim`, `metadataPerClaim`). Rather than introducing a parallel tracking system for shared devices, we extend this existing skeleton:
 
-In `reconcileClaim` (`controller.go:120-174`), for each result (written by kube-scheduler):
-- If `result.ShareID` is non-nil → shared allocation: accumulate `result.ConsumedCapacity` into a per-device capacity map
-- If `result.ShareID` is nil → exclusive allocation: add to `allocatedDevices` set (unchanged)
+1. `devicesPerClaim` changes from `sets.Set[DeviceID]` to `map[DeviceID]DeviceContribution` — carrying each claim's per-device capacity contribution
+2. `Metadata` gains `ConsumedCapacity` and `Shared` fields — `computeDeviceMetadata()` aggregates capacity from all claims
+3. ALL devices (shared and exclusive) remain in `allocatedDevices` — the `Shared` flag distinguishes them at query time
 
-New controller state:
+This preserves the single-loop reconcile flow and avoids dual cleanup paths.
+
+### Controller State Changes
 
 ```go
+// DeviceContribution records what a single claim contributes to a device's allocation.
+type DeviceContribution struct {
+    // ConsumedCapacity is the per-dimension capacity this claim consumes on the device.
+    // nil for exclusive allocations.
+    ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
+}
+
+type Metadata struct {
+    Releasable       bool
+    Consumers        []ConsumerRef
+    // Shared is true when the device is multi-allocatable (allocated via ShareID).
+    Shared           bool
+    // ConsumedCapacity is the aggregated capacity consumed across all claims referencing this device.
+    // Only populated when Shared is true.
+    ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
+}
+
 type Controller struct {
-    // ... existing fields ...
+    kubeClient client.Client
 
-    // consumedCapacity aggregates consumed capacity per device across all shared allocations.
-    consumedCapacity map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+    mu               sync.RWMutex
+    allocatedDevices map[cloudprovider.DeviceID]Metadata
+    claimsPerDevice  map[cloudprovider.DeviceID]sets.Set[types.NamespacedName]
+    devicesPerClaim  map[types.NamespacedName]map[cloudprovider.DeviceID]DeviceContribution  // CHANGED
+    metadataPerClaim map[types.NamespacedName]Metadata
 
-    // consumedCapacityPerClaim tracks each claim's contribution for accurate subtraction on deallocation.
-    consumedCapacityPerClaim map[types.NamespacedName]map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+    hydrationCh   chan struct{}
+    hydrationOnce sync.Once
+}
+```
+
+### Consumed Capacity Aggregation
+
+In `reconcileClaim`, the existing single-loop pattern is preserved. For each `DeviceRequestAllocationResult`:
+
+```go
+contributions := make(map[cloudprovider.DeviceID]DeviceContribution, len(results))
+for i := range results {
+    result := &results[i]
+    deviceID := makeDeviceID(result)
+    contributions[deviceID] = DeviceContribution{
+        ConsumedCapacity: result.ConsumedCapacity,  // nil for exclusive (ShareID == nil)
+    }
+}
+```
+
+The diff logic uses the same add/remove pattern as today, but operates on a map instead of a set:
+
+```go
+// Devices no longer in this claim
+for device := range oldContributions {
+    if _, still := contributions[device]; !still {
+        // remove from claimsPerDevice, recompute metadata or delete
+    }
+}
+// Devices in this claim (new or updated)
+for device := range contributions {
+    // ensure claimsPerDevice entry, recompute metadata
 }
 ```
 
 ### Shared vs Exclusive Discrimination
 
-The controller reads `DeviceRequestAllocationResult` objects written by kube-scheduler. The discriminant is the `ShareID` field on those results:
-- `ShareID != nil` → shared allocation on a multi-allocatable device → tracked in `consumedCapacity`
-- `ShareID == nil` → exclusive allocation → tracked in `allocatedDevices` (existing behavior)
+The discriminant is the `ConsumedCapacity` field on `DeviceContribution`:
+- `contribution.ConsumedCapacity != nil` → shared allocation (device is multi-allocatable)
+- `contribution.ConsumedCapacity == nil` → exclusive allocation
 
-Karpenter does not generate ShareIDs. The upstream scheduler generates them at actual allocation time. This is stable: once kube-scheduler marks an allocation as shared, that status is permanent for the lifetime of the claim.
+This information originates from `result.ConsumedCapacity` on `DeviceRequestAllocationResult` objects written by kube-scheduler. Karpenter does not generate ShareIDs or consumed capacity values — the upstream scheduler produces them at actual allocation time. Once set, they are immutable for the claim's lifetime.
+
+`computeDeviceMetadata()` derives the aggregate:
+
+```go
+func (c *Controller) computeDeviceMetadata(device cloudprovider.DeviceID) Metadata {
+    meta := Metadata{Releasable: true}
+    for nn := range c.claimsPerDevice[device] {
+        claimMeta := c.metadataPerClaim[nn]
+        if !claimMeta.Releasable {
+            meta.Releasable = false
+        }
+        meta.Consumers = append(meta.Consumers, claimMeta.Consumers...)
+
+        contrib := c.devicesPerClaim[nn][device]
+        if contrib.ConsumedCapacity != nil {
+            meta.Shared = true
+            meta.ConsumedCapacity = addCapacity(meta.ConsumedCapacity, contrib.ConsumedCapacity)
+        }
+    }
+    return meta
+}
+```
+
+A device is `Shared` if ANY claim referencing it carries consumed capacity. In practice this is all-or-nothing — a multi-allocatable device will only ever have shared allocations — but the aggregation is defensive.
 
 ### Public API Change
 
@@ -651,7 +727,33 @@ func NewAllocator(
 ) *Allocator
 ```
 
-The controller exposes this via a new method that returns both pieces (or via the existing `AllocatedDevices()` extended to return the new struct).
+The controller exposes this via a method that splits the unified `allocatedDevices` map:
+
+```go
+func (c *Controller) AllocatedDeviceState(ctx context.Context) (AllocatedDeviceState, error) {
+    select {
+    case <-c.hydrationCh:
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        state := AllocatedDeviceState{
+            ExclusiveDevices: make(sets.Set[cloudprovider.DeviceID], len(c.allocatedDevices)),
+            ConsumedCapacity: make(map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
+        }
+        for id, meta := range c.allocatedDevices {
+            if meta.Shared {
+                state.ConsumedCapacity[id] = meta.ConsumedCapacity
+            } else {
+                state.ExclusiveDevices.Insert(id)
+            }
+        }
+        return state, nil
+    case <-ctx.Done():
+        return AllocatedDeviceState{}, ctx.Err()
+    }
+}
+```
+
+The split happens at the boundary between controller and allocator — the controller maintains a clean unified model, the allocator receives the separated representation it needs.
 
 ---
 
