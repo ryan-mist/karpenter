@@ -124,10 +124,18 @@ Template devices (from cloud provider `ResourceSliceTemplate`) use the same stru
 The `apiServerSlice.Devices()` method (`types.go:127-142`) currently discards capacity. It is extended to populate the new fields:
 
 ```go
+attrs := make(map[resourcev1.QualifiedName]resourcev1.DeviceAttribute, len(d.Attributes))
+for k, v := range d.Attributes {
+    attrs[k] = v
+}
+capacity := make(map[resourcev1.QualifiedName]resourcev1.DeviceCapacity, len(d.Capacity))  // NEW
+for k, v := range d.Capacity {                                                              // NEW
+    capacity[k] = v                                                                         // NEW
+}                                                                                           // NEW
 s.devices[i] = cloudprovider.Device{
     Name:                     unique.Make(d.Name),
     Attributes:               attrs,
-    Capacity:                 d.Capacity,                          // NEW
+    Capacity:                 capacity,                            // NEW
     AllowMultipleAllocations: d.AllowMultipleAllocations != nil &&
                               *d.AllowMultipleAllocations,         // NEW
 }
@@ -135,15 +143,43 @@ s.devices[i] = cloudprovider.Device{
 
 ### CEL Environment
 
-The CEL evaluation environment for device selectors must expose the new `device.allowMultipleAllocations` boolean property. This enables DeviceClass selectors to filter for only multi-allocatable devices:
+The CEL evaluation environment for device selectors must expose `device.allowMultipleAllocations` (bool) and `device.capacity` (nested map). This enables DeviceClass selectors to filter for multi-allocatable devices or query capacity dimensions:
 
 ```yaml
 selectors:
   - cel:
       expression: "device.allowMultipleAllocations == true"
+  - cel:
+      expression: "device.capacity['networking.example.com']['bandwidth'].compareTo(quantity('1Gi')) >= 0"
 ```
 
-The `DeviceMatchesSelectors` helper in `request.go` must pass the new fields to the `dracel.Device{}` struct used for CEL evaluation.
+**Cache initialization.** The child allocator creates the CEL cache with `dracel.NewCache(0, dracel.Features{})` (`allocator.go:320`). This must change to enable the consumable capacity type schema:
+
+```go
+celCache: dracel.NewCache(0, dracel.Features{EnableConsumableCapacity: true})
+```
+
+This is set **unconditionally** (not gated behind a Karpenter feature flag). Rationale:
+
+1. The `dracel` compiler uses `environment.StoredExpressions` — it compiles against the latest type definition regardless of the connected cluster's version.
+2. On clusters < 1.34, `AllowMultipleAllocations` is never populated on `ResourceSlice` objects (the field didn't exist or is stripped by the API server). CEL expressions referencing it compile fine but evaluate to `false` via `ptr.Deref` — a safe no-op.
+3. On clusters ≥ 1.34, the field is populated by drivers that declare multi-allocatable devices and the feature gate is enabled in kube-scheduler. Karpenter's simulation matches the scheduler's behavior.
+4. Enabling unconditionally avoids version-detection complexity. A Karpenter binary compiled against k8s 1.35 client libraries can run against 1.33–1.35 clusters with correct behavior in all cases.
+
+If the feature is disabled server-side (the `DRAConsumableCapacity` gate is off on the API server), drivers cannot set `AllowMultipleAllocations` on their `ResourceSlice` objects — the API server rejects or strips the field. So even with Karpenter's CEL environment fully enabled, the field will never be `true` in practice on such clusters.
+
+**DeviceMatchesSelectors change.** The `dracel.Device{}` construction in `request.go:311-314` must pass the new fields:
+
+```go
+match, _, err := result.DeviceMatches(ctx, dracel.Device{
+    Driver:                   deviceID.Driver.Value(),
+    Attributes:               device.Attributes,
+    Capacity:                 device.Capacity,                          // NEW
+    AllowMultipleAllocations: ptr.To(device.AllowMultipleAllocations),  // NEW
+})
+```
+
+Note: `dracel.Device.AllowMultipleAllocations` is `*bool` (pointer) while `cloudprovider.Device.AllowMultipleAllocations` is `bool` (value). The `ptr.To()` conversion is required. When the device is exclusive (field is `false`), this passes `ptr.To(false)` which the CEL evaluator dereferences to `false` — correct behavior.
 
 ---
 

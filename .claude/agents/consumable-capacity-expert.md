@@ -100,11 +100,20 @@ The upstream `distinctAttributeConstraint` keys state by `requestName`. For a si
 ### Constraint state not reset across IT transitions (Karpenter-specific)
 After a successful IT DFS, constraints retain pinned state. `restoreState()` between IT attempts doesn't reset them. The next IT inherits stale pins. Fix: add `Reset()` to the Constraint interface.
 
+## Repository Layout
+
+Both are worktrees of the same Karpenter repo:
+
+- **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity`)
+
 ## Reference
 
-Upstream KEP-5075 semantics: `designs/dra/consumable-capacity.md`
-Karpenter integration design: `designs/dra/consumable-capacity-integration.md`
-Implementation notes & scoping decisions: `designs/dra/consumable-capacity-notes.md`
+Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
+
+- `designs/dra/consumable-capacity.md` — Upstream KEP-5075 semantics
+- `designs/dra/consumable-capacity-integration.md` — Karpenter integration design
+- `designs/dra/consumable-capacity-notes.md` — Implementation notes & scoping decisions
 
 Upstream implementation: `k8s.io/dynamic-resource-allocation@v0.35.0/structured/internal/experimental/`
 - `consumable_capacity.go` — CmpRequestOverCapacity, rounding

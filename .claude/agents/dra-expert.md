@@ -21,7 +21,16 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 - ResourceSlice interface (API server vs template adapters)
 - Cloud provider DynamicResources extensions
 
+## Repository Layout
+
+Both are worktrees of the same Karpenter repo:
+
+- **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity`)
+
 ## Key Files (read these for implementation details)
+
+Implementation code (relative to `/Users/ryanmist/Desktop/karp/karpenter`):
 
 - `pkg/scheduling/dynamicresources/allocator.go` - Core allocator + DFS
 - `pkg/scheduling/dynamicresources/allocationtracker.go` - Device state machine
@@ -32,6 +41,9 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 - `pkg/scheduling/dynamicresources/attributebindings.go` - Binding graph
 - `pkg/cloudprovider/dynamicresources.go` - Cloud provider types
 - `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking
+
+Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
+
 - `designs/dra/scheduling.md` - Authoritative allocator design doc
 - `designs/dra/consumable-capacity-integration.md` - Consumable capacity integration design
 - `designs/dra/consumable-capacity-notes.md` - Implementation notes, known bugs, scoping decisions
