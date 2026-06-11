@@ -27,7 +27,6 @@
   - [Parsing CapacityRequests](#parsing-capacityrequests)
   - [Per-Device Validation](#per-device-validation)
 - [Commit Protocol and Results](#commit-protocol-and-results)
-  - [ShareID Generation](#shareid-generation)
   - [ConsumedCapacity Recording](#consumedcapacity-recording)
   - [Metadata Extensions](#metadata-extensions)
 - [Controller Changes](#controller-changes)
@@ -78,7 +77,7 @@ Integrating consumable capacity into Karpenter's allocator presents three challe
 - Transient capacity tracking during DFS with backtracking
 - Cross-pod consumed capacity tracking (across `Allocate()` calls)
 - `DistinctAttribute` constraint type
-- `ShareID` generation and `ConsumedCapacity` recording in allocation results
+- `ConsumedCapacity` recording in allocation results
 - Controller aggregation of consumed capacity from existing cluster allocations
 - CEL expression support for `device.allowMultipleAllocations`
 
@@ -521,14 +520,6 @@ for _, constraint := range claimData.Constraints {
 
 ## Commit Protocol and Results
 
-### ShareID Generation
-
-When a multi-allocatable device is allocated (capacity check passes), a UUID is generated as the `ShareID`. This uniquely identifies this allocation share among all shares on the device.
-
-ShareID is generated in `tryDevice` at the point where the allocation is recorded (after all checks pass, before recursion). It is stored on `deviceAllocationMetadata` for later inclusion in the allocation result.
-
-For exclusive devices, no ShareID is generated (nil).
-
 ### ConsumedCapacity Recording
 
 The actual consumed capacity (after rounding) for each dimension is recorded alongside the device allocation. This value is computed during the capacity verification step and stored on the metadata for inclusion in the final allocation result.
@@ -541,7 +532,6 @@ The `deviceAllocationMetadata` struct (`allocator.go:452-456`) is extended:
 type deviceAllocationMetadata struct {
     claimIndex       int
     deviceWithID     DeviceWithID
-    shareID          *types.UID                                       // NEW
     consumedCapacity map[resourcev1.QualifiedName]resource.Quantity   // NEW
 }
 ```
@@ -551,7 +541,6 @@ The `ResourceClaimAllocationMetadata.Devices` field (currently `map[InstanceType
 ```go
 type DeviceAllocationResult struct {
     DeviceID         DeviceID
-    ShareID          *types.UID
     ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
 }
 
@@ -559,7 +548,7 @@ type DeviceAllocationResult struct {
 Devices map[InstanceTypeID][]DeviceAllocationResult
 ```
 
-This enables downstream consumers (integration tests, finalization logic) to construct proper `DeviceRequestAllocationResult` objects with ShareID and ConsumedCapacity.
+This enables downstream consumers (integration tests, finalization logic) to verify consumed capacity accounting.
 
 ---
 
@@ -569,7 +558,7 @@ This enables downstream consumers (integration tests, finalization logic) to con
 
 The device allocation controller (`pkg/controllers/dynamicresources/deviceallocation/controller.go`) currently tracks which devices are allocated from `ResourceClaim.Status.Allocation.Devices.Results`. For consumable capacity, it must also aggregate per-device consumed capacity across all claims.
 
-In `reconcileClaim` (`controller.go:120-174`), for each result:
+In `reconcileClaim` (`controller.go:120-174`), for each result (written by kube-scheduler):
 - If `result.ShareID` is non-nil → shared allocation: accumulate `result.ConsumedCapacity` into a per-device capacity map
 - If `result.ShareID` is nil → exclusive allocation: add to `allocatedDevices` set (unchanged)
 
@@ -589,11 +578,11 @@ type Controller struct {
 
 ### Shared vs Exclusive Discrimination
 
-The discriminant is `DeviceRequestAllocationResult.ShareID`:
+The controller reads `DeviceRequestAllocationResult` objects written by kube-scheduler. The discriminant is the `ShareID` field on those results:
 - `ShareID != nil` → shared allocation on a multi-allocatable device → tracked in `consumedCapacity`
 - `ShareID == nil` → exclusive allocation → tracked in `allocatedDevices` (existing behavior)
 
-This is stable: once the upstream scheduler marks an allocation as shared (by generating a ShareID), that status is permanent for the lifetime of the claim.
+Karpenter does not generate ShareIDs. The upstream scheduler generates them at actual allocation time. This is stable: once kube-scheduler marks an allocation as shared, that status is permanent for the lifetime of the claim.
 
 ### Public API Change
 
@@ -652,11 +641,11 @@ The controller exposes this via a new method that returns both pieces (or via th
 
 **Rationale:** Unlike exclusive devices (where allocation for NC-A means NC-B can't use it), multi-allocatable devices allow concurrent use as long as capacity permits. The capacity check naturally handles this — if NC-A commits 40/100, NC-B sees 60 remaining. No special "is this device owned by another NodeClaim?" logic is needed.
 
-### 4. Controller uses ShareID as the discriminant
+### 4. Controller uses ShareID (from kube-scheduler) as the discriminant
 
-**Decision:** `result.ShareID != nil` → shared allocation tracked in consumed capacity; `result.ShareID == nil` → exclusive tracked in allocated devices set.
+**Decision:** When reading `ResourceClaim.Status.Allocation.Devices.Results` (written by kube-scheduler, not Karpenter), `result.ShareID != nil` → shared allocation tracked in consumed capacity; `result.ShareID == nil` → exclusive tracked in allocated devices set.
 
-**Rationale:** ShareID is the canonical upstream signal that an allocation is shared. It's set by the scheduler at allocation time and immutable for the claim's lifetime. Using it avoids needing to cross-reference the device's `AllowMultipleAllocations` flag (which could change after allocation).
+**Rationale:** ShareID is the canonical upstream signal that an allocation is shared. It's set by kube-scheduler at allocation time and immutable for the claim's lifetime. Karpenter's allocator does not generate ShareIDs — it only simulates feasibility. The actual allocation (including ShareID generation) is performed by kube-scheduler after the node is launched. The controller reads kube-scheduler's output to build the consumed capacity state that feeds back into the allocator.
 
 ### 5. Per-device capacity validation (no pre-validation of dimension names)
 
@@ -745,4 +734,4 @@ Suggested PR sequence:
 2. Controller consumed capacity aggregation
 3. Allocation tracker extensions + DFS integration
 4. DistinctAttribute constraint (can parallel with 2-3)
-5. Commit protocol + result metadata extensions
+5. Commit protocol + consumed capacity metadata extensions
