@@ -49,66 +49,65 @@ ${REPO_CONTEXT}
 ## Target
 Generate tests for: ${IMPL_ROOT}/${TARGET}
 
+## CRITICAL: Context Management
+You MUST be efficient with your context window. Follow this exact reading strategy:
+1. Read ONLY the target file first: ${IMPL_ROOT}/${TARGET}
+2. Read the existing test file for the target (same name with _test.go suffix) — use offset/limit to read only the first 200 lines to understand imports and helpers
+3. Do NOT read allocator_test.go unless the target IS allocator.go — it is 3000+ lines and will exhaust your context
+4. Use grep to find specific helper functions instead of reading entire files
+5. For design context, read ONLY the relevant sections using grep first to locate line numbers, then read with offset/limit
+
 ## Instructions
-1. Read the target implementation file: ${IMPL_ROOT}/${TARGET}
-2. Read the design docs:
-   - ${DESIGN_ROOT}/designs/dra/scheduling.md
-   - ${DESIGN_ROOT}/designs/dra/consumable-capacity-integration.md (if the target touches consumable capacity)
-3. Read existing tests in the same directory to understand patterns, helpers, and style:
-   - Look at ${IMPL_ROOT}/pkg/scheduling/dynamicresources/allocator_test.go for test helpers
-   - Look at ${IMPL_ROOT}/pkg/scheduling/dynamicresources/pool_test.go for DescribeTable examples
-   - Look at ${IMPL_ROOT}/pkg/scheduling/dynamicresources/constraint_test.go for constraint testing patterns
-4. **PREFER adding tests to existing test files** rather than creating new ones. If there is already a test file
-   for the target (e.g., allocator_test.go for allocator.go), ADD your tests to that file. Only create a new
-   test file if no existing file covers the target or if the new tests represent a fundamentally different
-   concern that warrants its own file.
-5. Generate comprehensive tests that:
+1. Read the target implementation file
+2. Identify all code paths, branches, and error conditions
+3. Read the test helpers you need (grep for specific function names)
+4. Generate tests that:
    - Use Ginkgo v2 (. "github.com/onsi/ginkgo/v2") and Gomega (. "github.com/onsi/gomega")
    - Use DescribeTable with Entry() wherever multiple cases test the same behavior with different inputs
    - Cover ALL code paths: happy paths, error paths, edge cases, boundary conditions
-   - Reuse existing test helpers (makeNodeClaim, makeTemplate, makeClaim, etc.) from the existing test files
+   - Reuse existing test helpers (makeNodeClaim, makeTemplate, makeClaim, deviceID, etc.)
    - Follow the exact same package_test pattern (package dynamicresources_test)
    - Group related tests under Describe/Context blocks
-   - Name test cases to describe the behavior being tested, not the implementation detail
+5. ADD tests to the existing test file for the target — return the COMPLETE additions (new Describe blocks only, not the whole file)
 
-## Feature Gating Considerations
-DRA tests require Kubernetes 1.30+ (the DynamicResourceAllocation feature gate). Consumable capacity
-(KEP-5075) may require an even newer Kubernetes version or a separate feature gate that isn't available
-in all environments.
+## Available Test Helpers (from pool_test.go and attributebindings_test.go)
+- makeAPISlice(name, driver, pool string, opts ...func(*resourcev1.ResourceSlice)) — builds an API ResourceSlice
+- withAllNodes() — marks slice as accessible from all nodes
+- withAPIDevices(names ...string) — adds plain devices
+- withAPIDevicesWithAttrs(specs ...apiDeviceSpec) — adds devices with attributes
+- withGeneration(gen, sliceCount int64) — sets pool generation
+- deviceWithAttrs(name string, attrs map[QualifiedName]DeviceAttribute) — builds a device spec
+- deviceID(driver, pool, device string) DeviceID — builds a device ID
 
-When generating tests:
-- For integration tests (test/suites/dra/), check how the existing suite handles DRA gating. The suite
-  already runs against a DRA-enabled cluster, so basic DRA tests don't need extra gating.
-- For consumable capacity tests specifically, check if there is a version/feature gate check needed.
-  Look at the pattern in test/pkg/environment/common/expectations.go where version.Minor is checked
-  and Skip() is called for unsupported versions. If consumable capacity needs gating beyond the existing
-  DRA gate, add a similar Skip() guard.
-- For unit tests (pkg/scheduling/dynamicresources/*_test.go), feature gating is not relevant since
-  they test internal logic without a real cluster.
+## Available Test Helpers (from allocator_test.go)
+- makeNodeClaim(itNames ...string) *fakeNodeClaim
+- makeNodeClaimWithTemplates(itName string, templates ...*cloudprovider.ResourceSliceTemplate)
+- makeTemplate(driver, pool string, deviceNames ...string) *cloudprovider.ResourceSliceTemplate
+- makeTemplateWithAttrs(driver, pool string, specs ...apiDeviceSpec) *cloudprovider.ResourceSliceTemplate
+- makeClaim(name string, requests ...resourcev1.DeviceRequest) *resourcev1.ResourceClaim
+- makeClaimWithConstraints(name string, constraints []DeviceConstraint, requests ...) *resourcev1.ResourceClaim
+- exactRequest(name, className string, count int64) resourcev1.DeviceRequest
+- exactRequestWithSelector(name, className string, count int64, expr string) resourcev1.DeviceRequest
 
 ## Output Format
-Return ONLY the Go test code in the "code" field. No explanations outside the JSON.
-If there are already tests for this file, generate ADDITIONAL tests that cover cases not yet tested.
-When adding to an existing file, return the COMPLETE file contents (existing + new tests merged).
-Include the copyright header and all necessary imports.`
+Return ONLY the new Go test code to ADD (new Describe/Context blocks). Include any new imports needed.
+Do NOT return the full file — just the additions.`
 
 const DESIGN_VALIDATOR_PROMPT = `You are a DRA test coverage validator focused on DESIGN COMPLETENESS.
 
 ${REPO_CONTEXT}
 
+## CRITICAL: Context Management
+- Read ONLY the design doc sections relevant to the target. Use grep to find section headings first.
+- Do NOT read entire design docs — use offset/limit to read specific sections.
+- Focus on the BEHAVIORS described in the design that should be tested.
+
 ## Your Task
 1. Read the test code provided below.
-2. From ONLY the tests, reverse-engineer what you believe the design/specification must be.
-3. Read the actual design docs:
+2. Read the relevant design doc sections (use grep + offset/limit):
    - ${DESIGN_ROOT}/designs/dra/scheduling.md
-   - ${DESIGN_ROOT}/designs/dra/consumable-capacity-integration.md
-4. Compare your inferred design with the actual design.
-5. Identify any design behaviors, invariants, or edge cases that are NOT covered by the tests.
-6. Check whether tests are being added to existing test files (preferred) or creating unnecessary new files.
-7. For integration tests touching consumable capacity, verify that appropriate feature gating is in place.
-   DRA requires k8s 1.30+. Consumable capacity (KEP-5075) may need a newer version or additional gate.
-   Check how existing DRA tests handle this (look at test/suites/dra/suite_test.go and the
-   version.Minor Skip() pattern in test/pkg/environment/common/expectations.go).
+   - ${DESIGN_ROOT}/designs/dra/consumable-capacity-integration.md (if target touches consumable capacity)
+3. Identify design behaviors NOT covered by the tests.
 
 ## Target
 The tests are for: ${IMPL_ROOT}/${TARGET}
@@ -117,22 +116,25 @@ The tests are for: ${IMPL_ROOT}/${TARGET}
 {TESTS}
 
 ## Output Format
-Return a JSON object with these fields:
+Return a JSON object with:
 - "covered": array of design behaviors that ARE tested
-- "missing": array of design behaviors that are NOT tested (be specific about what scenario is missing, reference design doc sections)
+- "missing": array of design behaviors NOT tested (be specific, reference design doc sections)
 - "verdict": "pass" or "needs_work"
-- "feedback": specific instructions for the generator about what to add, referencing exact design doc sections and behaviors. Include feedback about file placement (existing vs new file) and feature gating if relevant.`
+- "feedback": specific instructions about what to add (keep under 500 words)`
 
 const IMPL_VALIDATOR_PROMPT = `You are a DRA test coverage validator focused on IMPLEMENTATION COMPLETENESS.
 
 ${REPO_CONTEXT}
 
+## CRITICAL: Context Management
+- Read ONLY the target implementation file.
+- Do NOT read test helpers or other files unless absolutely necessary.
+- Compare test code against implementation code paths.
+
 ## Your Task
 1. Read the test code provided below.
-2. From ONLY the tests, reverse-engineer what you believe the implementation does.
-3. Read the actual implementation: ${IMPL_ROOT}/${TARGET}
-4. Compare your inferred behavior with the actual code paths.
-5. Identify any code paths, branches, error conditions, or edge cases that are NOT exercised by the tests.
+2. Read the implementation: ${IMPL_ROOT}/${TARGET}
+3. Identify code paths NOT exercised by the tests.
 
 ## Target
 The tests are for: ${IMPL_ROOT}/${TARGET}
@@ -141,20 +143,25 @@ The tests are for: ${IMPL_ROOT}/${TARGET}
 {TESTS}
 
 ## Output Format
-Return a JSON object with these fields:
-- "covered_paths": array of code paths/branches that ARE tested
-- "uncovered_paths": array of code paths/branches that are NOT tested (reference line numbers from the implementation file)
+Return a JSON object with:
+- "covered_paths": array of code paths that ARE tested
+- "uncovered_paths": array of code paths NOT tested (reference line numbers)
 - "verdict": "pass" or "needs_work"
-- "feedback": specific instructions for the generator about what to add, referencing exact functions, line numbers, and branch conditions`
+- "feedback": specific instructions about what to add (keep under 500 words)`
 
-const CONVERGENCE_PROMPT = `You are a DRA test generator incorporating validator feedback. Your job is to produce a COMPLETE updated test file that addresses the gaps identified by both validators.
+const CONVERGENCE_PROMPT = `You are a DRA test generator incorporating validator feedback.
 
 ${REPO_CONTEXT}
 
 ## Target
 Tests for: ${IMPL_ROOT}/${TARGET}
 
-## Previous Tests (complete file)
+## CRITICAL: Context Management
+- Do NOT re-read files you already know about. Use the feedback directly.
+- Read ONLY specific lines referenced in the feedback (use offset/limit).
+- Keep your output focused on the NEW tests to add.
+
+## Previous Tests
 {PREVIOUS_TESTS}
 
 ## Design Validator Feedback
@@ -164,26 +171,19 @@ Tests for: ${IMPL_ROOT}/${TARGET}
 {IMPL_FEEDBACK}
 
 ## Instructions
-1. Read the feedback from both validators carefully.
-2. Read the relevant source files to understand the gaps:
-   - Implementation: ${IMPL_ROOT}/${TARGET}
-   - Design: ${DESIGN_ROOT}/designs/dra/scheduling.md
-3. Check the existing test file for the target — prefer adding to it rather than creating a new file.
-4. Produce a COMPLETE updated test file that includes both the previous tests AND new tests addressing the gaps.
-5. Use the same patterns: Ginkgo v2, Gomega, DescribeTable where appropriate, reuse existing helpers.
-6. Use DescribeTable for any set of cases that test the same behavior with different inputs.
-7. For consumable capacity tests in the integration suite (test/suites/dra/), add a version/feature
-   gate Skip() guard if the consumable capacity feature requires a newer k8s version than 1.30. Check
-   existing patterns in the codebase first (e.g., version.Minor checks with Skip()).
+1. Address the gaps identified by both validators.
+2. Read ONLY the specific source lines referenced in the feedback.
+3. Produce ADDITIONAL test code (new Describe/Context blocks only).
+4. Use the same patterns: Ginkgo v2, Gomega, DescribeTable where appropriate, reuse existing helpers.
 
 ## Output Format
-Return the COMPLETE Go test file in the "code" field (not just additions — the full file including previous tests and new ones).`
+Return the COMPLETE updated test additions (previous + new). Do NOT return the full original test file.`
 
 const TESTS_SCHEMA = {
   type: 'object',
   properties: {
-    code: { type: 'string', description: 'The complete Go test file content' },
-    summary: { type: 'string', description: 'Brief summary of what was generated/added' },
+    code: { type: 'string', description: 'Go test code (new Describe blocks to add)' },
+    summary: { type: 'string', description: 'Brief summary of what was generated (under 100 words)' },
   },
   required: ['code', 'summary'],
 }
