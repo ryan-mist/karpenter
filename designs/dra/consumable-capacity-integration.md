@@ -737,37 +737,78 @@ For DistinctAttribute the semantics are sound: we only need "these are different
 
 ## Implementation Sequencing
 
-The work items have dependencies that constrain ordering:
+Implementation follows the same layering pattern as the initial DRA allocator (attribute binding + pool generation → core types → request validation → allocator integration):
+
+### Commit 1: Device Model Changes ✓
+
+Foundation layer. Extends `cloudprovider.Device` with `Capacity`, `AllowMultipleAllocations`. Updates API server slice conversion and CEL environment.
+
+- [cloudprovider.Device Extension](#cloudproviderdevice-extension)
+- [API Server Slice Conversion](#api-server-slice-conversion)
+- [CEL Environment](#cel-environment)
+
+Equivalent to: *attribute binding + pool generation* (data ingestion layer).
+
+### Commit 2: Controller Changes (Consumed Capacity Ingestion)
+
+Completes the data ingestion layer — makes consumed capacity from existing cluster allocations available to the allocator.
+
+- [Consumed Capacity Aggregation](#consumed-capacity-aggregation)
+- [Shared vs Exclusive Discrimination](#shared-vs-exclusive-discrimination)
+- [Public API Change](#public-api-change)
+
+Equivalent to: *attribute binding + pool generation* (data flows into the allocator before it can reason about capacity).
+
+### Commit 3: Core Types & Verification Logic
+
+Pure computation layer — no state machines, no integration with DFS yet.
+
+- [Rounding Logic](#rounding-logic)
+- [Default Consumption](#default-consumption)
+- [DistinctAttribute Interface Implementation](#interface-implementation)
+- [Preallocated Consumed Capacity](#preallocated-consumed-capacity)
+- [Inflight Consumed Capacity](#inflight-consumed-capacity)
+
+Equivalent to: *core types* (foundational types and logic that request validation and the allocator build on).
+
+### Commit 4: Request Validation
+
+Parsing layer — transforms API objects into allocator-internal representations.
+
+- [Parsing CapacityRequests](#parsing-capacityrequests)
+- [Construction in ValidateClaimRequest](#construction-in-validateclaimrequest)
+
+Equivalent to: *request validation* (claim specs → allocator-internal data structures).
+
+### Commit 5: Allocator Integration
+
+DFS integration — connects all prior layers into the allocation decision path.
+
+- [Placement in tryDevice](#placement-in-trydevice)
+- [Backtracking](#backtracking)
+- [IsAllocated Semantic Change](#isallocated-semantic-change)
+- [Scoping and Evaluation](#scoping-and-evaluation) (DistinctAttribute in constraint loop)
+- [Commit Protocol Extension](#commit-protocol-extension)
+- [ConsumedCapacity Recording](#consumedcapacity-recording)
+- [Metadata Extensions](#metadata-extensions)
+
+Equivalent to: *allocator* (the DFS, backtracking, commit protocol).
+
+### Dependency Graph
 
 ```
-1. Device Model Changes
-   └── No dependencies. Foundation for everything else.
-
-2. Capacity Types & Verification Logic (new capacity.go)
-   └── Depends on: (1) Device model for DeviceCapacity type
-
-3. Controller Changes
-   └── Depends on: (1) Device model, (2) capacity types
-
-4. Allocation Tracker Changes
-   └── Depends on: (2) capacity types
-
-5. Request Validation (CapacityRequests parsing)
-   └── Depends on: (1) Device model
-
-6. DFS / tryDevice Integration
-   └── Depends on: (2) verification logic, (4) tracker, (5) request parsing
-
-7. DistinctAttribute Constraint
-   └── Independent — can parallel with (2)-(6)
-
-8. Commit Protocol & Result Extensions
-   └── Depends on: (6) DFS integration
+Commit 1: Device Model ✓
+  │
+  ├──→ Commit 2: Controller Changes
+  │       │
+  │       ▼
+  ├──→ Commit 3: Core Types & Verification
+  │       │
+  │       ▼
+  ├──→ Commit 4: Request Validation
+  │       │
+  │       ▼
+  └──→ Commit 5: Allocator Integration (depends on 2, 3, 4)
 ```
 
-Suggested PR sequence:
-1. Device model + capacity types + verification logic
-2. Controller consumed capacity aggregation
-3. Allocation tracker extensions + DFS integration
-4. DistinctAttribute constraint (can parallel with 2-3)
-5. Commit protocol + consumed capacity metadata extensions
+DistinctAttribute spans Commits 3-5 (struct definition → request parsing → DFS evaluation) but can be developed in parallel with capacity verification since they share no code paths until Commit 5.
