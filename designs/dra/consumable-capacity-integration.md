@@ -590,27 +590,34 @@ This enables downstream consumers (integration tests, finalization logic) to ver
 
 ## Controller Changes
 
-### Design Approach: Extend Existing Fields
+### Design Approach: Unify Per-Claim State
 
-The controller already tracks per-device state via four coordinated maps (`allocatedDevices`, `claimsPerDevice`, `devicesPerClaim`, `metadataPerClaim`). Rather than introducing a parallel tracking system for shared devices, we extend this existing skeleton:
+The controller currently uses four maps — `allocatedDevices`, `claimsPerDevice`, `devicesPerClaim`, and `metadataPerClaim`. The last two both key on claim `NamespacedName` and logically describe the same thing: what a claim contributes. We merge them into a single `ClaimMetadata` struct, reducing to **3 maps**:
 
-1. `devicesPerClaim` changes from `sets.Set[DeviceID]` to `map[DeviceID]DeviceContribution` — carrying each claim's per-device capacity contribution
-2. `Metadata` gains `ConsumedCapacity` and `Shared` fields — `computeDeviceMetadata()` aggregates capacity from all claims
+1. `claimMetadata` replaces both `devicesPerClaim` and `metadataPerClaim` — carries the claim's device contributions (including capacity) alongside releasability/consumer info
+2. `DeviceMetadata` (renamed from `Metadata`) gains `ConsumedCapacity` and `Shared` fields — `computeDeviceMetadata()` aggregates from all claims
 3. ALL devices (shared and exclusive) remain in `allocatedDevices` — the `Shared` flag distinguishes them at query time
-
-This preserves the single-loop reconcile flow and avoids dual cleanup paths.
 
 ### Controller State Changes
 
 ```go
-// DeviceContribution records what a single claim contributes to a device's allocation.
+// DeviceContribution records what a single claim contributes to a specific device.
 type DeviceContribution struct {
     // ConsumedCapacity is the per-dimension capacity this claim consumes on the device.
     // nil for exclusive allocations.
     ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
 }
 
-type Metadata struct {
+// ClaimMetadata combines per-claim reservation info with per-device contributions.
+// Replaces the previous devicesPerClaim + metadataPerClaim split.
+type ClaimMetadata struct {
+    Releasable    bool
+    Consumers     []ConsumerRef
+    Contributions map[cloudprovider.DeviceID]DeviceContribution
+}
+
+// DeviceMetadata is the aggregated state for a single device across all claims.
+type DeviceMetadata struct {
     Releasable       bool
     Consumers        []ConsumerRef
     // Shared is true when the device is multi-allocatable (allocated via ShareID).
@@ -624,43 +631,61 @@ type Controller struct {
     kubeClient client.Client
 
     mu               sync.RWMutex
-    allocatedDevices map[cloudprovider.DeviceID]Metadata
+    allocatedDevices map[cloudprovider.DeviceID]DeviceMetadata
     claimsPerDevice  map[cloudprovider.DeviceID]sets.Set[types.NamespacedName]
-    devicesPerClaim  map[types.NamespacedName]map[cloudprovider.DeviceID]DeviceContribution  // CHANGED
-    metadataPerClaim map[types.NamespacedName]Metadata
+    claimMetadata    map[types.NamespacedName]ClaimMetadata
 
     hydrationCh   chan struct{}
     hydrationOnce sync.Once
 }
 ```
 
+The device set for a claim is `keys(claimMetadata[nn].Contributions)` — no separate `devicesPerClaim` needed.
+
 ### Consumed Capacity Aggregation
 
-In `reconcileClaim`, the existing single-loop pattern is preserved. For each `DeviceRequestAllocationResult`:
+In `reconcileClaim`, the single-loop pattern is preserved. Build the new `ClaimMetadata` from the claim's allocation results:
 
 ```go
-contributions := make(map[cloudprovider.DeviceID]DeviceContribution, len(results))
+cm := ClaimMetadata{
+    Releasable:    claimReleasable(claim),
+    Consumers:     claimConsumers(claim),
+    Contributions: make(map[cloudprovider.DeviceID]DeviceContribution, len(results)),
+}
 for i := range results {
     result := &results[i]
     deviceID := makeDeviceID(result)
-    contributions[deviceID] = DeviceContribution{
+    cm.Contributions[deviceID] = DeviceContribution{
         ConsumedCapacity: result.ConsumedCapacity,  // nil for exclusive (ShareID == nil)
     }
 }
 ```
 
-The diff logic uses the same add/remove pattern as today, but operates on a map instead of a set:
+The diff logic uses the same add/remove pattern as today, comparing `Contributions` keys:
 
 ```go
+oldCM := c.claimMetadata[nn]
+c.claimMetadata[nn] = cm
+
 // Devices no longer in this claim
-for device := range oldContributions {
-    if _, still := contributions[device]; !still {
-        // remove from claimsPerDevice, recompute metadata or delete
+for device := range oldCM.Contributions {
+    if _, still := cm.Contributions[device]; !still {
+        c.claimsPerDevice[device].Delete(nn)
+        if len(c.claimsPerDevice[device]) == 0 {
+            delete(c.claimsPerDevice, device)
+            delete(c.allocatedDevices, device)
+        } else {
+            c.allocatedDevices[device] = c.computeDeviceMetadata(device)
+        }
     }
 }
 // Devices in this claim (new or updated)
-for device := range contributions {
-    // ensure claimsPerDevice entry, recompute metadata
+for device := range cm.Contributions {
+    if _, ok := c.claimsPerDevice[device]; !ok {
+        c.claimsPerDevice[device] = sets.New[types.NamespacedName]()
+    }
+    c.claimsPerDevice[device].Insert(nn)
+    c.allocatedDevices[device] = c.computeDeviceMetadata(device)
 }
 ```
 
@@ -675,16 +700,16 @@ This information originates from `result.ConsumedCapacity` on `DeviceRequestAllo
 `computeDeviceMetadata()` derives the aggregate:
 
 ```go
-func (c *Controller) computeDeviceMetadata(device cloudprovider.DeviceID) Metadata {
-    meta := Metadata{Releasable: true}
+func (c *Controller) computeDeviceMetadata(device cloudprovider.DeviceID) DeviceMetadata {
+    meta := DeviceMetadata{Releasable: true}
     for nn := range c.claimsPerDevice[device] {
-        claimMeta := c.metadataPerClaim[nn]
-        if !claimMeta.Releasable {
+        cm := c.claimMetadata[nn]
+        if !cm.Releasable {
             meta.Releasable = false
         }
-        meta.Consumers = append(meta.Consumers, claimMeta.Consumers...)
+        meta.Consumers = append(meta.Consumers, cm.Consumers...)
 
-        contrib := c.devicesPerClaim[nn][device]
+        contrib := cm.Contributions[device]
         if contrib.ConsumedCapacity != nil {
             meta.Shared = true
             meta.ConsumedCapacity = addCapacity(meta.ConsumedCapacity, contrib.ConsumedCapacity)
