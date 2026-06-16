@@ -752,33 +752,33 @@ func NewAllocator(
 ) *Allocator
 ```
 
-The controller exposes this via a method that splits the unified `allocatedDevices` map:
+The controller exposes allocated device state via an iterator that yields each device with its computed metadata:
 
 ```go
-func (c *Controller) AllocatedDeviceState(ctx context.Context) (AllocatedDeviceState, error) {
-    select {
-    case <-c.hydrationCh:
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        state := AllocatedDeviceState{
-            ExclusiveDevices: make(sets.Set[cloudprovider.DeviceID], len(c.allocatedDevices)),
-            ConsumedCapacity: make(map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
-        }
-        for id, meta := range c.allocatedDevices {
-            if meta.Shared {
-                state.ConsumedCapacity[id] = meta.ConsumedCapacity
-            } else {
-                state.ExclusiveDevices.Insert(id)
-            }
-        }
-        return state, nil
-    case <-ctx.Done():
-        return AllocatedDeviceState{}, ctx.Err()
+func (c *Controller) AllocatedDevices(ctx context.Context) (iter.Seq2[cloudprovider.DeviceID, DeviceMetadata], error)
+```
+
+`DeviceMetadata` carries `Shared bool` and `ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity` — the shared-vs-exclusive discrimination is already computed by the controller during reconciliation. The consumer (Commit 5 caller) iterates the output and builds `AllocatedDeviceState`:
+
+```go
+iter, err := deviceAllocController.AllocatedDevices(ctx)
+if err != nil {
+    return err
+}
+state := AllocatedDeviceState{
+    ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+    ConsumedCapacity: make(map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
+}
+for id, meta := range iter {
+    if meta.Shared {
+        state.ConsumedCapacity[id] = meta.ConsumedCapacity
+    } else {
+        state.ExclusiveDevices.Insert(id)
     }
 }
 ```
 
-The split happens at the boundary between controller and allocator — the controller maintains a clean unified model, the allocator receives the separated representation it needs.
+The split happens at the consumer boundary — the controller maintains a clean unified model behind the iterator, and the allocator caller constructs the separated representation that `NewAllocator` expects.
 
 ---
 
