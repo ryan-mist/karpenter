@@ -876,7 +876,7 @@ Foundation layer. Extends `cloudprovider.Device` with `Capacity`, `AllowMultiple
 
 Equivalent to: *attribute binding + pool generation* (data ingestion layer).
 
-### Commit 2: Controller Changes (Consumed Capacity Ingestion)
+### Commit 2: Controller Changes (Consumed Capacity Ingestion) ✓
 
 Completes the data ingestion layer — makes consumed capacity from existing cluster allocations available to the allocator.
 
@@ -926,7 +926,7 @@ Equivalent to: *allocator* (the DFS, backtracking, commit protocol).
 ```
 Commit 1: Device Model ✓
   │
-  ├──→ Commit 2: Controller Changes
+  ├──→ Commit 2: Controller Changes ✓
   │       │
   │       ▼
   ├──→ Commit 3: Core Types & Verification

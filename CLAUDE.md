@@ -14,6 +14,9 @@ go test ./... -count=1
 # Run specific package tests
 go test ./pkg/scheduling/dynamicresources/... -count=1
 
+# Run tests requiring DRAConsumableCapacity (needs 1.36+ envtest binary)
+KUBEBUILDER_ASSETS=$(setup-envtest use 1.36.0 -p path) go test ./pkg/controllers/dynamicresources/deviceallocation/... -count=1
+
 # Run integration tests (requires cluster)
 go test ./test/suites/dra/... -count=1
 ```
