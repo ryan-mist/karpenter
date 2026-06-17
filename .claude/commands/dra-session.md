@@ -9,7 +9,9 @@ For the rest of this session, when the user asks DRA-related questions or reques
 1. **Route to the appropriate expert agent** rather than answering directly:
    - **Karpenter DRA allocator** questions (DFS, AllocationTracker, pools, constraints, commit protocol, instance type superposition, NodeClaim interface) → spawn `dra-expert` agent
    - **Consumable capacity / KEP-5075** questions (multi-allocatable devices, capacity accounting, RequestPolicy, rounding, DistinctAttribute, ShareID) → spawn `consumable-capacity-expert` agent
-   - **Both** (integration design, how consumable capacity fits into Karpenter's allocator) → spawn both agents with the relevant sub-question, then synthesize their answers
+   - **Partitionable devices / KEP-4815** questions (SharedCounters, counter budgets, overlapping partitions, PerDeviceNodeSelection, multi-host devices, MIG partitioning) → spawn `partitionable-devices-expert` agent
+   - **Both CC + PD** (how consumable capacity and partitionable devices interact, devices with both ConsumesCounters and AllowMultipleAllocations) → spawn both `consumable-capacity-expert` and `partitionable-devices-expert`
+   - **Integration design** (how any feature maps into Karpenter's allocator) → spawn the relevant expert + `dra-expert`, then synthesize
 
 2. **Before delegating**, briefly state which agent(s) you're consulting and why (one sentence).
 
@@ -20,6 +22,9 @@ For the rest of this session, when the user asks DRA-related questions or reques
    - `designs/dra/consumable-capacity.md` — Upstream KEP-5075 semantics
    - `designs/dra/consumable-capacity-integration.md` — Karpenter integration design (how CC maps into the allocator)
    - `designs/dra/consumable-capacity-notes.md` — Scoping decisions, known upstream bugs, follow-ups
+   - `designs/dra/partitionable-devices.md` — Upstream KEP-4815 semantics
+   - `designs/dra/partitionable-devices-integration.md` — Karpenter integration design (SharedCounters, PerDeviceNodeSelection)
+   - `designs/dra/partitionable-devices-notes.md` — Scoping decisions, open questions, follow-ups
 
 5. **For non-DRA tasks**, proceed normally without delegation.
 
@@ -29,7 +34,8 @@ For the rest of this session, when the user asks DRA-related questions or reques
 |-------|--------|----------|
 | `dra-expert` | Karpenter DRA allocator internals | Questions about the existing allocator DFS, constraint system, pool management, commit protocol, thread safety |
 | `consumable-capacity-expert` | Upstream KEP-5075 semantics | Questions about multi-allocatable devices, capacity verification, rounding rules, DistinctAttribute, ShareID |
+| `partitionable-devices-expert` | Upstream KEP-4815 semantics | Questions about SharedCounters, counter budgets, overlapping partitions, PerDeviceNodeSelection, MIG, multi-host TPU |
 
 ## Confirm
 
-After reading this, respond with: "DRA session active. I'll delegate to expert agents for DRA questions — `dra-expert` for Karpenter allocator internals, `consumable-capacity-expert` for upstream KEP-5075 semantics."
+After reading this, respond with: "DRA session active. I'll delegate to expert agents for DRA questions — `dra-expert` for Karpenter allocator internals, `consumable-capacity-expert` for KEP-5075 semantics, `partitionable-devices-expert` for KEP-4815 semantics."

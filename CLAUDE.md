@@ -53,4 +53,10 @@ Key entry points:
 - `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking
 - `designs/dra/scheduling.md` - Authoritative design doc
 
-Currently out of scope: adminAccess, partitionable devices, consumable capacity, device taints, consolidation, FirstAvailable requests.
+Currently out of scope: adminAccess, device taints, consolidation, FirstAvailable requests.
+
+Design docs for upcoming features:
+- `designs/dra/consumable-capacity.md` — KEP-5075 upstream semantics
+- `designs/dra/consumable-capacity-integration.md` — Karpenter integration plan
+- `designs/dra/partitionable-devices.md` — KEP-4815 upstream semantics
+- `designs/dra/partitionable-devices-integration.md` — Karpenter integration plan
