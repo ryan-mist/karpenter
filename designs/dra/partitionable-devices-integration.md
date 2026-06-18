@@ -209,11 +209,50 @@ During pool gathering:
 4. For non-matching slices with `Devices`: retain only devices that have `ConsumesCounters` → `Pool.NonTargetingDevices`
 5. Validate: counter set names unique within pool
 
-**SharedCounters slices always count toward completeness** regardless of node affinity. A counter-set-only slice has no `NodeSelector`/`NodeName`/`AllNodes` — it applies to the pool globally. Pool gathering must accept these slices unconditionally (not filter them by requirements).
+### sliceMatchesRequirements Change
+
+Counter-set slices have no node affinity (no `NodeSelector`, `NodeName`, or `AllNodes`). Rather than special-casing them in `GatherPools`, extend `sliceMatchesRequirements` to return `true` for them — they are unconditionally relevant to the pool:
+
+```go
+func sliceMatchesRequirements(s ResourceSlice, requirements scheduling.Requirements) bool {
+    if s.Potential() {
+        panic("potential slices must not be passed to pool gathering or filtering")
+    }
+    if len(s.SharedCounters()) > 0 {
+        return true
+    }
+    if s.AllNodes() {
+        return true
+    }
+    if ns := s.NodeSelector(); ns != nil {
+        return nodeSelectorsMatch(ns, requirements)
+    }
+    return false
+}
+```
+
+This keeps `GatherPools` unchanged — counter-set slices flow through `addSlice(s, true)` naturally. A device slice with no affinity fields still returns `false` (preserving detection of buggy drivers), because it won't have `SharedCounters`.
+
+### ResourceSlice Interface Addition
+
+Add `SharedCounters()` to the `ResourceSlice` interface:
+
+```go
+type ResourceSlice interface {
+    // ... existing methods ...
+    SharedCounters() []cloudprovider.CounterSet
+}
+```
+
+Implementations:
+- `apiServerSlice`: parses `slice.Spec.SharedCounters` (lazily, like `Devices()`)
+- `templateSlice`: returns `template.CounterSets`
 
 ### Pool Gathering Changes (pool.go)
 
-The `poolBuilder` and `build()` function are extended:
+`GatherPools` is unchanged — `sliceMatchesRequirements` handles counter-set slices.
+
+The `build()` function branches on `SharedCounters()` when processing entries:
 
 ```go
 func (b *poolBuilder) build(key PoolKey) *Pool {
@@ -223,13 +262,20 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
         pool.Incomplete = true
     }
 
-    // Separate counter-set slices from device slices
-    var counterSetSlices []ResourceSlice
     seen := sets.New[unique.Handle[string]]()
-
     for _, e := range b.entries {
-        if e.slice.HasSharedCounters() {
-            counterSetSlices = append(counterSetSlices, e.slice)
+        if len(e.slice.SharedCounters()) > 0 {
+            // Counter-set slice — gather counter sets
+            for _, cs := range e.slice.SharedCounters() {
+                if pool.CounterSets == nil {
+                    pool.CounterSets = make(map[string]map[string]resource.Quantity)
+                }
+                counters := make(map[string]resource.Quantity, len(cs.Counters))
+                for name, qty := range cs.Counters {
+                    counters[name] = qty
+                }
+                pool.CounterSets[cs.Name] = counters
+            }
             continue
         }
         if e.matched {
@@ -264,9 +310,6 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
             }
         }
     }
-
-    // Gather counter sets
-    pool.CounterSets = gatherCounterSets(counterSetSlices)
 
     if len(pool.Slices) == 0 && len(pool.NonTargetingDevices) == 0 {
         return nil
@@ -321,9 +364,7 @@ Counter sets may reside in separate ResourceSlices from devices. The pool is onl
 - Missing counter-set slices → under-estimating total counters → incorrect availability
 - Missing device slices → under-estimating consumption → over-allocation
 
-This matches existing completeness logic (pools must be fully observed before use). No behavioral change — just reinforcing that the check matters more now.
-
-**SharedCounters slices and `sliceMatchesRequirements`:** Counter-set-only slices have no node affinity fields. They must not be passed through `sliceMatchesRequirements()` (which panics on potential slices and expects node-affinity fields). Pool gathering identifies them by `HasSharedCounters()` and handles them separately.
+This matches existing completeness logic (pools must be fully observed before use). No behavioral change — just reinforcing that the check matters more now. Counter-set slices pass through `sliceMatchesRequirements` (which returns `true` for them) and are counted toward completeness like any other slice.
 
 ### Pool Validation
 
@@ -692,13 +733,14 @@ This matches upstream, where `checkAvailableCounters` iterates pool device slice
 
 ### Commit 1: Device Model & Pool Changes
 
-Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `CounterSet` type, updates pool gathering/filtering to handle counter-set slices and non-targeting devices, and adds pool validation.
+Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `CounterSet` type, adds `SharedCounters()` to `ResourceSlice` interface, updates `sliceMatchesRequirements` + pool gathering/filtering to handle counter-set slices and non-targeting devices, and adds pool validation.
 
 - [cloudprovider.Device Extension](#cloudproviderdevice-extension)
 - [cloudprovider.CounterSet Type](#cloudprovidercounterset-type)
 - [API Server Slice Conversion](#api-server-slice-conversion)
 - [Pool Struct Extension](#pool-struct-extension)
-- [Counter Set Gathering](#counter-set-gathering)
+- [ResourceSlice Interface Addition](#resourceslice-interface-addition)
+- [sliceMatchesRequirements Change](#slicematchesrequirements-change)
 - [Pool Gathering Changes (pool.go)](#pool-gathering-changes-poolgo)
 - [FilterPools Changes (pool.go)](#filterpools-changes-poolgo)
 - [Pool Completeness](#pool-completeness)
