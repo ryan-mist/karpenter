@@ -198,9 +198,19 @@ Upstream can afford Option 1 because it schedules **one pod on one concrete node
 
 The key asymmetry with CC that makes Option 2 viable: counter consumption is **deterministic from the device definition**. Knowing "device X is allocated" + reading `device.ConsumesCounters` = full picture. No per-allocation metadata needed. The controller doesn't add information — it pre-computes what the allocator could derive, but moves that work off the hot path.
 
-### Recommendation: Option 2
+### Decision: Option 1 (match upstream)
 
-Performance wins are decisive for Karpenter's scheduling model. The architectural consistency with CC's controller-to-allocator data flow makes the pattern familiar. The upstream divergence is acceptable — Karpenter already diverges fundamentally (superposition vs. concrete node), and the correctness is straightforward to test (same deduction logic, different execution timing).
+The primary use case (MIG, SR-IOV) is node-local — all devices sharing a counter set are on the same node. The cross-node case (multi-host TPU) is rare and already scoped as limited support. This means the performance concerns with Option 1 are largely theoretical:
+- In a node-local pool, there are few or no "non-matching" devices (they're all on the same node the slice targets)
+- The O(devices) iteration is bounded by devices per physical GPU (~10-20 MIG partitions), not devices per cluster
+- Multi-host pools (where non-matching devices actually exist) are uncommon and small relative to the GPU MIG case
+
+Given this, matching upstream is the right call:
+- 1:1 correspondence makes correctness validation trivial
+- Pool is self-contained — allocator doesn't depend on controller pre-computation
+- Controller stays simple — no `ConsumesCounters` interpretation
+- When multi-host support expands, the mechanism already works correctly
+- Avoids premature optimization for a hot path that isn't actually hot in the common case
 
 ---
 

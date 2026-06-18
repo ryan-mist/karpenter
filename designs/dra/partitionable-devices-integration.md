@@ -175,22 +175,144 @@ Template counter sets are instance-type-specific — different GPU models have d
 
 ## Pool Management Changes
 
-### Counter Set Gathering
+### Pool Struct Extension
 
-Pool assembly (`Pool` struct in `types.go`) is extended to aggregate counter sets:
+The `Pool` struct (`pool.go`) is extended with counter sets and non-targeting devices:
 
 ```go
 type Pool struct {
-    // ... existing fields (devices, slices) ...
-    CounterSets map[string]map[string]resource.Quantity  // counterSetName → counterName → total
+    Key PoolKey
+    Slices []ResourceSlice
+    Devices []DeviceWithID
+    Incomplete bool
+    Invalid bool
+
+    // CounterSets holds the counter set definitions for this pool.
+    // counterSetName → counterName → total available quantity.
+    CounterSets map[string]map[string]resource.Quantity
+
+    // NonTargetingDevices holds devices from slices that don't match the current
+    // NodeClaim's requirements but have ConsumesCounters. These are NOT allocation
+    // candidates — they exist solely so the allocator can deduct their counter
+    // consumption when they are allocated (on other nodes).
+    // This mirrors upstream's DeviceSlicesNotTargetingNode.
+    NonTargetingDevices []DeviceWithID
 }
 ```
 
+### Counter Set Gathering
+
 During pool gathering:
 1. Iterate all ResourceSlices in the pool
-2. For slices with `SharedCounters`: merge into `Pool.CounterSets`
-3. For slices with `Devices`: parse devices as before (now including `ConsumesCounters`)
-4. Validate: counter set names unique within pool
+2. For slices with `SharedCounters` (no `Devices`): merge into `Pool.CounterSets`
+3. For matching slices with `Devices`: parse devices as before (now including `ConsumesCounters`) → `Pool.Devices`
+4. For non-matching slices with `Devices`: retain only devices that have `ConsumesCounters` → `Pool.NonTargetingDevices`
+5. Validate: counter set names unique within pool
+
+**SharedCounters slices always count toward completeness** regardless of node affinity. A counter-set-only slice has no `NodeSelector`/`NodeName`/`AllNodes` — it applies to the pool globally. Pool gathering must accept these slices unconditionally (not filter them by requirements).
+
+### Pool Gathering Changes (pool.go)
+
+The `poolBuilder` and `build()` function are extended:
+
+```go
+func (b *poolBuilder) build(key PoolKey) *Pool {
+    pool := &Pool{Key: key}
+
+    if int64(len(b.entries)) != b.resourceSliceCount {
+        pool.Incomplete = true
+    }
+
+    // Separate counter-set slices from device slices
+    var counterSetSlices []ResourceSlice
+    seen := sets.New[unique.Handle[string]]()
+
+    for _, e := range b.entries {
+        if e.slice.HasSharedCounters() {
+            counterSetSlices = append(counterSetSlices, e.slice)
+            continue
+        }
+        if e.matched {
+            // Matching device slice — devices are allocation candidates
+            pool.Slices = append(pool.Slices, e.slice)
+            topoReqs := sliceTopologyRequirements(e.slice)
+            for _, d := range e.slice.Devices() {
+                if seen.Has(d.Name) {
+                    pool.Invalid = true
+                }
+                seen.Insert(d.Name)
+                pool.Devices = append(pool.Devices, DeviceWithID{
+                    Device: d,
+                    ID:     DeviceID{...},
+                    TopologyRequirements: topoReqs,
+                })
+            }
+        } else {
+            // Non-matching device slice — retain devices with ConsumesCounters
+            // for counter deduction (not allocation candidates)
+            for _, d := range e.slice.Devices() {
+                if seen.Has(d.Name) {
+                    pool.Invalid = true
+                }
+                seen.Insert(d.Name)
+                if len(d.ConsumesCounters) > 0 {
+                    pool.NonTargetingDevices = append(pool.NonTargetingDevices, DeviceWithID{
+                        Device: d,
+                        ID:     DeviceID{...},
+                    })
+                }
+            }
+        }
+    }
+
+    // Gather counter sets
+    pool.CounterSets = gatherCounterSets(counterSetSlices)
+
+    if len(pool.Slices) == 0 && len(pool.NonTargetingDevices) == 0 {
+        return nil
+    }
+    return pool
+}
+```
+
+### FilterPools Changes (pool.go)
+
+`filterPool()` must preserve `NonTargetingDevices` across narrowing. When requirements tighten:
+- Previously-matching devices that no longer match move to `NonTargetingDevices` (if they have `ConsumesCounters`)
+- Existing `NonTargetingDevices` are always preserved (they never become candidates)
+
+```go
+func filterPool(pool *Pool, requirements scheduling.Requirements) *Pool {
+    p := &Pool{
+        Key:                 pool.Key,
+        Incomplete:          pool.Incomplete,
+        Invalid:             pool.Invalid,
+        CounterSets:         pool.CounterSets,
+        NonTargetingDevices: pool.NonTargetingDevices, // always preserved
+    }
+    for _, s := range pool.Slices {
+        if sliceMatchesRequirements(s, requirements) {
+            // Still matches — remains an allocation candidate
+            p.Slices = append(p.Slices, s)
+            topoReqs := sliceTopologyRequirements(s)
+            for _, d := range s.Devices() {
+                p.Devices = append(p.Devices, DeviceWithID{...})
+            }
+        } else {
+            // No longer matches — demote counter-consuming devices
+            for _, d := range s.Devices() {
+                if len(d.ConsumesCounters) > 0 {
+                    p.NonTargetingDevices = append(p.NonTargetingDevices, DeviceWithID{...})
+                }
+            }
+        }
+    }
+    if len(p.Slices) == 0 && len(p.NonTargetingDevices) == 0 {
+        return nil
+    }
+    return p
+}
+```
 
 ### Pool Completeness
 
@@ -201,15 +323,18 @@ Counter sets may reside in separate ResourceSlices from devices. The pool is onl
 
 This matches existing completeness logic (pools must be fully observed before use). No behavioral change — just reinforcing that the check matters more now.
 
+**SharedCounters slices and `sliceMatchesRequirements`:** Counter-set-only slices have no node affinity fields. They must not be passed through `sliceMatchesRequirements()` (which panics on potential slices and expects node-affinity fields). Pool gathering identifies them by `HasSharedCounters()` and handles them separately.
+
 ### Pool Validation
 
-After gathering, validate the pool before any allocation attempt:
+After gathering, validate the pool before any allocation attempt. Validation covers BOTH `Devices` and `NonTargetingDevices` — a non-targeting device with an invalid counter reference means the pool state is corrupt:
 
 ```go
 func (p *Pool) Validate() error {
     // 1. Counter set names unique (already checked during gathering)
-    // 2. For each device with ConsumesCounters:
-    for _, device := range p.Devices {
+    // 2. For each device with ConsumesCounters (targeting AND non-targeting):
+    allDevices := append(p.Devices, p.NonTargetingDevices...)
+    for _, device := range allDevices {
         for _, consumption := range device.ConsumesCounters {
             // Counter set must exist in pool
             cs, ok := p.CounterSets[consumption.CounterSet]
@@ -236,7 +361,7 @@ If validation fails, the pool is marked invalid and no devices from it are alloc
 
 ### Available Counter Computation
 
-At the start of allocation, compute remaining counter budgets per pool:
+At the start of allocation, compute remaining counter budgets per pool. The allocator iterates ALL devices in the pool (both targeting and non-targeting), checks whether each is allocated, and deducts its counters. This matches upstream's `checkAvailableCounters` pattern:
 
 ```go
 type AvailableCounters struct {
@@ -244,30 +369,50 @@ type AvailableCounters struct {
     counters map[string]map[string]resource.Quantity
 }
 
-func computeAvailableCounters(pool *Pool, allocatedDevices []DeviceID) *AvailableCounters {
+func computeAvailableCounters(pool *Pool, allocatedDevices sets.Set[DeviceID]) *AvailableCounters {
     // Start with full counter set budgets
     available := clone(pool.CounterSets)
     
-    // Deduct counters consumed by already-allocated devices
-    for _, deviceID := range allocatedDevices {
-        device := pool.LookupDevice(deviceID)
-        for _, consumption := range device.ConsumesCounters {
-            for counterName, amount := range consumption.Counters {
-                available[consumption.CounterSet][counterName].Sub(amount)
-            }
+    // Deduct counters consumed by already-allocated devices.
+    // Iterate BOTH targeting and non-targeting devices — an off-node device
+    // that is allocated still depletes shared counters for this pool.
+    for _, device := range pool.Devices {
+        if !allocatedDevices.Has(device.ID) {
+            continue
         }
+        deductCounters(available, device.Device)
+    }
+    for _, device := range pool.NonTargetingDevices {
+        if !allocatedDevices.Has(device.ID) {
+            continue
+        }
+        deductCounters(available, device.Device)
     }
     return &AvailableCounters{counters: available}
 }
+
+func deductCounters(available map[string]map[string]resource.Quantity, device cloudprovider.Device) {
+    for _, consumption := range device.ConsumesCounters {
+        for counterName, amount := range consumption.Counters {
+            remaining := available[consumption.CounterSet][counterName]
+            remaining.Sub(amount)
+            available[consumption.CounterSet][counterName] = remaining
+        }
+    }
+}
 ```
+
+This computation is cached per pool per allocator instance — it runs once when the pool is first accessed during allocation, not on every `tryDevice` call.
 
 ### Preallocated Counter State
 
-The controller provides the allocator with the set of allocated devices per pool (from ResourceClaim status). For counter tracking, we need to know which devices are allocated so their counter consumption can be deducted.
+The controller provides the allocator with the set of allocated devices per pool (from ResourceClaim status). For counter tracking, we need to know which devices are allocated so their counter consumption can be deducted from the pool's counter budgets.
 
-**Key insight:** Counter consumption is deterministic from the device definition — unlike consumable capacity (where the consumed amount depends on the request), SharedCounters are fixed per-device. We only need to know WHICH devices are allocated, not HOW MUCH they consumed. The device's `ConsumesCounters` declaration tells us the rest.
+**Key insight:** Counter consumption is deterministic from the device definition — unlike consumable capacity (where the consumed amount depends on the request), SharedCounters are fixed per-device. We only need to know WHICH devices are allocated, not HOW MUCH they consumed. The device's `ConsumesCounters` declaration (on the pool) tells us the rest.
 
-This means the existing `PreallocatedDevices` set (exclusive devices) and `PreallocatedConsumedCapacity` map (multi-allocatable devices) together provide enough information. If a device appears in either → its counters are deducted.
+The existing `PreallocatedDevices` set (exclusive devices) and `PreallocatedConsumedCapacity` map (multi-allocatable devices) together provide the allocated device set. The allocator uses this to identify allocated devices when iterating the pool's `Devices` and `NonTargetingDevices` during `computeAvailableCounters`.
+
+This is why the pool carries `NonTargetingDevices` — the allocator needs the device definitions to look up `ConsumesCounters` for off-node allocated devices. Without them on the pool, the allocator couldn't resolve what counters an off-node device consumes.
 
 ### Inflight Counter State
 
@@ -468,15 +613,9 @@ For **template devices**, per-device node selection is less relevant — templat
 
 ### Counter Consumption Tracking
 
-The device allocation controller already tracks which devices are allocated per claim. For counter state, the allocator needs to know which devices are allocated in each pool so it can compute counter deductions.
+**No new controller state or API changes are needed.**
 
-**No new controller state is needed.** The existing `allocatedDevices` map (from the controller) provides the set of allocated device IDs. The allocator combines this with pool device definitions (which contain `ConsumesCounters`) to compute counter state at allocation time.
-
-This is the fundamental difference from consumable capacity: counter consumption is a fixed property of the device definition (it's declared on the ResourceSlice), not a variable property of each allocation (like consumed capacity amounts). The allocator only needs to know "is this device allocated?" — not "how much did it consume?" — because the answer to "how much" is always the device's `ConsumesCounters` declaration.
-
-### Public API Change
-
-The `AllocatedDeviceState` struct (from consumable capacity integration) already carries the device sets needed:
+The device allocation controller already tracks which devices are allocated per claim. The existing `AllocatedDeviceState` struct (from consumable capacity integration) provides the allocated device sets:
 
 ```go
 type AllocatedDeviceState struct {
@@ -485,18 +624,11 @@ type AllocatedDeviceState struct {
 }
 ```
 
-Both `ExclusiveDevices` and `keys(ConsumedCapacity)` represent allocated devices. The allocator iterates the union to compute counter deductions:
+The allocator uses these sets to identify which devices are allocated when computing available counters. The counter deduction logic lives in the allocator (via `computeAvailableCounters`), which looks up each allocated device's `ConsumesCounters` from the pool's device definitions (`Devices` + `NonTargetingDevices`).
 
-```go
-for deviceID := range allocatedState.ExclusiveDevices {
-    deductCounters(deviceID, pool)
-}
-for deviceID := range allocatedState.ConsumedCapacity {
-    deductCounters(deviceID, pool)
-}
-```
+This is the fundamental difference from consumable capacity: counter consumption is a fixed property of the device definition (declared on the ResourceSlice), not a variable property of each allocation. The controller doesn't need to interpret `ConsumesCounters` semantics — it just provides the "which devices are allocated" signal. The pool provides the "what do they consume" definitions. The allocator joins the two.
 
-No change to the controller's public API is required. The information already flows through.
+This matches upstream, where `checkAvailableCounters` iterates pool device slices and checks `allocatedState.AllocatedDevices.Has(deviceID)` — the pool carries the definitions, the allocated state carries the IDs.
 
 ---
 
@@ -510,37 +642,45 @@ No change to the controller's public API is required. The information already fl
 
 **Alternative considered:** Tracking counter consumption as a field on allocation results (like `ConsumedCapacity`). Rejected because it's redundant with the device definition and adds unnecessary API surface.
 
-### 2. Pool validation is fail-fast for the entire pool
+### 2. Pool carries non-targeting devices for counter deduction (matching upstream)
+
+**Decision:** The pool stores off-node devices with `ConsumesCounters` in a separate `NonTargetingDevices` field. The allocator iterates these alongside targeting devices to compute available counters. No controller pre-computation of counter consumption.
+
+**Rationale:** This matches upstream's `DeviceSlicesNotTargetingNode` approach. The performance cost of iterating non-targeting devices is negligible in practice because the primary use case (MIG) is node-local — all MIG partitions sharing a counter set are on the same node, so `NonTargetingDevices` is typically empty. The cross-node case (multi-host TPU) is rare and has small device counts per pool. Matching upstream provides 1:1 correctness validation, keeps the controller simple (no `ConsumesCounters` interpretation), and avoids premature optimization. See `partitionable-devices-notes.md` for the full analysis of both options.
+
+**Alternative considered:** Controller pre-computes aggregate counter consumption per pool (`PreallocatedCounterConsumption`), eliminating the need for non-targeting devices on the pool. Rejected because the performance benefit is marginal for real workloads, it diverges from upstream, and it adds semantic responsibility to the controller that doesn't belong there.
+
+### 3. Pool validation is fail-fast for the entire pool
 
 **Decision:** If any device in a pool references a non-existent counter set or counter, the entire pool is marked invalid.
 
 **Rationale:** Partial validation is unsound — a device referencing a missing counter set might be the one preventing other devices from being allocated (via shared counter depletion). Silently ignoring the invalid device could allow over-allocation. The upstream allocator uses the same strategy.
 
-### 3. Counter sets are gathered at pool assembly time, not lazily
+### 4. Counter sets are gathered at pool assembly time, not lazily
 
 **Decision:** Counter sets are resolved when pools are gathered (during scheduler initialization / pool refresh). Invalid references are caught early.
 
 **Rationale:** Lazy resolution during `tryDevice` would require error handling in the hot path and would repeat the resolution for every candidate device. Early resolution amortizes the cost and surfaces errors before allocation begins.
 
-### 4. Template pools can have counter sets
+### 5. Template pools can have counter sets
 
 **Decision:** Cloud providers can declare counter sets on template pools (via `ResourceSliceTemplate.CounterSets`). Template devices can declare `ConsumesCounters`.
 
 **Rationale:** This enables GPU cloud providers to express MIG-style partitioning on template devices. Without it, Karpenter cannot simulate MIG allocation for instance types not yet provisioned — a critical gap for the primary KEP-4815 use case (dynamic GPU partitioning).
 
-### 5. Counter check placement: after IsAllocated, before CEL
+### 6. Counter check placement: after IsAllocated, before CEL
 
 **Decision:** Counter verification runs after the binary `IsAllocated` check and capacity check, but before CEL selector evaluation.
 
 **Rationale:** Counter checks are cheaper than CEL compilation/evaluation (simple quantity comparison vs. expression evaluation). Running them first prunes ineligible devices before the expensive selector step. The IsAllocated check is the cheapest filter and stays first.
 
-### 6. PerDeviceNodeSelection resolves per-device, not per-slice
+### 7. PerDeviceNodeSelection resolves per-device, not per-slice
 
 **Decision:** When `PerDeviceNodeSelection: true`, topology requirements are resolved per-device during `tryDevice`, not pre-computed per-slice during pool gathering.
 
 **Rationale:** Pre-computation would require storing per-device topology on the pool structure, complicating pool assembly. Since topology is only evaluated for devices that pass all other checks (IsAllocated, capacity, counters, CEL), the per-device resolution runs infrequently. The marginal cost is negligible.
 
-### 7. Three-layer counter tracking mirrors capacity tracking
+### 8. Three-layer counter tracking mirrors capacity tracking
 
 **Decision:** Counter state uses the same three-layer pattern as consumable capacity: preallocated (cluster state) + inflight (earlier pods) + allocating (current DFS).
 
@@ -552,12 +692,16 @@ No change to the controller's public API is required. The information already fl
 
 ### Commit 1: Device Model & Pool Changes
 
-Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `CounterSet` type, updates pool gathering and validation.
+Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `CounterSet` type, updates pool gathering/filtering to handle counter-set slices and non-targeting devices, and adds pool validation.
 
 - [cloudprovider.Device Extension](#cloudproviderdevice-extension)
 - [cloudprovider.CounterSet Type](#cloudprovidercounterset-type)
 - [API Server Slice Conversion](#api-server-slice-conversion)
+- [Pool Struct Extension](#pool-struct-extension)
 - [Counter Set Gathering](#counter-set-gathering)
+- [Pool Gathering Changes (pool.go)](#pool-gathering-changes-poolgo)
+- [FilterPools Changes (pool.go)](#filterpools-changes-poolgo)
+- [Pool Completeness](#pool-completeness)
 - [Pool Validation](#pool-validation)
 
 ### Commit 2: Counter State & Verification Logic
