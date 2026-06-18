@@ -138,6 +138,72 @@ The "allocate" case is interesting: Karpenter might allocate a multi-host device
 
 ---
 
+## Design Decision: Off-Node Counter Deduction Strategy
+
+### Problem
+
+SharedCounters are pool-level — allocating a device on node-A depletes counters that affect allocatability on node-B (same pool). When computing available counters, the allocator must account for ALL allocated devices in the pool, including those on nodes that don't match the current NodeClaim's requirements.
+
+Karpenter's `Pool.Devices` currently only contains devices from **matching** slices. If an off-node device is allocated and consuming counters, the allocator can't look up its `ConsumesCounters` to deduct from the budget.
+
+Upstream (concrete-node scheduler) solves this by storing `DeviceSlicesNotTargetingNode` on the pool — keeping off-node device definitions available for counter deduction at allocation time.
+
+Karpenter must choose where this resolution happens.
+
+### Option 1: Pool carries non-matching device definitions
+
+Pool gathering stores off-node devices on the pool (not as allocation candidates, but as definitions for counter lookup). The allocator iterates all pool devices, checks which are allocated, and deducts their `ConsumesCounters`.
+
+**Pros:**
+- Mirrors upstream 1:1 — easy to cross-reference and validate correctness
+- Pool is the single source of truth for ALL device definitions in the pool
+- Allocator is self-contained: pool + allocated device IDs = everything it needs
+- Controller stays simple — just reports device IDs, doesn't interpret `ConsumesCounters` semantics
+- If device definitions change (ResourceSlice update), pool rebuild picks it up automatically
+
+**Cons:**
+- Breaks the current clean model: "pool = devices you can allocate from"
+- Memory: Pool grows with all devices in the pool regardless of allocatability. For a 100-node × 8-GPU pool = 800 device definitions (~500B–2KB each) carried per pool view, multiplied by N NodeClaims evaluated in a scheduling loop.
+- CPU in scheduling hot path: O(all devices in pool) per pool to find allocated ones and deduct counters (set lookup per device). Upstream caches this per allocator instance, but Karpenter evaluates many pods × many ITs per loop.
+- `FilterPools()` must preserve non-matching devices across narrowing operations
+- `pool.go` grows more complex — non-matching devices need a separate field and different handling during filtering
+
+### Option 2: Controller pre-computes counter deductions
+
+The controller resolves `ConsumesCounters` for each allocated device and passes aggregate counter consumption per pool to the allocator.
+
+```go
+// PreallocatedCounterConsumption: poolID → counterSetName → counterName → total consumed
+PreallocatedCounterConsumption map[PoolID]map[string]map[string]resource.Quantity
+```
+
+**Pros:**
+- Pool stays lean — only allocatable devices, clean separation preserved
+- Memory: A few hundred bytes per pool (pre-summed quantities), shared across all NodeClaims. No duplication.
+- CPU in scheduling path: O(1) per counter check — `remaining = total - preallocated - inflight - allocating`. No device iteration or set lookups during allocation.
+- Architecturally consistent with CC: `PreallocatedConsumedCapacity` is pre-computed by the controller (variable per-allocation, MUST be pre-computed). `PreallocatedCounterConsumption` (fixed per-device, CAN be pre-computed) follows the same data flow.
+- Controller work is O(allocated devices in pool), triggered by claim status changes (infrequent relative to scheduling decisions)
+
+**Cons:**
+- Controller must understand `ConsumesCounters` semantics (it currently interprets claim allocation results, not device definitions)
+- Different from upstream — harder to validate by cross-referencing upstream code
+- Controller must join claim status (allocated device IDs) with ResourceSlice data (device definitions) to resolve `ConsumesCounters`
+- If a device's `ConsumesCounters` changes (ResourceSlice update mid-lifecycle), controller must recompute
+- Creates semantic asymmetry: CC pre-computation is necessary (consumed amounts are variable), counter pre-computation is a performance choice (amounts are fixed per device definition)
+- Less transparent for debugging: "why is this counter consumed?" requires tracing through controller logic rather than looking at pool + allocated set directly
+
+### Analysis: Why they differ from upstream
+
+Upstream can afford Option 1 because it schedules **one pod on one concrete node** at a time — the O(devices) iteration runs once. Karpenter evaluates **N pods × M instance types** in a single scheduling loop, multiplying the cost.
+
+The key asymmetry with CC that makes Option 2 viable: counter consumption is **deterministic from the device definition**. Knowing "device X is allocated" + reading `device.ConsumesCounters` = full picture. No per-allocation metadata needed. The controller doesn't add information — it pre-computes what the allocator could derive, but moves that work off the hot path.
+
+### Recommendation: Option 2
+
+Performance wins are decisive for Karpenter's scheduling model. The architectural consistency with CC's controller-to-allocator data flow makes the pattern familiar. The upstream divergence is acceptable — Karpenter already diverges fundamentally (superposition vs. concrete node), and the correctness is straightforward to test (same deduction logic, different execution timing).
+
+---
+
 ## Follow-Up Work
 
 1. **Scoring/ordering for counter-efficient allocation** — minimize counter waste when multiple partitions could satisfy a request (blocked on upstream KEP-4970)
