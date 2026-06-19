@@ -122,9 +122,9 @@ func FilterPools(pools []*Pool, requirements scheduling.Requirements) []*Pool {
 	return filtered
 }
 
-// TODO: update comment
 // filterPool returns a copy of the pool containing only slices (and their devices) that match
-// the requirements. Returns nil if no slices match.
+// the requirements. Devices with ConsumesCounters on non-matching slices are moved to
+// NonTargetingDevices. Returns nil if no slices match and no NonTargetingDevices exist.
 func filterPool(pool *Pool, requirements scheduling.Requirements) *Pool {
 	p := &Pool{
 		Key:                 pool.Key,
@@ -300,7 +300,6 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
 	pool.Invalid = pool.Invalid || !validateDeviceCounterConsumption(counterSets, pool.Slices)
 	pool.Invalid = pool.Invalid || !validateDeviceCounterConsumption(counterSets, nonTargetingDeviceSlices)
 
-	// No matching slices and no non-targeting devices — pool is invisible to this node.
 	if len(pool.Slices) == 0 && len(pool.NonTargetingDevices) == 0 {
 		return nil
 	}
