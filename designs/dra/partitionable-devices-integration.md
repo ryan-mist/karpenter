@@ -6,7 +6,6 @@
 - [Scope](#scope)
 - [Device Model Changes](#device-model-changes)
   - [cloudprovider.Device Extension](#cloudproviderdevice-extension)
-  - [cloudprovider.CounterSet Type](#cloudprovidercounterset-type)
   - [API Server Slice Conversion](#api-server-slice-conversion)
   - [Template Device Support](#template-device-support)
 - [Pool Management Changes](#pool-management-changes)
@@ -93,7 +92,7 @@ Integrating partitionable devices into Karpenter's allocator presents challenges
 
 ### cloudprovider.Device Extension
 
-The `cloudprovider.Device` struct is extended with counter consumption declarations:
+The `cloudprovider.Device` struct is extended with counter consumption declarations using the upstream Kubernetes API types directly:
 
 ```go
 type Device struct {
@@ -101,60 +100,20 @@ type Device struct {
     Attributes               map[resourcev1.QualifiedName]resourcev1.DeviceAttribute
     Capacity                 map[resourcev1.QualifiedName]resourcev1.DeviceCapacity
     AllowMultipleAllocations bool
-    ConsumesCounters         []DeviceCounterConsumption  // NEW
-}
-
-type DeviceCounterConsumption struct {
-    CounterSet string                          // references CounterSet.Name in same pool
-    Counters   map[string]resource.Quantity    // counter values consumed on allocation
+    ConsumesCounters         []resourcev1.DeviceCounterConsumption  // NEW
 }
 ```
 
 For devices with no counter consumption (majority today), `ConsumesCounters` is nil — no behavioral change.
 
-### cloudprovider.CounterSet Type
-
-Counter sets are a pool-level concept, not per-device:
-
-```go
-type CounterSet struct {
-    Name     string
-    Counters map[string]resource.Quantity  // counterName → total available
-}
-```
-
 ### API Server Slice Conversion
 
-The `apiServerSlice` conversion (in `types.go`) is extended to:
+The `apiServerSlice` conversion (in `types.go`) stores the upstream types directly — no unwrapping into intermediate types:
 
-1. **Parse `SharedCounters`** from slices that declare them (slices with `SharedCounters` and no `Devices`)
-2. **Parse `ConsumesCounters`** on each device
+1. **`SharedCounters`**: stored as `[]resourcev1.CounterSet` on the slice (via `SharedCounters()` accessor)
+2. **`ConsumesCounters`**: stored as `[]resourcev1.DeviceCounterConsumption` on each device
 
-```go
-// For slices with SharedCounters (no Devices):
-for _, cs := range slice.Spec.SharedCounters {
-    counters := make(map[string]resource.Quantity, len(cs.Counters))
-    for name, counter := range cs.Counters {
-        counters[name] = counter.Value
-    }
-    s.counterSets = append(s.counterSets, cloudprovider.CounterSet{
-        Name:     cs.Name,
-        Counters: counters,
-    })
-}
-
-// For devices with ConsumesCounters:
-for _, consumption := range d.ConsumesCounters {
-    counters := make(map[string]resource.Quantity, len(consumption.Counters))
-    for name, counter := range consumption.Counters {
-        counters[name] = counter.Value
-    }
-    device.ConsumesCounters = append(device.ConsumesCounters, cloudprovider.DeviceCounterConsumption{
-        CounterSet: consumption.CounterSet,
-        Counters:   counters,
-    })
-}
-```
+No conversion loops are needed — the API types are used as-is throughout the pool layer.
 
 ### Template Device Support
 
@@ -165,7 +124,7 @@ Cloud providers can declare `ConsumesCounters` on template devices. This enables
 ```go
 type ResourceSliceTemplate struct {
     // ... existing fields ...
-    CounterSets []cloudprovider.CounterSet  // NEW — counter sets for template pool
+    SharedCounters []resourcev1.CounterSet  // NEW — counter sets for template pool
 }
 ```
 
@@ -188,8 +147,8 @@ type Pool struct {
     Invalid bool
 
     // CounterSets holds the counter set definitions for this pool.
-    // counterSetName → counterName → total available quantity.
-    CounterSets map[string]map[string]resource.Quantity
+    // counterSetName → counterName → Counter (with .Value as resource.Quantity).
+    CounterSets map[string]map[string]resourcev1.Counter
 
     // NonTargetingDevices holds devices from slices that don't match the current
     // NodeClaim's requirements but have ConsumesCounters. These are NOT allocation
@@ -218,10 +177,10 @@ func sliceMatchesRequirements(s ResourceSlice, requirements scheduling.Requireme
     if s.Potential() {
         panic("potential slices must not be passed to pool gathering or filtering")
     }
-    if len(s.SharedCounters()) > 0 {
+    if s.AllNodes() {
         return true
     }
-    if s.AllNodes() {
+    if s.SharedCounters() != nil {
         return true
     }
     if ns := s.NodeSelector(); ns != nil {
@@ -240,19 +199,19 @@ Add `SharedCounters()` to the `ResourceSlice` interface:
 ```go
 type ResourceSlice interface {
     // ... existing methods ...
-    SharedCounters() []cloudprovider.CounterSet
+    SharedCounters() []resourcev1.CounterSet
 }
 ```
 
 Implementations:
-- `apiServerSlice`: parses `slice.Spec.SharedCounters` (lazily, like `Devices()`)
-- `templateSlice`: returns `template.CounterSets`
+- `apiServerSlice`: returns `slice.Spec.SharedCounters` directly (no conversion needed)
+- `templateSlice`: returns `template.SharedCounters`
 
 ### Pool Gathering Changes (pool.go)
 
 `GatherPools` is unchanged — `sliceMatchesRequirements` handles counter-set slices.
 
-The `build()` function branches on `SharedCounters()` when processing entries:
+The `build()` function branches on `SharedCounters()` when processing entries. Counter-set slices are accumulated separately and validated via helper functions after the main loop:
 
 ```go
 func (b *poolBuilder) build(key PoolKey) *Pool {
@@ -262,20 +221,12 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
         pool.Incomplete = true
     }
 
+    var counterSetSlices []ResourceSlice
+    var nonTargetingDeviceSlices []ResourceSlice
     seen := sets.New[unique.Handle[string]]()
     for _, e := range b.entries {
-        if len(e.slice.SharedCounters()) > 0 {
-            // Counter-set slice — gather counter sets
-            for _, cs := range e.slice.SharedCounters() {
-                if pool.CounterSets == nil {
-                    pool.CounterSets = make(map[string]map[string]resource.Quantity)
-                }
-                counters := make(map[string]resource.Quantity, len(cs.Counters))
-                for name, qty := range cs.Counters {
-                    counters[name] = qty
-                }
-                pool.CounterSets[cs.Name] = counters
-            }
+        if e.slice.SharedCounters() != nil {
+            counterSetSlices = append(counterSetSlices, e.slice)
             continue
         }
         if e.matched {
@@ -283,33 +234,29 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
             pool.Slices = append(pool.Slices, e.slice)
             topoReqs := sliceTopologyRequirements(e.slice)
             for _, d := range e.slice.Devices() {
-                if seen.Has(d.Name) {
-                    pool.Invalid = true
-                }
+                pool.Invalid = pool.Invalid || seen.Has(d.Name)
                 seen.Insert(d.Name)
-                pool.Devices = append(pool.Devices, DeviceWithID{
-                    Device: d,
-                    ID:     DeviceID{...},
-                    TopologyRequirements: topoReqs,
-                })
+                pool.Devices = append(pool.Devices, newDeviceWithID(key, d, topoReqs))
             }
         } else {
+            nonTargetingDeviceSlices = append(nonTargetingDeviceSlices, e.slice)
             // Non-matching device slice — retain devices with ConsumesCounters
-            // for counter deduction (not allocation candidates)
+            // for counter deduction (not allocation candidates).
+            // No duplicate name detection — matches upstream behavior where only
+            // targeting devices are validated for name uniqueness.
             for _, d := range e.slice.Devices() {
-                if seen.Has(d.Name) {
-                    pool.Invalid = true
-                }
-                seen.Insert(d.Name)
                 if len(d.ConsumesCounters) > 0 {
-                    pool.NonTargetingDevices = append(pool.NonTargetingDevices, DeviceWithID{
-                        Device: d,
-                        ID:     DeviceID{...},
-                    })
+                    pool.NonTargetingDevices = append(pool.NonTargetingDevices, newDeviceWithID(key, d, nil))
                 }
             }
         }
     }
+
+    counterSets, valid := getAndValidateCounterSets(counterSetSlices)
+    pool.CounterSets = counterSets
+    pool.Invalid = pool.Invalid || !valid
+    pool.Invalid = pool.Invalid || !validateDeviceCounterConsumption(counterSets, pool.Slices)
+    pool.Invalid = pool.Invalid || !validateDeviceCounterConsumption(counterSets, nonTargetingDeviceSlices)
 
     if len(pool.Slices) == 0 && len(pool.NonTargetingDevices) == 0 {
         return nil
@@ -368,33 +315,44 @@ This matches existing completeness logic (pools must be fully observed before us
 
 ### Pool Validation
 
-After gathering, validate the pool before any allocation attempt. Validation covers BOTH `Devices` and `NonTargetingDevices` — a non-targeting device with an invalid counter reference means the pool state is corrupt:
+Validation is inlined in `build()` (not a separate method). It covers BOTH targeting and non-targeting device slices — a non-targeting device with an invalid counter reference means the pool state is corrupt:
 
 ```go
-func (p *Pool) Validate() error {
-    // 1. Counter set names unique (already checked during gathering)
-    // 2. For each device with ConsumesCounters (targeting AND non-targeting):
-    allDevices := append(p.Devices, p.NonTargetingDevices...)
-    for _, device := range allDevices {
-        for _, consumption := range device.ConsumesCounters {
-            // Counter set must exist in pool
-            cs, ok := p.CounterSets[consumption.CounterSet]
-            if !ok {
-                return fmt.Errorf("device %q references unknown counter set %q", ...)
+func getAndValidateCounterSets(slices []ResourceSlice) (map[string]map[string]resourcev1.Counter, bool) {
+    counterSets := make(map[string]map[string]resourcev1.Counter)
+    valid := true
+    for _, slice := range slices {
+        for _, counterSet := range slice.SharedCounters() {
+            if _, found := counterSets[counterSet.Name]; found {
+                valid = false  // duplicate counter set name
             }
-            // Each referenced counter must exist in the counter set
-            for counterName := range consumption.Counters {
-                if _, ok := cs[counterName]; !ok {
-                    return fmt.Errorf("device %q references unknown counter %q in set %q", ...)
+            counterSets[counterSet.Name] = counterSet.Counters
+        }
+    }
+    return counterSets, valid
+}
+
+func validateDeviceCounterConsumption(counterSets map[string]map[string]resourcev1.Counter, slices []ResourceSlice) bool {
+    for _, slice := range slices {
+        for _, device := range slice.Devices() {
+            for _, consumption := range device.ConsumesCounters {
+                counterSet, found := counterSets[consumption.CounterSet]
+                if !found {
+                    return false  // references unknown counter set
+                }
+                for counterName := range consumption.Counters {
+                    if _, found := counterSet[counterName]; !found {
+                        return false  // references unknown counter within set
+                    }
                 }
             }
         }
     }
-    return nil
+    return true
 }
 ```
 
-If validation fails, the pool is marked invalid and no devices from it are allocatable. This matches upstream behavior.
+If validation fails, the pool is marked `Invalid = true` and no devices from it are allocatable. This matches upstream behavior.
 
 ---
 
@@ -402,7 +360,7 @@ If validation fails, the pool is marked invalid and no devices from it are alloc
 
 ### Available Counter Computation
 
-At the start of allocation, compute remaining counter budgets per pool. The allocator iterates ALL devices in the pool (both targeting and non-targeting), checks whether each is allocated, and deducts its counters. This matches upstream's `checkAvailableCounters` pattern:
+At the start of allocation, compute remaining counter budgets per pool. The allocator extracts `resource.Quantity` values from `Pool.CounterSets` (which stores `resourcev1.Counter`) for arithmetic, then iterates ALL devices in the pool (both targeting and non-targeting), checks whether each is allocated, and deducts its counters. This matches upstream's `checkAvailableCounters` pattern:
 
 ```go
 type AvailableCounters struct {
@@ -731,12 +689,11 @@ This matches upstream, where `checkAvailableCounters` iterates pool device slice
 
 ## Implementation Sequencing
 
-### Commit 1: Device Model & Pool Changes
+### Commit 1: Device Model & Pool Changes ✓
 
-Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `CounterSet` type, adds `SharedCounters()` to `ResourceSlice` interface, updates `sliceMatchesRequirements` + pool gathering/filtering to handle counter-set slices and non-targeting devices, and adds pool validation.
+Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `SharedCounters()` to `ResourceSlice` interface, updates `sliceMatchesRequirements` + pool gathering/filtering to handle counter-set slices and non-targeting devices, and adds pool validation.
 
 - [cloudprovider.Device Extension](#cloudproviderdevice-extension)
-- [cloudprovider.CounterSet Type](#cloudprovidercounterset-type)
 - [API Server Slice Conversion](#api-server-slice-conversion)
 - [Pool Struct Extension](#pool-struct-extension)
 - [ResourceSlice Interface Addition](#resourceslice-interface-addition)
@@ -775,7 +732,7 @@ Topology handling for multi-host devices.
 ### Dependency Graph
 
 ```
-Commit 1: Device Model & Pool Changes
+Commit 1: Device Model & Pool Changes ✓
   │
   ├──→ Commit 2: Counter State & Verification Logic
   │       │
