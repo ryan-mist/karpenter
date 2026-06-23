@@ -23,6 +23,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -35,8 +36,12 @@ type (
 	InstanceTypeID  = unique.Handle[string]
 	NodeClaimID     = unique.Handle[string]
 	NodePoolID      = unique.Handle[string]
-	ResourceClaimID = unique.Handle[string]
+	ResourceClaimID = unique.Handle[types.NamespacedName]
 )
+
+func resourceClaimID(claim *resourcev1.ResourceClaim) ResourceClaimID {
+	return unique.Make(types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name})
+}
 
 // DeviceID wraps cloudprovider.DeviceID with scheduling-specific metadata.
 // Template indicates whether the device comes from a cloud provider template
@@ -132,7 +137,6 @@ func (s *apiServerSlice) Pool() cloudprovider.ResourcePool {
 
 func (s *apiServerSlice) Devices() []cloudprovider.Device {
 	if s.devices == nil {
-		perDevice := s.PerDeviceNodeSelection()
 		s.devices = make([]cloudprovider.Device, len(s.slice.Spec.Devices))
 		for i, d := range s.slice.Spec.Devices {
 			attrs := make(map[resourcev1.QualifiedName]resourcev1.DeviceAttribute, len(d.Attributes))
@@ -150,7 +154,7 @@ func (s *apiServerSlice) Devices() []cloudprovider.Device {
 				AllowMultipleAllocations: lo.FromPtr(d.AllowMultipleAllocations),
 				ConsumesCounters:         d.ConsumesCounters,
 			}
-			if perDevice {
+			if s.PerDeviceNodeSelection() {
 				s.devices[i].NodeName = d.NodeName
 				s.devices[i].NodeSelector = d.NodeSelector
 				s.devices[i].AllNodes = d.AllNodes

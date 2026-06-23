@@ -17,8 +17,8 @@ limitations under the License.
 package cloudprovider
 
 import (
+	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
-	"k8s.io/utils/ptr"
 )
 
 func (in *DynamicResources) DeepCopyInto(out *DynamicResources) {
@@ -81,6 +81,7 @@ func (in *ResourceSliceTemplate) DeepCopy() *ResourceSliceTemplate {
 	return out
 }
 
+// nolint:gocyclo
 func (in *Device) DeepCopyInto(out *Device) {
 	*out = *in
 	if in.Attributes != nil {
@@ -108,13 +109,13 @@ func (in *Device) DeepCopyInto(out *Device) {
 		}
 	}
 	if in.NodeName != nil {
-		out.NodeName = ptr.To(*in.NodeName)
+		out.NodeName = lo.ToPtr(*in.NodeName)
 	}
 	if in.NodeSelector != nil {
 		out.NodeSelector = in.NodeSelector.DeepCopy()
 	}
 	if in.AllNodes != nil {
-		out.AllNodes = ptr.To(*in.AllNodes)
+		out.AllNodes = lo.ToPtr(*in.AllNodes)
 	}
 }
 

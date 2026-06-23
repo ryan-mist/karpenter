@@ -26,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	dracel "k8s.io/dynamic-resource-allocation/cel"
 	"k8s.io/klog/v2"
@@ -62,8 +63,8 @@ type Allocator struct {
 // ResourceClaimAllocationMetadataForClaim returns a copy of the allocator's internal ResourceClaim allocation metadata.
 // A nil result will be returned if the claim hasn't been allocated by the allocator, i.e. both unallocated claims and
 // claims allocated in-cluster will return nil.
-func (a *Allocator) ResourceClaimAllocationMetadataForClaim(claimName string) *ResourceClaimAllocationMetadata {
-	meta, ok := a.claimAllocationMetadata[unique.Make(claimName)]
+func (a *Allocator) ResourceClaimAllocationMetadataForClaim(key types.NamespacedName) *ResourceClaimAllocationMetadata {
+	meta, ok := a.claimAllocationMetadata[unique.Make(key)]
 	if !ok {
 		return nil
 	}
@@ -138,12 +139,12 @@ type AllocatedDeviceState struct {
 // these are converted internally to the scheduling DeviceID type.
 func NewAllocator(
 	inClusterSlices []ResourceSlice,
-	allocatedDevices AllocatedDeviceState,
+	allocatedDevices sets.Set[cloudprovider.DeviceID],
 	attributeBindings AttributeBindings,
 	kubeClient client.Client,
 ) *Allocator {
 	return &Allocator{
-		allocationTracker:       NewAllocationTracker(allocatedDevices.ExclusiveDevices.UnsortedList()...), // TODO: at later step
+		allocationTracker:       NewAllocationTracker(allocatedDevices.UnsortedList()...),
 		attributeBindings:       attributeBindings,
 		kubeClient:              kubeClient,
 		inClusterSlices:         inClusterSlices,
@@ -198,7 +199,7 @@ func (a *allocation) Commit(ctx context.Context) {
 			"allocated devices",
 			"nodeClaimID", a.nodeClaimID.Value(),
 			"devicesByResourceClaim", lo.MapEntries(a.claimMetadata, func(claimID ResourceClaimID, meta *ResourceClaimAllocationMetadata) (string, map[string][]string) {
-				return claimID.Value(), lo.MapEntries(meta.Devices, func(it InstanceTypeID, ids []DeviceID) (string, []string) {
+				return claimID.Value().String(), lo.MapEntries(meta.Devices, func(it InstanceTypeID, ids []DeviceID) (string, []string) {
 					return it.Value(), lo.Map(ids, func(id DeviceID, _ int) string { return id.String() })
 				})
 			}),
@@ -387,7 +388,7 @@ func (a *Allocator) ClassifyClaims(nodeClaim NodeClaim, claims []*resourcev1.Res
 		}
 
 		// In-memory allocated: a prior pod already allocated this claim in this loop.
-		if meta, ok := a.claimAllocationMetadata[unique.Make(claim.Name)]; ok {
+		if meta, ok := a.claimAllocationMetadata[resourceClaimID(claim)]; ok {
 			// Template-allocated claims are node-local to the original NodeClaim.
 			if meta.UsedTemplateDevices {
 				if meta.NodeClaimID != nodeClaim.ID() {
@@ -455,7 +456,8 @@ type allocator struct {
 	requirements scheduling.Requirements
 	// pools represents the set of pools that we're currently evaluating. This can be constrained and relaxed as we
 	// traverse the decision tree based on allocated device topology requirements.
-	pools []*Pool
+	pools      []*Pool
+	poolsByKey map[PoolKey]*Pool
 	// TODO(jmdeal@): Evaluate using the call stack as the stack rather than an explicit stack, I can't recall why I didn't
 	snapshots []backtrackSnapshot
 }
@@ -524,10 +526,19 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 			NodePool:       a.nodeClaim.NodePoolID().Value(),
 			InstanceTypeID: itID,
 		})
+
+		// Pre-DFS feasibility: skip this IT if counter budgets can't possibly satisfy demand.
+		if !a.countersFeasible() {
+			continue
+		}
+
 		if a.dfs(0, 0, 0) {
 			survivingITs = append(survivingITs, itID)
-			counterConsumptionByIT[itID] = copyCounterMap(a.allocatingCounters)
-			templateCounterConsumptionByIT[itID] = copyCounterMap(a.templateAllocatingCounters)
+			counterConsumptionByIT[itID] = a.allocatingCounters
+			templateCounterConsumptionByIT[itID] = a.templateAllocatingCounters
+			// Definsive nils to prevents future regressions where allocatingCounters / templateAllocatingCounters is re-used
+			a.allocatingCounters = nil
+			a.templateAllocatingCounters = nil
 
 			deviceIDsByIT[itID] = make([]DeviceID, len(a.allocatedDevicesMetadata))
 			itReqs := scheduling.NewRequirements()
@@ -644,7 +655,14 @@ func (a *allocator) numSlots(rd *RequestData) int {
 func (a *allocator) dfsExactCount(claimIdx, reqIdx, slotIdx int, cd *ClaimData, rd *RequestData) bool {
 	// In-cluster devices from pools (reflects current pool state after any requirement tightening).
 	for _, pool := range a.pools {
+		if pool.Incomplete {
+			continue
+		}
+		exhausted := a.poolCountersExhausted(pool)
 		for _, d := range pool.Devices {
+			if exhausted && len(d.ConsumesCounters) > 0 {
+				continue
+			}
 			if a.tryDevice(claimIdx, reqIdx, slotIdx, cd, rd, d) {
 				return true
 			}
@@ -706,7 +724,7 @@ func (a *allocator) tryDevice(
 				remainingCounterSets = a.templateRemainingCounters[poolKey]
 			}
 		} else {
-			pool, _ := lo.Find(a.pools, func(p *Pool) bool { return p.Key == poolKey })
+			pool := a.poolsByKey[poolKey]
 			if pool == nil {
 				return false
 			}
@@ -761,6 +779,7 @@ func (a *allocator) tryDevice(
 		})
 		a.requirements.Add(dw.TopologyRequirements.Values()...)
 		a.pools = FilterPools(a.pools, a.requirements)
+		a.buildPoolIndex()
 		pushedSnapshot = true
 	}
 
@@ -788,6 +807,7 @@ func (a *allocator) tryDevice(
 		a.snapshots = a.snapshots[:len(a.snapshots)-1]
 		a.requirements = snapshot.reqs
 		a.pools = snapshot.pools
+		a.buildPoolIndex()
 	}
 
 	for j := constraintsAdded - 1; j >= 0; j-- {
@@ -801,6 +821,7 @@ func (a *allocator) tryDevice(
 func (a *allocator) restoreState(pools []*Pool) {
 	a.allocatedDevicesMetadata = nil
 	a.pools = pools
+	a.buildPoolIndex()
 	a.allocatedDevices = sets.New[DeviceID]()
 	a.allocatingCounters = make(map[PoolKey]map[string]map[string]resourcev1.Counter)
 	a.templateAllocatingCounters = make(map[PoolKey]map[string]map[string]resourcev1.Counter)
@@ -813,6 +834,13 @@ func (a *allocator) restoreState(pools []*Pool) {
 	}
 	// NOTE: Requirements are not reset since instance type requirements are accumulated to ensure the result is
 	// representable by a NodeClaim.
+}
+
+func (a *allocator) buildPoolIndex() {
+	a.poolsByKey = make(map[PoolKey]*Pool, len(a.pools))
+	for _, p := range a.pools {
+		a.poolsByKey[p.Key] = p
+	}
 }
 
 // buildTemplateCounters returns the remaining counter budgets for the current IT's template pool.
@@ -865,6 +893,39 @@ func computeTemplateTotals(slices []ResourceSlice) map[PoolKey]map[string]map[st
 	return totalsByPool
 }
 
+// poolCountersExhausted returns true if any counter in the pool has been fully consumed
+// by DFS-local tentative allocations, meaning no additional counter-consuming device from
+// this pool can succeed.
+func (a *allocator) poolCountersExhausted(pool *Pool) bool {
+	if len(pool.CounterSets) == 0 {
+		return false
+	}
+	remaining := a.allocationTracker.RemainingCounters[pool.Key]
+	if remaining == nil {
+		return false
+	}
+	allocating := a.allocatingCounters[pool.Key]
+	if allocating == nil {
+		return false
+	}
+	for counterSetName, counterSet := range allocating {
+		counterSetRemaining, ok := remaining[counterSetName]
+		if !ok {
+			continue
+		}
+		for counterName, allocCounter := range counterSet {
+			remCounter, ok := counterSetRemaining[counterName]
+			if !ok {
+				continue
+			}
+			if remCounter.Value.Value()-allocCounter.Value.Value() <= 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // checkCounters verifies that shared counters have sufficient remaining budget for the device.
 // remainingCounterSets is the base budget (from AllocationTracker for in-cluster pools, or
 // templateRemainingCounters for template pools). The DFS-local allocatingCounters are subtracted
@@ -891,13 +952,13 @@ func (a *allocator) checkCounters(device cloudprovider.Device, poolKey PoolKey, 
 			if !ok {
 				return false
 			}
-			available := remainingCounter.Value.DeepCopy()
+			allocatingVal := int64(0)
 			if allocatingCounters != nil {
-				if allocatingCounter, ok := allocatingCounters[counterName]; ok {
-					available.Sub(allocatingCounter.Value)
+				if ac, ok := allocatingCounters[counterName]; ok {
+					allocatingVal = ac.Value.Value()
 				}
 			}
-			if available.Cmp(counter.Value) < 0 {
+			if remainingCounter.Value.Value()-allocatingVal < counter.Value.Value() {
 				return false
 			}
 		}
@@ -956,21 +1017,94 @@ func (a *allocator) restoreAllocatingCounters(device cloudprovider.Device, poolK
 	}
 }
 
-func copyCounterMap(src map[PoolKey]map[string]map[string]resourcev1.Counter) map[PoolKey]map[string]map[string]resourcev1.Counter {
-	if len(src) == 0 {
-		return nil
-	}
-	cp := make(map[PoolKey]map[string]map[string]resourcev1.Counter, len(src))
-	for poolKey, counterSets := range src {
-		cpCounterSets := make(map[string]map[string]resourcev1.Counter, len(counterSets))
-		for counterSetName, counters := range counterSets {
-			cpCounters := make(map[string]resourcev1.Counter, len(counters))
-			for counterName, counter := range counters {
-				cpCounters[counterName] = resourcev1.Counter{Value: counter.Value.DeepCopy()}
+// countersFeasible checks whether the remaining counter budgets can possibly
+// satisfy the aggregate demand from all requests. This is a conservative
+// lower-bound check: if even the minimum total consumption exceeds available
+// budget, no DFS path can succeed. This is only done for AllMode requests
+// as their eligible devices (both in-cluster and template) are pre-computed.
+func (a *allocator) countersFeasible() bool {
+	for _, cd := range a.claimData {
+		for _, rd := range cd.Requests {
+			if rd.AllocationMode == resourcev1.DeviceAllocationModeAll {
+				if !a.allModeCountersFeasible(&rd) {
+					return false
+				}
 			}
-			cpCounterSets[counterSetName] = cpCounters
 		}
-		cp[poolKey] = cpCounterSets
+	}
+	return true
+}
+
+//nolint:gocyclo
+func (a *allocator) allModeCountersFeasible(rd *RequestData) bool {
+	// For All mode, we must allocate all predetermined devices.
+	// Decrement from shadow copies of remaining counters as we iterate.
+	// Map: poolKey -> counterSetName -> counterName -> Counter
+	inClusterShadow := make(map[PoolKey]map[string]map[string]resourcev1.Counter)
+	templateShadow := make(map[PoolKey]map[string]map[string]resourcev1.Counter)
+
+	devices := rd.AllDevices
+	if templateDevices, ok := rd.AllTemplateDevicesByIT[a.itID]; ok {
+		devices = append(devices, templateDevices...)
+	}
+
+	for _, d := range devices {
+		if len(d.ConsumesCounters) == 0 {
+			continue
+		}
+		poolKey := PoolKey{Driver: d.ID.Driver, Pool: d.ID.Pool}
+
+		var shadow map[PoolKey]map[string]map[string]resourcev1.Counter
+		if d.ID.Template {
+			shadow = templateShadow
+		} else {
+			shadow = inClusterShadow
+		}
+
+		if _, ok := shadow[poolKey]; !ok {
+			var remaining map[string]map[string]resourcev1.Counter
+			if d.ID.Template {
+				if a.templateRemainingCounters != nil {
+					remaining = a.templateRemainingCounters[poolKey]
+				}
+			} else {
+				remaining = a.allocationTracker.RemainingCounters[poolKey]
+			}
+			if remaining == nil {
+				return false
+			}
+			shadow[poolKey] = copyCounterSets(remaining)
+		}
+		poolShadow := shadow[poolKey]
+		for _, consumption := range d.ConsumesCounters {
+			counterSetsShadow, ok := poolShadow[consumption.CounterSet]
+			if !ok {
+				return false
+			}
+			for counterName, counter := range consumption.Counters {
+				availCounter, ok := counterSetsShadow[counterName]
+				if !ok {
+					return false
+				}
+				availCounter.Value.Sub(counter.Value)
+				if availCounter.Value.Cmp(resource.Quantity{}) < 0 {
+					return false
+				}
+				counterSetsShadow[counterName] = availCounter
+			}
+		}
+	}
+	return true
+}
+
+func copyCounterSets(src map[string]map[string]resourcev1.Counter) map[string]map[string]resourcev1.Counter {
+	cp := make(map[string]map[string]resourcev1.Counter, len(src))
+	for counterSetName, counters := range src {
+		cpCounters := make(map[string]resourcev1.Counter, len(counters))
+		for counterName, counter := range counters {
+			cpCounters[counterName] = resourcev1.Counter{Value: counter.Value.DeepCopy()}
+		}
+		cp[counterSetName] = cpCounters
 	}
 	return cp
 }
