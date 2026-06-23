@@ -690,11 +690,13 @@ This matches upstream, where `checkAvailableCounters` iterates pool device slice
 
 **Rationale:** Counter checks are cheaper than CEL compilation/evaluation (simple quantity comparison vs. expression evaluation). Running them first prunes ineligible devices before the expensive selector step. The IsAllocated check is the cheapest filter and stays first.
 
-### 7. PerDeviceNodeSelection resolves per-device, not per-slice
+### 7. PerDeviceNodeSelection filters eagerly during pool gathering
 
-**Decision:** When `PerDeviceNodeSelection: true`, topology requirements are resolved per-device during `tryDevice`, not pre-computed per-slice during pool gathering.
+**Decision:** When `PerDeviceNodeSelection: true`, topology requirements are resolved per-device during pool building (`build()` and `filterPool()`). Devices whose per-device topology is incompatible with the NodeClaim's requirements are excluded from `Pool.Devices` at gather time — counter-consuming incompatible devices are moved to `NonTargetingDevices`, others are dropped.
 
-**Rationale:** Pre-computation would require storing per-device topology on the pool structure, complicating pool assembly. Since topology is only evaluated for devices that pass all other checks (IsAllocated, capacity, counters, CEL), the per-device resolution runs infrequently. The marginal cost is negligible.
+**Rationale:** Eager filtering reduces the DFS branching factor by excluding provably-unreachable devices before the search begins. This is especially valuable for multi-host slices where only a subset of devices target any given topology. The topology is stored on `DeviceWithID.TopologyRequirements` (same as slice-level topology), so the allocator's `tryDevice` compatibility check acts as a safety net but rarely rejects devices that passed the gather-time filter. Since `FilterPools` is called after every topology tightening in the DFS (requirement narrowing), dynamic incompatibility from progressive narrowing is also handled eagerly.
+
+**Note:** `kubernetes.io/hostname` is not in Karpenter's `WellKnownLabels`, so devices with `NodeName` are always filtered out for new NodeClaims (Karpenter can't predict hostnames). These devices are only usable on existing-node NodeClaims that already have the hostname in their requirements.
 
 ### 8. Three-layer counter tracking mirrors capacity tracking
 
@@ -748,12 +750,14 @@ Extends counter verification to template devices. Template counter budgets are p
 - `checkCounters` branching on `deviceID.Template` to use `templateRemainingCounters`
 - `InflightTemplateCounterConsumption` tracking across pods on same (NodeClaim, IT)
 
-### Commit 4: PerDeviceNodeSelection
+### Commit 4: PerDeviceNodeSelection ✓
 
-Topology handling for multi-host devices.
+Topology handling for multi-host devices. Per-device node affinity fields (`NodeName`, `NodeSelector`, `AllNodes`) are extracted during pool building and stored on `DeviceWithID.TopologyRequirements`. Incompatible devices are eagerly filtered: excluded from `Pool.Devices` at gather time (counter-consumers move to `NonTargetingDevices`). The allocator's `tryDevice` topology check serves as a safety net but rarely rejects post-filter.
 
 - [Topology Requirement Extraction](#topology-requirement-extraction)
 - [NodeClaim Compatibility](#nodeclaim-compatibility)
+- Eager per-device filtering in `build()` and `filterPool()`
+- Deep copy support for new `Device` fields (`NodeName`, `NodeSelector`, `AllNodes`)
 
 ### Dependency Graph
 
@@ -765,7 +769,7 @@ Commit 1: Device Model & Pool Changes ✓
   │       ▼
   ├──→ Commit 3: Template Counter Verification ✓ (implemented with commit 2)
   │
-  └──→ Commit 4: PerDeviceNodeSelection (independent of 2, 3)
+  └──→ Commit 4: PerDeviceNodeSelection ✓ (independent of 2, 3)
 ```
 
-Commit 4 is independent of the counter work and can be developed in parallel.
+All commits complete.
