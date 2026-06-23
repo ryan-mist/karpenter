@@ -439,7 +439,6 @@ type allocator struct {
 	// templateRemainingCounters holds the remaining counter budgets for template pools.
 	// Initialized per-IT from ResourceSliceTemplate.SharedCounters. Template counters are local to the
 	// current IT (not shared across NodeClaims), so they live on the child allocator rather than the tracker.
-	// Wired into checkCounters in Commit 3.
 	templateRemainingCounters map[PoolKey]map[string]map[string]resourcev1.Counter
 
 	// requirements are the topology requirements that are incrementally built up by the DFS. Each time an in-cluster
@@ -687,12 +686,22 @@ func (a *allocator) tryDevice(
 	}
 
 	// 1c. Counter verification — check shared counter budgets.
-	// In-cluster devices: look up the pool from a.pools and check against tracker's RemainingCounters.
-	// Template devices: use templateRemainingCounters (wired in Commit 3).
 	if len(dw.ConsumesCounters) > 0 {
 		poolKey := PoolKey{Driver: deviceID.Driver, Pool: deviceID.Pool}
-		pool, _ := lo.Find(a.pools, func(p *Pool) bool { return p.Key == poolKey })
-		if pool == nil || !a.checkCounters(dw.Device, poolKey, pool) {
+		var remainingCounterSets map[string]map[string]resourcev1.Counter
+		if deviceID.Template {
+			if a.templateRemainingCounters != nil {
+				remainingCounterSets = a.templateRemainingCounters[poolKey]
+			}
+		} else {
+			pool, _ := lo.Find(a.pools, func(p *Pool) bool { return p.Key == poolKey })
+			if pool == nil {
+				return false
+			}
+			a.allocationTracker.InitRemainingCounters(pool)
+			remainingCounterSets = a.allocationTracker.RemainingCounters[poolKey]
+		}
+		if !a.checkCounters(dw.Device, poolKey, remainingCounterSets) {
 			return false
 		}
 	}
@@ -828,16 +837,14 @@ func (a *allocator) buildTemplateCounters() map[PoolKey]map[string]map[string]re
 	return remainingByPool
 }
 
-// checkCounters verifies that the pool's shared counters have sufficient remaining budget for the device.
-// Remaining counters are tracked on the AllocationTracker (initialized lazily per pool). The DFS-local
-// allocatingCounters are subtracted here to account for tentative allocations in the current search.
-func (a *allocator) checkCounters(device cloudprovider.Device, poolKey PoolKey, pool *Pool) bool {
+// checkCounters verifies that shared counters have sufficient remaining budget for the device.
+// remainingCounterSets is the base budget (from AllocationTracker for in-cluster pools, or
+// templateRemainingCounters for template pools). The DFS-local allocatingCounters are subtracted
+// to account for tentative allocations in the current search.
+func (a *allocator) checkCounters(device cloudprovider.Device, poolKey PoolKey, remainingCounterSets map[string]map[string]resourcev1.Counter) bool {
 	if len(device.ConsumesCounters) == 0 {
 		return true
 	}
-	// Ensure remaining counters are initialized for this pool.
-	a.allocationTracker.InitRemainingCounters(pool)
-	remainingCounterSets := a.allocationTracker.RemainingCounters[poolKey]
 	if remainingCounterSets == nil {
 		return false
 	}

@@ -79,20 +79,26 @@ func withAPIDevices(names ...string) func(*resourcev1.ResourceSlice) {
 }
 
 type apiDeviceSpec struct {
-	name  string
-	attrs map[resourcev1.QualifiedName]resourcev1.DeviceAttribute
+	name             string
+	attrs            map[resourcev1.QualifiedName]resourcev1.DeviceAttribute
+	consumesCounters []resourcev1.DeviceCounterConsumption
 }
 
 func deviceWithAttrs(name string, attrs map[resourcev1.QualifiedName]resourcev1.DeviceAttribute) apiDeviceSpec {
 	return apiDeviceSpec{name: name, attrs: attrs}
 }
 
+func deviceWithAttrsAndCounters(name string, attrs map[resourcev1.QualifiedName]resourcev1.DeviceAttribute, consumesCounters []resourcev1.DeviceCounterConsumption) apiDeviceSpec {
+	return apiDeviceSpec{name: name, attrs: attrs, consumesCounters: consumesCounters}
+}
+
 func withAPIDevicesWithAttrs(specs ...apiDeviceSpec) func(*resourcev1.ResourceSlice) {
 	return func(s *resourcev1.ResourceSlice) {
 		for _, spec := range specs {
 			s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
-				Name:       spec.name,
-				Attributes: spec.attrs,
+				Name:             spec.name,
+				Attributes:       spec.attrs,
+				ConsumesCounters: spec.consumesCounters,
 			})
 		}
 	}
