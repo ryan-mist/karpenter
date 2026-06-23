@@ -892,7 +892,6 @@ Pure computation layer — no state machines, no integration with DFS yet.
 
 - [Rounding Logic](#rounding-logic)
 - [Default Consumption](#default-consumption)
-- [DistinctAttribute Interface Implementation](#interface-implementation)
 - [Preallocated Consumed Capacity](#preallocated-consumed-capacity)
 - [Inflight Consumed Capacity](#inflight-consumed-capacity)
 
@@ -914,12 +913,20 @@ DFS integration — connects all prior layers into the allocation decision path.
 - [Placement in tryDevice](#placement-in-trydevice)
 - [Backtracking](#backtracking)
 - [IsAllocated Semantic Change](#isallocated-semantic-change)
-- [Scoping and Evaluation](#scoping-and-evaluation) (DistinctAttribute in constraint loop)
 - [Commit Protocol Extension](#commit-protocol-extension)
 - [ConsumedCapacity Recording](#consumedcapacity-recording)
 - [Metadata Extensions](#metadata-extensions)
 
 Equivalent to: *allocator* (the DFS, backtracking, commit protocol).
+
+### Commit 6: DistinctAttribute Constraint (deferred)
+
+Independent constraint type — no code dependency on capacity verification. Can land any time after commit 5.
+
+- [DistinctAttribute Interface Implementation](#interface-implementation)
+- [Scoping and Evaluation](#scoping-and-evaluation) (DistinctAttribute in constraint loop)
+
+Equivalent to: *constraint extension* (new constraint type following the existing `Constraint` interface pattern).
 
 ### Dependency Graph
 
@@ -935,7 +942,9 @@ Commit 1: Device Model ✓
   ├──→ Commit 4: Request Validation
   │       │
   │       ▼
-  └──→ Commit 5: Allocator Integration (depends on 2, 3, 4)
+  ├──→ Commit 5: Allocator Integration (depends on 2, 3, 4)
+  │
+  └──→ Commit 6: DistinctAttribute (independent, after 5)
 ```
 
-DistinctAttribute spans Commits 3-5 (struct definition → request parsing → DFS evaluation) but can be developed in parallel with capacity verification since they share no code paths until Commit 5.
+DistinctAttribute is orthogonal to capacity verification — they share no code paths. Commit 6 can be developed and landed independently after the capacity path is complete.
