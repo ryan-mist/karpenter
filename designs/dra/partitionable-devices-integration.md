@@ -703,24 +703,26 @@ Foundation layer. Extends `cloudprovider.Device` with `ConsumesCounters`, adds `
 - [Pool Completeness](#pool-completeness)
 - [Pool Validation](#pool-validation)
 
-### Commit 2: Counter State & Verification Logic
+### Commit 2: Counter State & Verification Logic ✓
 
-Core computation layer — counter tracking types and the verification function.
+Core computation layer and DFS integration — counter tracking types, verification function, and wiring into the allocation path. Commits 2 and 3 from the original plan were merged into a single commit since the state and integration are tightly coupled.
 
 - [Available Counter Computation](#available-counter-computation)
 - [Preallocated Counter State](#preallocated-counter-state)
 - [Inflight Counter State](#inflight-counter-state)
 - [Per-IT Counter State (DFS-local)](#per-it-counter-state-dfs-local)
 - [Counter Verification Logic](#counter-verification-logic)
-
-### Commit 3: Allocator Integration
-
-DFS integration — connects counter verification into the allocation decision path.
-
 - [Placement in tryDevice](#placement-in-trydevice)
 - [Backtracking](#backtracking)
 - [Interaction with Consumable Capacity](#interaction-with-consumable-capacity)
 - [Commit Protocol Extension](#commit-protocol-extension)
+
+### Commit 3: Template Counter Verification
+
+Extends counter verification to template devices. Template counter budgets are per-IT (not shared across NodeClaims) and initialized from `ResourceSliceTemplate.SharedCounters`.
+
+- Template counter budget initialization via `buildTemplateCounters`
+- `checkCounters` branching on `deviceID.Template` to use `templateRemainingCounters`
 
 ### Commit 4: PerDeviceNodeSelection
 
@@ -734,12 +736,12 @@ Topology handling for multi-host devices.
 ```
 Commit 1: Device Model & Pool Changes ✓
   │
-  ├──→ Commit 2: Counter State & Verification Logic
+  ├──→ Commit 2: Counter State & Verification Logic ✓ (merged original commits 2+3)
   │       │
   │       ▼
-  ├──→ Commit 3: Allocator Integration (depends on 1, 2)
+  ├──→ Commit 3: Template Counter Verification (depends on 2)
   │
   └──→ Commit 4: PerDeviceNodeSelection (independent of 2, 3)
 ```
 
-Commits 2-3 are sequential (counter logic → DFS integration). Commit 4 is independent and can be developed in parallel.
+Commit 3 is scoped to template devices only. Commit 4 is independent and can be developed in parallel.
