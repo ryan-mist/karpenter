@@ -415,21 +415,30 @@ This is why the pool carries `NonTargetingDevices` — the allocator needs the d
 
 ### Inflight Counter State
 
-As pods are scheduled within a scheduling loop, counter deductions from earlier `Allocate()` calls must be visible to later calls:
+As pods are scheduled within a scheduling loop, counter deductions from earlier `Allocate()` calls must be visible to later calls. In-cluster and template counters require separate inflight tracking:
 
 ```go
 type AllocationTracker struct {
     // ... existing fields ...
     
-    // InflightCounterConsumption tracks counter deductions from devices allocated
-    // by earlier pods in this scheduling loop. Map: poolID → counterSetName → counterName → consumed.
-    InflightCounterConsumption map[PoolID]map[string]map[string]resource.Quantity
+    // InflightCounterConsumption tracks counter deductions from in-cluster devices allocated
+    // by earlier pods in this scheduling loop. Map: poolKey → counterSetName → counterName → consumed.
+    // Uses pessimistic-max across ITs since the NodeClaim collapses to a single IT.
+    InflightCounterConsumption map[PoolKey]map[string]map[string]resource.Quantity
+
+    // InflightTemplateCounterConsumption tracks counter deductions from template devices.
+    // Keyed by (NodeClaimID, InstanceTypeID, PoolKey) because template budgets are per-IT and
+    // per-NodeClaim — unlike in-cluster counters which are global.
+    // Map: nodeClaimID → instanceTypeID → poolKey → counterSetName → counterName → consumed.
+    InflightTemplateCounterConsumption map[NodeClaimID]map[InstanceTypeID]map[PoolKey]map[string]map[string]resource.Quantity
 }
 ```
 
-On `Commit()`: the child allocator's counter deductions are merged into `InflightCounterConsumption`.
+Template counters are separated from in-cluster counters because: (1) a template pool and an in-cluster pool can share the same `PoolKey` (same driver+pool name) but have independent budgets; (2) template counters are rebuilt per-IT in `restoreState()` while in-cluster counters accumulate across ITs; (3) template consumption commits per-(NodeClaim, IT) while in-cluster consumption commits globally via pessimistic-max.
 
-On `ReleaseInstanceTypes()`: if a committed allocation's instance type is pruned, its counter contribution must be subtracted from `InflightCounterConsumption`.
+On `Commit()`: the child allocator's counter deductions are merged into the appropriate inflight map — in-cluster counters into `InflightCounterConsumption` (with pessimistic-max delta), template counters into `InflightTemplateCounterConsumption[nodeClaimID][itID]`.
+
+On `ReleaseInstanceTypes()`: if a committed allocation's instance type is pruned, its counter contribution must be subtracted from the respective inflight map. For in-cluster, the pessimistic max is recomputed. For template, the (NodeClaim, IT) entry is simply deleted.
 
 ### Per-IT Counter State (DFS-local)
 
@@ -529,6 +538,8 @@ Three layers of counter consumption (matching the capacity verification pattern)
 - `inflight` — from earlier pods in this scheduling loop
 - `allocating` — from earlier allocations in this DFS tree
 
+For **template devices**, `checkCounters` uses template-specific state: `preallocated` is zero (template devices have no prior cluster state), `inflight` is sourced from `InflightTemplateCounterConsumption[nodeClaimID][itID][poolKey]` rather than the global in-cluster map, and `total` comes from `ResourceSliceTemplate.SharedCounters`. In practice, `buildTemplateCounters()` computes `total - inflight` upfront as the initial `templateRemainingCounters`, so the runtime check is `remaining - allocating >= needed`.
+
 ### Interaction with Consumable Capacity
 
 Counter verification and capacity verification are **independent checks that both must pass**:
@@ -551,17 +562,23 @@ A device that passes capacity but fails counters is rejected. A device that pass
 
 ### Commit Protocol Extension
 
-On `Commit()`, the child allocator reports counter deductions to the top-level tracker:
+On `Commit()`, the child allocator reports counter deductions to the top-level tracker. In-cluster and template counters commit through separate paths:
 
 ```go
 func (a *Allocator) Commit(child *allocation) {
     // ... existing commit logic (devices, capacity) ...
     
-    // Merge counter deductions into inflight state
+    // In-cluster: merge with pessimistic-max delta into global inflight state
     for counterSet, counters := range child.allocatingCounters {
         for counterName, amount := range counters {
             a.tracker.InflightCounterConsumption[poolID][counterSet][counterName].Add(amount)
         }
+    }
+    
+    // Template: store per-(NodeClaim, IT, Pool) — no pessimistic-max needed since
+    // template counters are already per-IT (each IT has its own budget).
+    for it, countersByPool := range child.templateCounterConsumptionByIT {
+        a.tracker.InflightTemplateCounterConsumption[child.nodeClaimID][it][poolKey] = countersByPool
     }
 }
 ```
@@ -685,6 +702,12 @@ This matches upstream, where `checkAvailableCounters` iterates pool device slice
 
 **Rationale:** The problems are structurally identical — shared resources consumed across time horizons (existing allocations → same scheduling loop → same DFS tree). Reusing the pattern reduces cognitive overhead and enables a consistent backtracking/commit protocol.
 
+### 9. Template counter inflight state is keyed by (NodeClaim, IT, Pool)
+
+**Decision:** `InflightTemplateCounterConsumption` is a separate field from `InflightCounterConsumption`, keyed by `(NodeClaimID, InstanceTypeID, PoolKey)`.
+
+**Rationale:** Template and in-cluster counters cannot share an inflight map because: (1) template and in-cluster pools can share the same `PoolKey` (same driver name), creating key collisions; (2) template counters are rebuilt per-IT in `restoreState()` while in-cluster counters accumulate across ITs; (3) template consumption commits per-(NodeClaim, IT) while in-cluster consumption commits globally. The three-key hierarchy ensures `buildTemplateCounters()` can subtract exactly the prior committed consumption for the relevant (NodeClaim, IT) pair when initializing `templateRemainingCounters`.
+
 ---
 
 ## Implementation Sequencing
@@ -717,12 +740,13 @@ Core computation layer and DFS integration — counter tracking types, verificat
 - [Interaction with Consumable Capacity](#interaction-with-consumable-capacity)
 - [Commit Protocol Extension](#commit-protocol-extension)
 
-### Commit 3: Template Counter Verification
+### Commit 3: Template Counter Verification ✓
 
-Extends counter verification to template devices. Template counter budgets are per-IT (not shared across NodeClaims) and initialized from `ResourceSliceTemplate.SharedCounters`.
+Extends counter verification to template devices. Template counter budgets are per-IT and per-NodeClaim — `buildTemplateCounters()` initializes from `ResourceSliceTemplate.SharedCounters` minus `InflightTemplateCounterConsumption[nodeClaimID][itID][poolKey]` to account for prior committed template allocations on the same (NodeClaim, IT) pair. Implemented alongside Commit 2 in the implementation branch (commits `138362b8` + `bfe0f318`).
 
 - Template counter budget initialization via `buildTemplateCounters`
 - `checkCounters` branching on `deviceID.Template` to use `templateRemainingCounters`
+- `InflightTemplateCounterConsumption` tracking across pods on same (NodeClaim, IT)
 
 ### Commit 4: PerDeviceNodeSelection
 
@@ -739,9 +763,9 @@ Commit 1: Device Model & Pool Changes ✓
   ├──→ Commit 2: Counter State & Verification Logic ✓ (merged original commits 2+3)
   │       │
   │       ▼
-  ├──→ Commit 3: Template Counter Verification (depends on 2)
+  ├──→ Commit 3: Template Counter Verification ✓ (implemented with commit 2)
   │
   └──→ Commit 4: PerDeviceNodeSelection (independent of 2, 3)
 ```
 
-Commit 3 is scoped to template devices only. Commit 4 is independent and can be developed in parallel.
+Commit 4 is independent of the counter work and can be developed in parallel.
