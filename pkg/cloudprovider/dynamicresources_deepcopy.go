@@ -18,6 +18,7 @@ package cloudprovider
 
 import (
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/utils/ptr"
 )
 
 func (in *DynamicResources) DeepCopyInto(out *DynamicResources) {
@@ -105,6 +106,15 @@ func (in *Device) DeepCopyInto(out *Device) {
 				}
 			}
 		}
+	}
+	if in.NodeName != nil {
+		out.NodeName = ptr.To(*in.NodeName)
+	}
+	if in.NodeSelector != nil {
+		out.NodeSelector = in.NodeSelector.DeepCopy()
+	}
+	if in.AllNodes != nil {
+		out.AllNodes = ptr.To(*in.AllNodes)
 	}
 }
 

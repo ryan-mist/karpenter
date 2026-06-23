@@ -103,6 +103,9 @@ type ResourceSlice interface {
 	// SharedCounters returns the counter set definitions declared by this slice.
 	// Returns nil if the slice declares no counter sets.
 	SharedCounters() []resourcev1.CounterSet
+	// PerDeviceNodeSelection returns true if the slice uses per-device node affinity
+	// rather than slice-level node affinity.
+	PerDeviceNodeSelection() bool
 }
 
 // apiServerSlice adapts a resourcev1.ResourceSlice from the API server to the ResourceSlice interface.
@@ -129,6 +132,7 @@ func (s *apiServerSlice) Pool() cloudprovider.ResourcePool {
 
 func (s *apiServerSlice) Devices() []cloudprovider.Device {
 	if s.devices == nil {
+		perDevice := s.PerDeviceNodeSelection()
 		s.devices = make([]cloudprovider.Device, len(s.slice.Spec.Devices))
 		for i, d := range s.slice.Spec.Devices {
 			attrs := make(map[resourcev1.QualifiedName]resourcev1.DeviceAttribute, len(d.Attributes))
@@ -145,6 +149,11 @@ func (s *apiServerSlice) Devices() []cloudprovider.Device {
 				Capacity:                 capacity,
 				AllowMultipleAllocations: lo.FromPtr(d.AllowMultipleAllocations),
 				ConsumesCounters:         d.ConsumesCounters,
+			}
+			if perDevice {
+				s.devices[i].NodeName = d.NodeName
+				s.devices[i].NodeSelector = d.NodeSelector
+				s.devices[i].AllNodes = d.AllNodes
 			}
 		}
 	}
@@ -176,6 +185,10 @@ func (s *apiServerSlice) ResourceSliceCount() int64 {
 
 func (s *apiServerSlice) SharedCounters() []resourcev1.CounterSet {
 	return s.slice.Spec.SharedCounters
+}
+
+func (s *apiServerSlice) PerDeviceNodeSelection() bool {
+	return lo.FromPtr(s.slice.Spec.PerDeviceNodeSelection)
 }
 
 // templateSlice adapts a cloudprovider.ResourceSliceTemplate to the ResourceSlice interface.
@@ -222,6 +235,10 @@ func (s *templateSlice) ResourceSliceCount() int64 {
 
 func (s *templateSlice) SharedCounters() []resourcev1.CounterSet {
 	return s.template.SharedCounters
+}
+
+func (s *templateSlice) PerDeviceNodeSelection() bool {
+	return false
 }
 
 // nodeSelectorsToRequirements extracts scheduling requirements from a NodeSelector.
