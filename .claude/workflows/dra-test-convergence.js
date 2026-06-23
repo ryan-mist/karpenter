@@ -11,7 +11,7 @@ export const meta = {
 
 // Repository layout:
 //   Design docs:     /Users/ryanmist/Desktop/karpenter-plan  (branch consumable-capacity-plan)
-//   Implementation:  /Users/ryanmist/Desktop/karp/karpenter  (branch consumable-capacity)
+//   Implementation:  /Users/ryanmist/Desktop/karp/karpenter  (branch consumable-capacity-partitionable-devices)
 //
 // Tests live alongside implementation code in the implementation worktree.
 
@@ -32,7 +32,7 @@ This project uses TWO git worktrees of the same Karpenter repo:
   - designs/dra/consumable-capacity-integration.md — Karpenter integration design
   - designs/dra/consumable-capacity-notes.md — Scoping decisions, known bugs
 
-- **Implementation + Tests:** ${IMPL_ROOT} (branch consumable-capacity)
+- **Implementation + Tests:** ${IMPL_ROOT} (branch consumable-capacity-partitionable-devices)
   - pkg/scheduling/dynamicresources/ — Core DRA allocator code and tests
   - pkg/controllers/dynamicresources/ — Device allocation controller
   - pkg/cloudprovider/ — Cloud provider interface

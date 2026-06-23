@@ -105,7 +105,7 @@ After a successful IT DFS, constraints retain pinned state. `restoreState()` bet
 Both are worktrees of the same Karpenter repo:
 
 - **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
-- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity-partitionable-devices`)
 
 ## Reference
 

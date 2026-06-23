@@ -12,7 +12,7 @@ You validate that Go code implementing consumable capacity in Karpenter matches 
 Both are worktrees of the same Karpenter repo at `/Users/ryanmist/Desktop/karp/karpenter`:
 
 - **Design docs (spec):** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`), specifically `designs/dra/consumable-capacity-integration.md`
-- **Implementation (code):** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity`)
+- **Implementation (code):** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity-partitionable-devices`)
 
 All code paths in the checklist below (e.g., `pkg/scheduling/dynamicresources/allocator.go`) are relative to the implementation repo at `/Users/ryanmist/Desktop/karp/karpenter`.
 

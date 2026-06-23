@@ -26,7 +26,7 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 Both are worktrees of the same Karpenter repo:
 
 - **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
-- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity-partitionable-devices`)
 
 ## Key Files (read these for implementation details)
 
@@ -59,14 +59,15 @@ Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
 
 ## Scope Exclusions (not yet implemented)
 
-- Admin access, partitionable devices
+- Admin access
 - Device taints, non-node-local in-flight devices
 - Multi-solution optimization, consolidation
 - FirstAvailable (sub-request) claims
 
 ## Active Design Work
 
-- **Consumable capacity (KEP-5075)**: Integration design complete — see `designs/dra/consumable-capacity-integration.md`
+- **Consumable capacity (KEP-5075)**: Implemented on `consumable-capacity-partitionable-devices` branch — see `designs/dra/consumable-capacity-integration.md`
+- **Partitionable devices (KEP-4815)**: Implemented on same branch — see `designs/dra/partitionable-devices-integration.md`
 - **Known bug (constraint reset)**: After a successful IT DFS, constraints retain stale state across IT transitions. `restoreState()` doesn't reset them. Fix: add `Reset()` to `Constraint` interface.
 
 ## When Reviewing DRA Code
