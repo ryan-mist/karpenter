@@ -307,6 +307,8 @@ As pods are scheduled within a single scheduling loop, capacity committed by ear
 - **On Commit():** The child allocator's per-IT consumed capacity is merged into `InflightConsumedCapacity`
 - **On ReleaseInstanceTypes():** If a committed allocation's instance type is pruned, its consumed capacity contribution must be subtracted from `InflightConsumedCapacity`
 
+**Scope:** `InflightConsumedCapacity` tracks only **in-cluster** multi-allocatable devices. Template multi-allocatable devices are tracked separately per-(NodeClaim, IT) via `templateConsumedCapacity` on the `AllocationTracker` — an additive (sparse) map that accumulates consumption across `Allocate()` calls. Each instance type has its own independent template device set — there is no cross-IT contention for template capacity — so pessimistic-max semantics do not apply. Instead, template capacity consumption is added directly per-IT, and the DFS check compares `trackerConsumed + allocating + consumed <= device.Capacity[dim].Value`.
+
 ### Cross-NodeClaim Sharing
 
 Multi-allocatable in-cluster devices can be shared across NodeClaims — this is a fundamental difference from exclusive devices. For exclusive devices, `IsAllocated` returns `true` when a device is allocated for a *different* NodeClaim (pessimistic assumption). For multi-allocatable devices, cross-NodeClaim sharing is permitted as long as capacity remains — the capacity check handles correctness.
@@ -320,6 +322,7 @@ The existing `allocation.Commit()` (`allocator.go:181-201`) calls `allocationTra
 1. Multi-allocatable device IDs are recorded in `InflightConsumedCapacity` rather than `InflightClusterAllocations`
 2. Per-device consumed capacity (computed during the DFS) is summed into the tracker's map
 3. The `InflightClusterAllocationsByNodeClaim` inverse index is extended to also track multi-allocatable devices (needed for `ReleaseInstanceTypes`)
+4. **Template multi-allocatable device capacity** is committed directly per-IT (like `templateCounterConsumptionByIT` in the partitionable devices integration), not via pessimistic-max. Each IT's template devices are independent — committing capacity for one IT does not affect another IT's template capacity. The tracker uses an additive `templateConsumedCapacity` map (sparse, keyed by NC → IT → DeviceID → dim) rather than a "remaining" model — no eager initialization needed since the device ceiling is available at check time.
 
 ---
 
@@ -860,6 +863,12 @@ For DistinctAttribute the semantics are sound: we only need "these are different
 
 **Rationale:** The upstream implementation keys by `requestName`, which breaks for `count > 1` — all slots share the same key, causing map overwrites that destroy the history of previously seen values. Our slice approach preserves all values for duplicate checking and pops correctly during LIFO backtracking.
 
+### 11. Template capacity tracked separately from in-cluster capacity (per-IT independence)
+
+**Decision:** Template multi-allocatable device capacity is tracked per-(NodeClaim, IT) using `templateCapacityConsumptionByIT` on the `allocation` struct and `templateConsumedCapacity` (additive, sparse) on the `AllocationTracker`, separate from the global `InflightConsumedCapacity` used for in-cluster devices.
+
+**Rationale:** In-cluster multi-allocatable devices are shared physical resources — capacity consumed by any IT candidate on any NodeClaim reduces what's available to all others, requiring pessimistic-max semantics at commit time (we don't know which IT will be selected, so we must assume the worst-case consumption). Template devices are the opposite: each IT has its own independent set of template devices that exist only if that IT is selected. IT-A's template NIC capacity is entirely independent of IT-B's template NIC capacity because they represent different hypothetical hardware. This is the same justification that drives `templateRemainingCounters` for SharedCounters in the partitionable devices integration — direct addition per-IT, no pessimistic-max, no cross-IT contention. Unlike `templateRemainingCounters` (which uses a "remaining" model because counter budgets are pool-level), template capacity uses an additive model (`templateConsumedCapacity`) because capacity is per-device — there is no aggregation benefit from pre-computing remaining, and the additive model avoids eager initialization of every multi-allocatable template device.
+
 ---
 
 ## Implementation Sequencing
@@ -894,6 +903,7 @@ Pure computation layer — no state machines, no integration with DFS yet.
 - [Default Consumption](#default-consumption)
 - [Preallocated Consumed Capacity](#preallocated-consumed-capacity)
 - [Inflight Consumed Capacity](#inflight-consumed-capacity)
+- Template capacity tracking fields (`templateCapacityConsumptionByIT` on `allocation`, `templateConsumedCapacity` on `AllocationTracker`) — additive model, sparse, no eager initialization needed
 
 Equivalent to: *core types* (foundational types and logic that request validation and the allocator build on).
 
