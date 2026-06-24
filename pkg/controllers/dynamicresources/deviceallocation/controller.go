@@ -43,19 +43,6 @@ import (
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
 
-// SOME NOTES
-// Controller responsible for tracking allocated devices based on ResourceClaim statuses.
-// The controller provides an iterator interface which will be consumed by the provisioner and disruption controllers when creating the DRA allocator (PR to follow).
-
-// SOME CONSIDERATIONS
-// Multiple pods can consume the same ResourceClaim.
-// To avoid overprovisioning, we need to release a device when all pods with reservations for that device are in a deleting state.
-// A subset of pods deleting is not sufficient since it won't result in the device being released.
-
-// TODO
-// Needs to aggregate per-device consumed capacity across all claims
-// Multiple claims can reference the same device.
-
 const (
 	minReconciles = 10
 	maxReconciles = 3000

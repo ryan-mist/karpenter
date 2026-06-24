@@ -132,6 +132,10 @@ func (at *AllocationTracker) Commit(alloc *allocation) {
 				continue
 			}
 			// Multi-allocatable devices are tracked via capacity, not binary allocation.
+			// TODO(commit-5): This only catches devices with prior cluster allocations. Fresh multi-allocatable
+			// devices (never allocated before) will fall through and be inserted into InflightClusterAllocations,
+			// incorrectly blocking cross-NodeClaim sharing. Commit 5 should use device.AllowMultipleAllocations
+			// as the discriminator instead.
 			if _, isMultiAlloc := at.PreallocatedConsumedCapacity[id]; isMultiAlloc {
 				continue
 			}
@@ -569,6 +573,8 @@ func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim,
 
 	// Multi-allocatable devices are never "fully allocated" from a binary standpoint.
 	// The capacity check in tryDevice determines whether the device can accept the new allocation.
+	// TODO(commit-5): This misses fresh multi-allocatable devices with no prior cluster allocations.
+	// Commit 5 should also check InflightConsumedCapacity or device.AllowMultipleAllocations directly.
 	if _, isMultiAlloc := at.PreallocatedConsumedCapacity[deviceID]; isMultiAlloc {
 		return false
 	}
