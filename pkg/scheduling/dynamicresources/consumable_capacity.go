@@ -44,7 +44,7 @@ func (a *allocator) checkCapacity(device cloudprovider.Device, deviceID DeviceID
 	}
 	var sources []map[resourcev1.QualifiedName]resource.Quantity
 	if deviceID.Template {
-		if tc := a.allocationTracker.TemplateRemainingCapacityForIT(a.nodeClaim.ID(), a.itID); tc != nil {
+		if tc := a.allocationTracker.TemplateConsumedCapacityForIT(a.nodeClaim.ID(), a.itID); tc != nil {
 			sources = append(sources, tc[deviceID])
 		}
 		sources = append(sources, a.templateAllocatingCapacity[deviceID])
@@ -247,23 +247,9 @@ func (at *AllocationTracker) releaseTemplateCapacity(nodeClaimID NodeClaimID, re
 	}
 }
 
-// InitTemplateRemainingCapacity initializes the template consumed capacity state for a
-// (NodeClaim, IT) pair. Subsequent calls for the same (NC, IT) are no-ops.
-func (at *AllocationTracker) InitTemplateRemainingCapacity(nodeClaimID NodeClaimID, itID InstanceTypeID) {
-	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
-	if !ok {
-		consumedByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
-		at.templateConsumedCapacity[nodeClaimID] = consumedByIT
-	}
-	if _, ok := consumedByIT[itID]; ok {
-		return
-	}
-	consumedByIT[itID] = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
-}
-
-// TemplateRemainingCapacityForIT returns the template consumed capacity for the given
+// TemplateConsumedCapacityForIT returns the template consumed capacity for the given
 // (NodeClaim, IT) pair. Returns nil if not yet initialized.
-func (at *AllocationTracker) TemplateRemainingCapacityForIT(nodeClaimID NodeClaimID, itID InstanceTypeID) map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity {
+func (at *AllocationTracker) TemplateConsumedCapacityForIT(nodeClaimID NodeClaimID, itID InstanceTypeID) map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity {
 	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
 	if !ok {
 		return nil
