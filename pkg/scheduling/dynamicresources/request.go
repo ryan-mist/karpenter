@@ -22,6 +22,7 @@ import (
 
 	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	dracel "k8s.io/dynamic-resource-allocation/cel"
@@ -58,6 +59,9 @@ type RequestData struct {
 	AllTemplateDevicesByIT map[InstanceTypeID][]DeviceWithID
 	// Selectors is the combined set of selectors from the class and request.
 	Selectors []resourcev1.DeviceSelector
+	// CapacityRequests contains the per-dimension capacity requirements from
+	// ExactDeviceRequest.Capacity.Requests. nil when no capacity is requested.
+	CapacityRequests map[resourcev1.QualifiedName]resource.Quantity
 }
 
 // ClaimData holds the parsed constraints and requests for a single ResourceClaim.
@@ -207,6 +211,10 @@ func validateExactRequest(
 		Selectors:      selectors,
 		NumDevices:     int(req.Count),
 		AllocationMode: resourcev1.DeviceAllocationModeExactCount,
+	}
+
+	if req.Capacity != nil {
+		rd.CapacityRequests = req.Capacity.Requests
 	}
 
 	if req.AllocationMode == resourcev1.DeviceAllocationModeAll {

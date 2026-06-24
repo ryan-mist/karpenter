@@ -112,6 +112,37 @@ var _ = Describe("Request Validation", func() {
 			Expect(data.Requests[0].Name).To(Equal("gpu-req"))
 			Expect(data.Requests[0].NumDevices).To(Equal(2))
 			Expect(data.Requests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
+			Expect(data.Requests[0].CapacityRequests).To(BeNil())
+		})
+
+		It("should populate CapacityRequests when Capacity is set", func() {
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+				Spec: resourcev1.ResourceClaimSpec{
+					Devices: resourcev1.DeviceClaim{
+						Requests: []resourcev1.DeviceRequest{
+							{
+								Name: "gpu-req",
+								Exactly: &resourcev1.ExactDeviceRequest{
+									DeviceClassName: "empty-class",
+									Count:           1,
+									Capacity: &resourcev1.CapacityRequirements{
+										Requests: map[resourcev1.QualifiedName]resource.Quantity{
+											"gpu.example.com/memory": resource.MustParse("16Gi"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(data.Requests).To(HaveLen(1))
+			Expect(data.Requests[0].CapacityRequests).To(HaveLen(1))
+			Expect(data.Requests[0].CapacityRequests["gpu.example.com/memory"]).To(Equal(resource.MustParse("16Gi")))
 		})
 
 		It("should validate multiple requests in a single claim", func() {
