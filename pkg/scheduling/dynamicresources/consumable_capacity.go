@@ -23,6 +23,205 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// commitCapacity stores per-IT capacity consumption and increments InflightConsumedCapacity by
+// the delta between the new pessimistic max and the old one.
+func (at *AllocationTracker) commitCapacity(nodeClaimID NodeClaimID, newCapacityByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) {
+	if len(newCapacityByIT) == 0 {
+		return
+	}
+	storedConsumedCapacityByIT, ok := at.consumedCapacityByNodeClaimIT[nodeClaimID]
+	if !ok {
+		storedConsumedCapacityByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+		at.consumedCapacityByNodeClaimIT[nodeClaimID] = storedConsumedCapacityByIT
+	}
+
+	oldMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Merge new consumption into stored state.
+	for it, deviceCapacity := range newCapacityByIT {
+		storedDevices, ok := storedConsumedCapacityByIT[it]
+		if !ok {
+			storedConsumedCapacityByIT[it] = deviceCapacity
+			continue
+		}
+		for deviceID, consumedByDevice := range deviceCapacity {
+			storedConsumedByDevice, ok := storedDevices[deviceID]
+			if !ok {
+				storedDevices[deviceID] = consumedByDevice
+				continue
+			}
+			for name, qty := range consumedByDevice {
+				existing := storedConsumedByDevice[name]
+				existing.Add(qty)
+				storedConsumedByDevice[name] = existing
+			}
+		}
+	}
+
+	newMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Add the delta (newMax - oldMax) to InflightConsumedCapacity.
+	for deviceID, newConsumedByDevice := range newMax {
+		for name, newQty := range newConsumedByDevice {
+			delta := newQty.DeepCopy()
+			if oldConsumedByDevice, ok := oldMax[deviceID]; ok {
+				if oldQty, ok := oldConsumedByDevice[name]; ok {
+					delta.Sub(oldQty)
+				}
+			}
+			if delta.Sign() > 0 {
+				if at.InflightConsumedCapacity[deviceID] == nil {
+					at.InflightConsumedCapacity[deviceID] = make(map[resourcev1.QualifiedName]resource.Quantity)
+				}
+				existing := at.InflightConsumedCapacity[deviceID][name]
+				existing.Add(delta)
+				at.InflightConsumedCapacity[deviceID][name] = existing
+			}
+		}
+	}
+}
+
+// commitTemplateCapacity adds per-IT template capacity consumption to the tracker's consumed state.
+// Template capacity doesn't need pessimistic-max treatment — each IT has its own independent device set.
+func (at *AllocationTracker) commitTemplateCapacity(nodeClaimID NodeClaimID, consumptionByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) {
+	if len(consumptionByIT) == 0 {
+		return
+	}
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		consumedByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+		at.templateConsumedCapacity[nodeClaimID] = consumedByIT
+	}
+	for itID, devices := range consumptionByIT {
+		consumedDevices, ok := consumedByIT[itID]
+		if !ok {
+			consumedByIT[itID] = devices
+			continue
+		}
+		for deviceID, consumedByDevice := range devices {
+			storedConsumedByDevice, ok := consumedDevices[deviceID]
+			if !ok {
+				consumedDevices[deviceID] = consumedByDevice
+				continue
+			}
+			for name, qty := range consumedByDevice {
+				existing := storedConsumedByDevice[name]
+				existing.Add(qty)
+				storedConsumedByDevice[name] = existing
+			}
+		}
+	}
+}
+
+// releaseCapacity adjusts InflightConsumedCapacity when instance types are pruned. Recomputes
+// the pessimistic max from remaining ITs and subtracts the delta.
+func (at *AllocationTracker) releaseCapacity(nodeClaimID NodeClaimID, releasedITs []InstanceTypeID) {
+	storedConsumedCapacityByIT, ok := at.consumedCapacityByNodeClaimIT[nodeClaimID]
+	if !ok {
+		return
+	}
+
+	oldMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	for _, itID := range releasedITs {
+		delete(storedConsumedCapacityByIT, itID)
+	}
+
+	newMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Subtract the delta (oldMax - newMax) from InflightConsumedCapacity.
+	for deviceID, oldConsumedByDevice := range oldMax {
+		for name, oldQty := range oldConsumedByDevice {
+			delta := oldQty.DeepCopy()
+			if newConsumedByDevice, ok := newMax[deviceID]; ok {
+				if newQty, ok := newConsumedByDevice[name]; ok {
+					delta.Sub(newQty)
+				}
+			}
+			if delta.Sign() > 0 {
+				inflight := at.InflightConsumedCapacity[deviceID]
+				if inflight == nil {
+					continue
+				}
+				existing := inflight[name]
+				existing.Sub(delta)
+				inflight[name] = existing
+				if existing.Sign() <= 0 {
+					delete(inflight, name)
+				}
+				if len(inflight) == 0 {
+					delete(at.InflightConsumedCapacity, deviceID)
+				}
+			}
+		}
+	}
+
+	if len(storedConsumedCapacityByIT) == 0 {
+		delete(at.consumedCapacityByNodeClaimIT, nodeClaimID)
+	}
+}
+
+// releaseTemplateCapacity removes template capacity state for pruned instance types.
+func (at *AllocationTracker) releaseTemplateCapacity(nodeClaimID NodeClaimID, releasedITs []InstanceTypeID) {
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		return
+	}
+	for _, itID := range releasedITs {
+		delete(consumedByIT, itID)
+	}
+	if len(consumedByIT) == 0 {
+		delete(at.templateConsumedCapacity, nodeClaimID)
+	}
+}
+
+// InitTemplateRemainingCapacity initializes the template consumed capacity state for a
+// (NodeClaim, IT) pair. Subsequent calls for the same (NC, IT) are no-ops.
+func (at *AllocationTracker) InitTemplateRemainingCapacity(nodeClaimID NodeClaimID, itID InstanceTypeID) {
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		consumedByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+		at.templateConsumedCapacity[nodeClaimID] = consumedByIT
+	}
+	if _, ok := consumedByIT[itID]; ok {
+		return
+	}
+	consumedByIT[itID] = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+}
+
+// TemplateRemainingCapacityForIT returns the template consumed capacity for the given
+// (NodeClaim, IT) pair. Returns nil if not yet initialized.
+func (at *AllocationTracker) TemplateRemainingCapacityForIT(nodeClaimID NodeClaimID, itID InstanceTypeID) map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity {
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		return nil
+	}
+	return consumedByIT[itID]
+}
+
+// pessimisticCapacityMax computes the maximum consumed capacity per device per dimension across all ITs.
+func pessimisticCapacityMax(capacityByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity {
+	if len(capacityByIT) == 0 {
+		return nil
+	}
+	maxByDevice := make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+	for _, devices := range capacityByIT {
+		for deviceID, consumedByDevice := range devices {
+			maxConsumedByDevice, ok := maxByDevice[deviceID]
+			if !ok {
+				maxConsumedByDevice = make(map[resourcev1.QualifiedName]resource.Quantity, len(consumedByDevice))
+				maxByDevice[deviceID] = maxConsumedByDevice
+			}
+			for name, qty := range consumedByDevice {
+				if existing, ok := maxConsumedByDevice[name]; !ok || qty.Cmp(existing) > 0 {
+					maxConsumedByDevice[name] = qty.DeepCopy()
+				}
+			}
+		}
+	}
+	return maxByDevice
+}
+
 // computeConsumedCapacity computes the consumed capacity for all dimensions on a device given
 // the request's capacity requirements. Returns nil if the device has no capacity dimensions.
 // Returns an error if a requested dimension doesn't exist on the device or violates policy.
