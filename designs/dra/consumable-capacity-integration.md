@@ -907,7 +907,7 @@ Pure computation layer — no state machines, no integration with DFS yet.
 
 Equivalent to: *core types* (foundational types and logic that request validation and the allocator build on).
 
-### Commit 4: Request Validation
+### Commit 4: Request Validation ✓
 
 Parsing layer — transforms API objects into allocator-internal representations.
 
@@ -949,7 +949,7 @@ Commit 1: Device Model ✓
   ├──→ Commit 3: Core Types & Verification ✓
   │       │
   │       ▼
-  ├──→ Commit 4: Request Validation
+  ├──→ Commit 4: Request Validation ✓
   │       │
   │       ▼
   ├──→ Commit 5: Allocator Integration (depends on 2, 3, 4)
