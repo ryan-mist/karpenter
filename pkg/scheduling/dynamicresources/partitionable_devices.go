@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicresources
 
 import (
+	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -221,13 +222,15 @@ func (at *AllocationTracker) InitRemainingCounters(pool *Pool) {
 	}
 	// Deduct consumption from preallocated devices.
 	for i := range pool.Devices {
-		if !at.PreallocatedDevices.Has(pool.Devices[i].ID) {
+		if !at.PreallocatedDevices.Has(pool.Devices[i].ID) &&
+			!lo.HasKey(at.PreallocatedConsumedCapacity, pool.Devices[i].ID) {
 			continue
 		}
 		deductFromCounters(remainingCounterSets, pool.Devices[i].Device)
 	}
 	for i := range pool.NonTargetingDevices {
-		if !at.PreallocatedDevices.Has(pool.NonTargetingDevices[i].ID) {
+		if !at.PreallocatedDevices.Has(pool.NonTargetingDevices[i].ID) &&
+			!lo.HasKey(at.PreallocatedConsumedCapacity, pool.NonTargetingDevices[i].ID) {
 			continue
 		}
 		deductFromCounters(remainingCounterSets, pool.NonTargetingDevices[i].Device)
