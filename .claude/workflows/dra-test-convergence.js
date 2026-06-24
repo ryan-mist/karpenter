@@ -24,11 +24,32 @@ const MAX_ROUNDS = args?.maxRounds || 3
 // Pass as args.commit (a SHA, short SHA, or range like "abc123..def456").
 // When set, agents only generate/validate tests for changed code paths in that diff.
 const COMMIT = args?.commit || null
+// Optional: scope tests to uncommitted changes (staged + unstaged).
+// Pass as args.uncommitted = true to use `git diff HEAD` as the scope.
+// This enables testing code-in-progress before committing.
+const UNCOMMITTED = args?.uncommitted || false
 
-// If a commit is specified, build scoping context for prompts.
-// The SCOPE_CONTEXT variable is injected into all agent prompts to restrict coverage.
+// Build scoping context for prompts based on commit or uncommitted mode.
 let SCOPE_CONTEXT = ''
-if (COMMIT) {
+if (UNCOMMITTED) {
+  SCOPE_CONTEXT = `
+## SCOPE RESTRICTION — CRITICAL
+
+You are testing ONLY the UNCOMMITTED changes (staged + unstaged working tree modifications).
+
+Before doing anything else, run this command to see the exact diff:
+\`\`\`bash
+cd ${IMPL_ROOT} && git diff HEAD -- ${TARGET}
+\`\`\`
+
+**Rules when scoped to uncommitted changes:**
+1. ONLY generate tests for code paths that were ADDED or MODIFIED in the diff output.
+2. Do NOT generate tests for pre-existing code that was not touched.
+3. If the diff adds a new function, test that function. If it modifies an existing function, test the modified behavior.
+4. Use the surrounding context (unchanged lines) only to understand HOW to call the changed code — not as a test target.
+5. Validators: only flag gaps in coverage of the CHANGED code. Pre-existing untested code is out of scope.
+`
+} else if (COMMIT) {
   SCOPE_CONTEXT = `
 ## SCOPE RESTRICTION — CRITICAL
 
@@ -258,7 +279,9 @@ const VALIDATION_SCHEMA = {
 
 // Phase 1: Generate initial tests
 phase('Generate')
-if (COMMIT) {
+if (UNCOMMITTED) {
+  log(`Generating tests for ${TARGET} scoped to uncommitted changes (impl: ${IMPL_ROOT})`)
+} else if (COMMIT) {
   log(`Generating tests for ${TARGET} scoped to commit ${COMMIT} (impl: ${IMPL_ROOT})`)
 } else {
   log(`Generating tests for ${TARGET} — full file (impl: ${IMPL_ROOT}, design: ${DESIGN_ROOT})`)
