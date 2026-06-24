@@ -135,16 +135,16 @@ type AllocatedDeviceState struct {
 }
 
 // NewAllocator constructs an Allocator for a single scheduling loop.
-// allocatedDevices contains the set of in-cluster devices that are already allocated;
-// these are converted internally to the scheduling DeviceID type.
+// allocatedState contains the set of in-cluster devices that are already allocated
+// (exclusive devices and multi-allocatable device consumed capacity).
 func NewAllocator(
 	inClusterSlices []ResourceSlice,
-	allocatedDevices sets.Set[cloudprovider.DeviceID],
+	allocatedState AllocatedDeviceState,
 	attributeBindings AttributeBindings,
 	kubeClient client.Client,
 ) *Allocator {
 	return &Allocator{
-		allocationTracker:       NewAllocationTracker(allocatedDevices.UnsortedList()...),
+		allocationTracker:       NewAllocationTracker(allocatedState),
 		attributeBindings:       attributeBindings,
 		kubeClient:              kubeClient,
 		inClusterSlices:         inClusterSlices,
@@ -191,6 +191,12 @@ type allocation struct {
 	// templateCounterConsumptionByIT holds per-IT template counter deductions from this allocation.
 	// Subtracted from the tracker's remaining budget on Commit(); the entry is deleted on Release.
 	templateCounterConsumptionByIT map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter
+	// capacityConsumptionByIT holds per-IT consumed capacity for in-cluster multi-allocatable devices.
+	// Stored in the tracker on Commit() using the same pessimistic-max pattern as counters.
+	capacityConsumptionByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+	// templateCapacityConsumptionByIT holds per-IT consumed capacity for template multi-allocatable
+	// devices. Subtracted from the tracker's remaining budget on Commit().
+	templateCapacityConsumptionByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
 }
 
 func (a *allocation) Commit(ctx context.Context) {
@@ -336,6 +342,8 @@ func (a *Allocator) Allocate(
 		allocatedDevices:           sets.New[DeviceID](),
 		allocatingCounters:         make(map[PoolKey]map[string]map[string]resourcev1.Counter),
 		templateAllocatingCounters: make(map[PoolKey]map[string]map[string]resourcev1.Counter),
+		allocatingCapacity:         make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
+		templateAllocatingCapacity: make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
 		deviceMatchesRequest:       make(map[matchKey]bool),
 		requirements:               classifyRes.requirements,
 	}
@@ -450,6 +458,14 @@ type allocator struct {
 	// current IT (not shared across NodeClaims), so they live on the child allocator rather than the tracker.
 	templateRemainingCounters map[PoolKey]map[string]map[string]resourcev1.Counter
 
+	// allocatingCapacity tracks consumed capacity for in-cluster multi-allocatable devices tentatively
+	// allocated in the current DFS. Reset per-IT via restoreState(). Map: deviceID → dimensionName → consumed quantity.
+	allocatingCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+	// templateAllocatingCapacity tracks consumed capacity for template multi-allocatable devices
+	// tentatively allocated in the current DFS. Separated from allocatingCapacity to prevent
+	// cross-contamination when template and in-cluster pools share the same device names.
+	templateAllocatingCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+
 	// requirements are the topology requirements that are incrementally built up by the DFS. Each time an in-cluster
 	// device with topology requirements is allocated, those requirements are added to these requirements. These are
 	// restored during backtracking from the snapshots.
@@ -494,6 +510,10 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 	counterConsumptionByIT := make(map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter)
 	// templateCounterConsumptionByIT tracks template counter deductions per-IT for cross-pod tracking.
 	templateCounterConsumptionByIT := make(map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter)
+	// capacityConsumptionByIT tracks per-IT consumed capacity for in-cluster multi-allocatable devices.
+	capacityConsumptionByIT := make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+	// templateCapacityConsumptionByIT tracks per-IT consumed capacity for template multi-allocatable devices.
+	templateCapacityConsumptionByIT := make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
 
 	// Snapshot initial state for restoration between IT attempts.
 	initialPools := a.pools
@@ -536,9 +556,13 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 			survivingITs = append(survivingITs, itID)
 			counterConsumptionByIT[itID] = a.allocatingCounters
 			templateCounterConsumptionByIT[itID] = a.templateAllocatingCounters
+			capacityConsumptionByIT[itID] = a.allocatingCapacity
+			templateCapacityConsumptionByIT[itID] = a.templateAllocatingCapacity
 			// Definsive nils to prevents future regressions where allocatingCounters / templateAllocatingCounters is re-used
 			a.allocatingCounters = nil
 			a.templateAllocatingCounters = nil
+			a.allocatingCapacity = nil
+			a.templateAllocatingCapacity = nil
 
 			deviceIDsByIT[itID] = make([]DeviceID, len(a.allocatedDevicesMetadata))
 			itReqs := scheduling.NewRequirements()
@@ -597,13 +621,15 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 		InstanceTypes: survivingITs,
 		Requirements:  nodeClaimRequirements,
 		Allocation: &allocation{
-			allocator:                      a.Allocator,
-			nodeClaimID:                    a.nodeClaim.ID(),
-			deviceIDsByIT:                  deviceIDsByIT,
-			filteredPools:                  FilterPools(initialPools, a.requirements),
-			claimMetadata:                  claimAllocMetaByRC,
-			counterConsumptionByIT:         counterConsumptionByIT,
-			templateCounterConsumptionByIT: templateCounterConsumptionByIT,
+			allocator:                       a.Allocator,
+			nodeClaimID:                     a.nodeClaim.ID(),
+			deviceIDsByIT:                   deviceIDsByIT,
+			filteredPools:                   FilterPools(initialPools, a.requirements),
+			claimMetadata:                   claimAllocMetaByRC,
+			counterConsumptionByIT:          counterConsumptionByIT,
+			templateCounterConsumptionByIT:  templateCounterConsumptionByIT,
+			capacityConsumptionByIT:         capacityConsumptionByIT,
+			templateCapacityConsumptionByIT: templateCapacityConsumptionByIT,
 		},
 	}, nil
 }
@@ -826,6 +852,8 @@ func (a *allocator) restoreState(pools []*Pool) {
 	a.allocatingCounters = make(map[PoolKey]map[string]map[string]resourcev1.Counter)
 	a.templateAllocatingCounters = make(map[PoolKey]map[string]map[string]resourcev1.Counter)
 	a.templateRemainingCounters = a.buildTemplateCounters()
+	a.allocatingCapacity = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+	a.templateAllocatingCapacity = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
 	a.snapshots = nil
 	for _, cd := range a.claimData {
 		for _, c := range cd.Constraints {

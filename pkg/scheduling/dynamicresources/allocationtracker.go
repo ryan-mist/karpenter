@@ -21,6 +21,7 @@ import (
 
 	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -37,6 +38,11 @@ type AllocationTracker struct {
 	// after set during Allocator construction.
 	PreallocatedDevices sets.Set[DeviceID]
 
+	// PreallocatedConsumedCapacity holds the aggregated consumed capacity for multi-allocatable devices
+	// from existing cluster allocations. Multi-allocatable devices appear here instead of PreallocatedDevices.
+	// Immutable after construction. Map: deviceID → dimensionName → consumed quantity.
+	PreallocatedConsumedCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+
 	// InflightClusterAllocations contains the allocation metadata by device for a given device ID. Note that entries in
 	// this structure are not immutable - as instance types are released by NodeClaims, devices also have the potential to
 	// be released and removed from the map.
@@ -48,6 +54,21 @@ type AllocationTracker struct {
 	InflightClusterAllocationsByNodeClaim map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]
 
 	InflightTemplateAllocations map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]
+
+	// InflightConsumedCapacity tracks consumed capacity committed by earlier pods in this scheduling loop
+	// for multi-allocatable devices. Updated via commitCapacity/releaseCapacity using the same pessimistic-max
+	// pattern as SharedCounters but keyed per-device rather than per-pool.
+	// Map: deviceID → dimensionName → consumed quantity.
+	InflightConsumedCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+	// consumedCapacityByNodeClaimIT stores per-NodeClaim per-IT capacity consumption for precise release.
+	// Map: nodeClaimID → instanceTypeID → deviceID → dimensionName → consumed quantity.
+	consumedCapacityByNodeClaimIT map[NodeClaimID]map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
+
+	// templateConsumedCapacity tracks consumed capacity for multi-allocatable template devices
+	// per (NodeClaim, IT). Each IT has its own independent device set (no pessimistic-max needed).
+	// Sparse — only devices with actual cross-pod consumption get entries. Incremented on Commit.
+	// Map: nodeClaimID → instanceTypeID → deviceID → dimensionName → consumed quantity.
+	templateConsumedCapacity map[NodeClaimID]map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
 
 	// RemainingCounters tracks the remaining counter budgets per pool. Initialized lazily per pool
 	// (total - preallocated consumption), then decremented on Commit and incremented on Release.
@@ -66,21 +87,29 @@ type AllocationTracker struct {
 	templateRemainingCounters map[NodeClaimID]map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter
 }
 
-func NewAllocationTracker(preallocatedDevices ...cloudprovider.DeviceID) *AllocationTracker {
-	converted := make(sets.Set[DeviceID], len(preallocatedDevices))
-	for i := range preallocatedDevices {
-		converted.Insert(DeviceID{
-			DeviceID: preallocatedDevices[i],
+func NewAllocationTracker(allocatedState AllocatedDeviceState) *AllocationTracker {
+	preallocatedDevices := make(sets.Set[DeviceID], len(allocatedState.ExclusiveDevices))
+	for id := range allocatedState.ExclusiveDevices {
+		preallocatedDevices.Insert(DeviceID{
+			DeviceID: id,
 		})
 	}
+	preallocatedCapacity := make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity, len(allocatedState.ConsumedCapacity))
+	for id, capacity := range allocatedState.ConsumedCapacity {
+		preallocatedCapacity[DeviceID{DeviceID: id}] = capacity
+	}
 	return &AllocationTracker{
-		PreallocatedDevices:                   converted,
+		PreallocatedDevices:                   preallocatedDevices,
+		PreallocatedConsumedCapacity:          preallocatedCapacity,
 		InflightClusterAllocations:            make(map[DeviceID]*InflightAllocationMetadata),
 		InflightClusterAllocationsByNodeClaim: make(map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]),
 		InflightTemplateAllocations:           make(map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]),
+		InflightConsumedCapacity:              make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
+		consumedCapacityByNodeClaimIT:         make(map[NodeClaimID]map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
 		RemainingCounters:                     make(map[PoolKey]map[string]map[string]resourcev1.Counter),
 		countersByNodeClaimIT:                 make(map[NodeClaimID]map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter),
 		templateRemainingCounters:             make(map[NodeClaimID]map[InstanceTypeID]map[PoolKey]map[string]map[string]resourcev1.Counter),
+		templateConsumedCapacity:              make(map[NodeClaimID]map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
 	}
 }
 
@@ -100,6 +129,10 @@ func (at *AllocationTracker) Commit(alloc *allocation) {
 		for _, id := range deviceIDs {
 			if id.Template {
 				at.insertAllocation(at.InflightTemplateAllocations, id, alloc.nodeClaimID, it)
+				continue
+			}
+			// Multi-allocatable devices are tracked via capacity, not binary allocation.
+			if _, isMultiAlloc := at.PreallocatedConsumedCapacity[id]; isMultiAlloc {
 				continue
 			}
 			at.insertAllocation(at.InflightClusterAllocationsByNodeClaim, id, alloc.nodeClaimID, it)
@@ -125,6 +158,8 @@ func (at *AllocationTracker) Commit(alloc *allocation) {
 	}
 	at.commitCounters(alloc.nodeClaimID, alloc.counterConsumptionByIT)
 	at.commitTemplateCounters(alloc.nodeClaimID, alloc.templateCounterConsumptionByIT)
+	at.commitCapacity(alloc.nodeClaimID, alloc.capacityConsumptionByIT)
+	at.commitTemplateCapacity(alloc.nodeClaimID, alloc.templateCapacityConsumptionByIT)
 }
 
 func (at *AllocationTracker) insertAllocation(
@@ -263,6 +298,96 @@ func subtractDeltaFromRemaining(remaining map[PoolKey]map[string]map[string]reso
 	}
 }
 
+// commitCapacity stores per-IT capacity consumption and increments InflightConsumedCapacity by
+// the delta between the new pessimistic max and the old one.
+func (at *AllocationTracker) commitCapacity(nodeClaimID NodeClaimID, newCapacityByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) {
+	if len(newCapacityByIT) == 0 {
+		return
+	}
+	storedConsumedCapacityByIT, ok := at.consumedCapacityByNodeClaimIT[nodeClaimID]
+	if !ok {
+		storedConsumedCapacityByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+		at.consumedCapacityByNodeClaimIT[nodeClaimID] = storedConsumedCapacityByIT
+	}
+
+	oldMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Merge new consumption into stored state.
+	for it, deviceCapacity := range newCapacityByIT {
+		storedDevices, ok := storedConsumedCapacityByIT[it]
+		if !ok {
+			storedConsumedCapacityByIT[it] = deviceCapacity
+			continue
+		}
+		for deviceID, consumedByDevice := range deviceCapacity {
+			storedConsumedByDevice, ok := storedDevices[deviceID]
+			if !ok {
+				storedDevices[deviceID] = consumedByDevice
+				continue
+			}
+			for name, qty := range consumedByDevice {
+				existing := storedConsumedByDevice[name]
+				existing.Add(qty)
+				storedConsumedByDevice[name] = existing
+			}
+		}
+	}
+
+	newMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Add the delta (newMax - oldMax) to InflightConsumedCapacity.
+	for deviceID, newConsumedByDevice := range newMax {
+		for name, newQty := range newConsumedByDevice {
+			delta := newQty.DeepCopy()
+			if oldConsumedByDevice, ok := oldMax[deviceID]; ok {
+				if oldQty, ok := oldConsumedByDevice[name]; ok {
+					delta.Sub(oldQty)
+				}
+			}
+			if delta.Sign() > 0 {
+				if at.InflightConsumedCapacity[deviceID] == nil {
+					at.InflightConsumedCapacity[deviceID] = make(map[resourcev1.QualifiedName]resource.Quantity)
+				}
+				existing := at.InflightConsumedCapacity[deviceID][name]
+				existing.Add(delta)
+				at.InflightConsumedCapacity[deviceID][name] = existing
+			}
+		}
+	}
+}
+
+// commitTemplateCapacity adds per-IT template capacity consumption to the tracker's consumed state.
+// Template capacity doesn't need pessimistic-max treatment — each IT has its own independent device set.
+func (at *AllocationTracker) commitTemplateCapacity(nodeClaimID NodeClaimID, consumptionByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) {
+	if len(consumptionByIT) == 0 {
+		return
+	}
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		consumedByIT = make(map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+		at.templateConsumedCapacity[nodeClaimID] = consumedByIT
+	}
+	for itID, devices := range consumptionByIT {
+		consumedDevices, ok := consumedByIT[itID]
+		if !ok {
+			consumedByIT[itID] = devices
+			continue
+		}
+		for deviceID, consumedByDevice := range devices {
+			storedConsumedByDevice, ok := consumedDevices[deviceID]
+			if !ok {
+				consumedDevices[deviceID] = consumedByDevice
+				continue
+			}
+			for name, qty := range consumedByDevice {
+				existing := storedConsumedByDevice[name]
+				existing.Add(qty)
+				storedConsumedByDevice[name] = existing
+			}
+		}
+	}
+}
+
 func (at *AllocationTracker) ReleaseInstanceTypes(ctx context.Context, nodeClaim NodeClaimID, instanceTypes ...InstanceTypeID) {
 	released := make(map[InstanceTypeID]sets.Set[DeviceID])
 	for _, instanceType := range instanceTypes {
@@ -286,6 +411,8 @@ func (at *AllocationTracker) ReleaseInstanceTypes(ctx context.Context, nodeClaim
 	}
 	at.releaseCounters(nodeClaim, instanceTypes)
 	at.releaseTemplateCounters(nodeClaim, instanceTypes)
+	at.releaseCapacity(nodeClaim, instanceTypes)
+	at.releaseTemplateCapacity(nodeClaim, instanceTypes)
 
 	if len(released) != 0 && log.FromContext(ctx).V(1).Enabled() {
 		log.FromContext(ctx).V(1).Info("releasing allocations", "nodeClaimID", nodeClaim.Value(), "devicesByInstanceType", lo.MapEntries(released, func(it InstanceTypeID, ids sets.Set[DeviceID]) (string, []string) {
@@ -333,6 +460,68 @@ func (at *AllocationTracker) releaseTemplateCounters(nodeClaimID NodeClaimID, re
 	}
 }
 
+// releaseCapacity adjusts InflightConsumedCapacity when instance types are pruned. Recomputes
+// the pessimistic max from remaining ITs and subtracts the delta.
+func (at *AllocationTracker) releaseCapacity(nodeClaimID NodeClaimID, releasedITs []InstanceTypeID) {
+	storedConsumedCapacityByIT, ok := at.consumedCapacityByNodeClaimIT[nodeClaimID]
+	if !ok {
+		return
+	}
+
+	oldMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	for _, itID := range releasedITs {
+		delete(storedConsumedCapacityByIT, itID)
+	}
+
+	newMax := pessimisticCapacityMax(storedConsumedCapacityByIT)
+
+	// Subtract the delta (oldMax - newMax) from InflightConsumedCapacity.
+	for deviceID, oldConsumedByDevice := range oldMax {
+		for name, oldQty := range oldConsumedByDevice {
+			delta := oldQty.DeepCopy()
+			if newConsumedByDevice, ok := newMax[deviceID]; ok {
+				if newQty, ok := newConsumedByDevice[name]; ok {
+					delta.Sub(newQty)
+				}
+			}
+			if delta.Sign() > 0 {
+				inflight := at.InflightConsumedCapacity[deviceID]
+				if inflight == nil {
+					continue
+				}
+				existing := inflight[name]
+				existing.Sub(delta)
+				inflight[name] = existing
+				if existing.Sign() <= 0 {
+					delete(inflight, name)
+				}
+				if len(inflight) == 0 {
+					delete(at.InflightConsumedCapacity, deviceID)
+				}
+			}
+		}
+	}
+
+	if len(storedConsumedCapacityByIT) == 0 {
+		delete(at.consumedCapacityByNodeClaimIT, nodeClaimID)
+	}
+}
+
+// releaseTemplateCapacity removes template capacity state for pruned instance types.
+func (at *AllocationTracker) releaseTemplateCapacity(nodeClaimID NodeClaimID, releasedITs []InstanceTypeID) {
+	consumedByIT, ok := at.templateConsumedCapacity[nodeClaimID]
+	if !ok {
+		return
+	}
+	for _, itID := range releasedITs {
+		delete(consumedByIT, itID)
+	}
+	if len(consumedByIT) == 0 {
+		delete(at.templateConsumedCapacity, nodeClaimID)
+	}
+}
+
 // addDeltaToRemaining adds (oldCounterMax - newCounterMax) back to remaining counters.
 func addDeltaToRemaining(remaining map[PoolKey]map[string]map[string]resourcev1.Counter, oldCounterMax, newCounterMax map[PoolKey]map[string]map[string]resourcev1.Counter) {
 	for poolKey, oldCounterSets := range oldCounterMax {
@@ -375,6 +564,12 @@ func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim,
 		if instanceTypeAllocs.Has(deviceID) {
 			return true
 		}
+		return false
+	}
+
+	// Multi-allocatable devices are never "fully allocated" from a binary standpoint.
+	// The capacity check in tryDevice determines whether the device can accept the new allocation.
+	if _, isMultiAlloc := at.PreallocatedConsumedCapacity[deviceID]; isMultiAlloc {
 		return false
 	}
 
@@ -522,4 +717,27 @@ func getCounter(m map[PoolKey]map[string]map[string]resourcev1.Counter, pool Poo
 	}
 	c, ok := counters[name]
 	return c, ok
+}
+
+// pessimisticCapacityMax computes the maximum consumed capacity per device per dimension across all ITs.
+func pessimisticCapacityMax(capacityByIT map[InstanceTypeID]map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity) map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity {
+	if len(capacityByIT) == 0 {
+		return nil
+	}
+	maxByDevice := make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
+	for _, devices := range capacityByIT {
+		for deviceID, consumedByDevice := range devices {
+			maxConsumedByDevice, ok := maxByDevice[deviceID]
+			if !ok {
+				maxConsumedByDevice = make(map[resourcev1.QualifiedName]resource.Quantity, len(consumedByDevice))
+				maxByDevice[deviceID] = maxConsumedByDevice
+			}
+			for name, qty := range consumedByDevice {
+				if existing, ok := maxConsumedByDevice[name]; !ok || qty.Cmp(existing) > 0 {
+					maxConsumedByDevice[name] = qty.DeepCopy()
+				}
+			}
+		}
+	}
+	return maxByDevice
 }
