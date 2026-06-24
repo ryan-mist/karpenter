@@ -895,7 +895,7 @@ Completes the data ingestion layer — makes consumed capacity from existing clu
 
 Equivalent to: *attribute binding + pool generation* (data flows into the allocator before it can reason about capacity).
 
-### Commit 3: Core Types & Verification Logic
+### Commit 3: Core Types & Verification Logic ✓
 
 Pure computation layer — no state machines, no integration with DFS yet.
 
@@ -946,7 +946,7 @@ Commit 1: Device Model ✓
   ├──→ Commit 2: Controller Changes ✓
   │       │
   │       ▼
-  ├──→ Commit 3: Core Types & Verification
+  ├──→ Commit 3: Core Types & Verification ✓
   │       │
   │       ▼
   ├──→ Commit 4: Request Validation
