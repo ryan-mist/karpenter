@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicresources_test
 
 import (
+	"fmt"
 	"unique"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -209,6 +210,19 @@ func exactRequestWithSelector(name, className string, count int64, expr string) 
 			Count:           count,
 			Selectors: []resourcev1.DeviceSelector{
 				{CEL: &resourcev1.CELDeviceSelector{Expression: expr}},
+			},
+		},
+	}
+}
+
+func exactRequestWithCapacity(name, className string, count int64, capacityRequests map[resourcev1.QualifiedName]resource.Quantity) resourcev1.DeviceRequest {
+	return resourcev1.DeviceRequest{
+		Name: name,
+		Exactly: &resourcev1.ExactDeviceRequest{
+			DeviceClassName: className,
+			Count:           count,
+			Capacity: &resourcev1.CapacityRequirements{
+				Requests: capacityRequests,
 			},
 		},
 	}
@@ -5251,6 +5265,792 @@ var _ = Describe("Allocator", func() {
 			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim1})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).ToNot(BeNil())
+		})
+	})
+
+	Describe("Consumable capacity — DFS capacity-gated allocation", func() {
+		It("should allocate a multi-alloc device with capacity and record ConsumedCapacity in metadata", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			Expect(meta.Devices).To(HaveKey(unique.Make("it-1")))
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(1))
+			Expect(allocResults[0].DeviceID.Device.Value()).To(Equal("gpu-0"))
+			Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+				resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("16Gi"),
+			))
+		})
+
+		It("should block allocation when multi-alloc device capacity is exhausted", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {
+						"gpu.example.com/vram": resource.MustParse("70Gi"),
+					},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should deduct capacity within a single DFS when multiple slots request the same multi-alloc device", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("32Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1",
+				exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("16Gi"),
+				}),
+				exactRequestWithCapacity("req-2", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("16Gi"),
+				}),
+			)
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(2))
+			Expect(allocResults[0].DeviceID.Device.Value()).To(Equal("gpu-0"))
+			Expect(allocResults[1].DeviceID.Device.Value()).To(Equal("gpu-0"))
+			Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+				resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("16Gi"),
+			))
+			Expect(allocResults[1].ConsumedCapacity).To(HaveKeyWithValue(
+				resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("16Gi"),
+			))
+		})
+
+		It("should fail when intra-DFS capacity deduction exceeds device capacity", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("24Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1",
+				exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("16Gi"),
+				}),
+				exactRequestWithCapacity("req-2", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("16Gi"),
+				}),
+			)
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should restore capacity on backtrack and find alternative devices", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices,
+							resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+								},
+							},
+							resourcev1.Device{
+								Name:                     "gpu-1",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {Value: resource.MustParse("40Gi")},
+								},
+							},
+						)
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					deviceID("gpu.example.com", "pool-a", "gpu-1").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1",
+				exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("20Gi"),
+				}),
+				exactRequestWithCapacity("req-2", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("20Gi"),
+				}),
+			)
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(2))
+		})
+
+		It("should have nil ConsumedCapacity for exclusive (non-multi-alloc) devices", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices("gpu-0")),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(1))
+			Expect(allocResults[0].DeviceID.Device.Value()).To(Equal("gpu-0"))
+			Expect(allocResults[0].ConsumedCapacity).To(BeNil())
+		})
+
+		It("should accumulate capacity across sequential Allocate+Commit calls for the same multi-alloc device", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("48Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			// First allocation: 16Gi
+			nc1 := makeNodeClaimWithID("nc-1", "it-1")
+			claim1 := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			r1, err := alloc.Allocate(ctx, nc1, []*resourcev1.ResourceClaim{claim1})
+			Expect(err).ToNot(HaveOccurred())
+			r1.Allocation.Commit(ctx)
+
+			// Second allocation: 16Gi (remaining: 16Gi)
+			nc2 := makeNodeClaimWithID("nc-2", "it-1")
+			claim2 := makeClaim("c2", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			r2, err := alloc.Allocate(ctx, nc2, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			r2.Allocation.Commit(ctx)
+
+			// Third allocation: 16Gi (remaining: 0Gi)
+			nc3 := makeNodeClaimWithID("nc-3", "it-1")
+			claim3 := makeClaim("c3", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			r3, err := alloc.Allocate(ctx, nc3, []*resourcev1.ResourceClaim{claim3})
+			Expect(err).ToNot(HaveOccurred())
+			r3.Allocation.Commit(ctx)
+
+			// Fourth allocation should fail (capacity exhausted)
+			nc4 := makeNodeClaimWithID("nc-4", "it-1")
+			claim4 := makeClaim("c4", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("1Gi"),
+			}))
+			_, err = alloc.Allocate(ctx, nc4, []*resourcev1.ResourceClaim{claim4})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should consume full device capacity when no explicit capacity request is made on a multi-alloc device", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
+			r1, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			r1.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(1))
+			Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+				resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("80Gi"),
+			))
+
+			// Second allocation should fail (full capacity consumed)
+			nc2 := makeNodeClaimWithID("nc-2", "it-1")
+			_, err = alloc.Allocate(ctx, nc2, []*resourcev1.ResourceClaim{makeClaim("c2", exactRequest("req-1", "gpu", 1))})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should track capacity independently across ITs", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+							},
+						})
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaimWithID("nc-a", "it-a", "it-b")
+			claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.InstanceTypes).To(HaveLen(2))
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			for _, itName := range []string{"it-a", "it-b"} {
+				itResults := meta.Devices[unique.Make(itName)]
+				Expect(itResults).To(HaveLen(1))
+				Expect(itResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("16Gi"),
+				))
+			}
+		})
+
+		It("should skip a device when request references a non-existent capacity dimension", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices,
+							resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+								},
+							},
+							resourcev1.Device{
+								Name:                     "gpu-1",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/bandwidth": {Value: resource.MustParse("100Gi")},
+								},
+							},
+						)
+					},
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					deviceID("gpu.example.com", "pool-a", "gpu-1").DeviceID: {},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/bandwidth": resource.MustParse("50Gi"),
+			}))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			allocResults := meta.Devices[unique.Make("it-1")]
+			Expect(allocResults).To(HaveLen(1))
+			Expect(allocResults[0].DeviceID.Device.Value()).To(Equal("gpu-1"))
+		})
+
+		It("should allow cross-NodeClaim sharing of a fresh multi-alloc device via inflight capacity tracking", func() {
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1),
+					func(s *resourcev1.ResourceSlice) {
+						s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+							Name:                     "gpu-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("80Gi")},
+							},
+						})
+					},
+				),
+			}
+			// NOT seeding ConsumedCapacity — fresh device discovered during allocation.
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+			}, nil, env.Client)
+
+			// NC-A allocates 16Gi
+			ncA := makeNodeClaimWithID("nc-a", "it-1")
+			claim1 := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			r1, err := alloc.Allocate(ctx, ncA, []*resourcev1.ResourceClaim{claim1})
+			Expect(err).ToNot(HaveOccurred())
+			r1.Allocation.Commit(ctx)
+
+			// NC-B can still allocate the same device
+			ncB := makeNodeClaimWithID("nc-b", "it-1")
+			claim2 := makeClaim("c2", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("16Gi"),
+			}))
+			r2, err := alloc.Allocate(ctx, ncB, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			r2.Allocation.Commit(ctx)
+
+			// Exceeding remaining capacity (80 - 16 - 16 = 48 remaining) should fail
+			ncC := makeNodeClaimWithID("nc-c", "it-1")
+			claim3 := makeClaim("c3", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("49Gi"),
+			}))
+			_, err = alloc.Allocate(ctx, ncC, []*resourcev1.ResourceClaim{claim3})
+			Expect(err).To(HaveOccurred())
+
+			// Exactly 48Gi should succeed
+			ncD := makeNodeClaimWithID("nc-d", "it-1")
+			claim4 := makeClaim("c4", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("48Gi"),
+			}))
+			r4, err := alloc.Allocate(ctx, ncD, []*resourcev1.ResourceClaim{claim4})
+			Expect(err).ToNot(HaveOccurred())
+			r4.Allocation.Commit(ctx)
+		})
+
+		It("should handle template multi-alloc devices with capacity constraints", func() {
+			alloc = dynamicresources.NewAllocator(nil, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+			}, nil, env.Client)
+
+			nc := makeNodeClaimWithTemplatesAndID("nc-a", "it-1",
+				&cloudprovider.ResourceSliceTemplate{
+					Driver: unique.Make("gpu.example.com"),
+					Pool:   cloudprovider.ResourcePool{Name: unique.Make("pool-tmpl")},
+					Devices: []cloudprovider.Device{
+						{
+							Name:                    unique.Make("tgpu-0"),
+							AllowMultipleAllocations: true,
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("40Gi")},
+							},
+						},
+					},
+				},
+			)
+
+			// First pod: 20Gi
+			claim1 := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("20Gi"),
+			}))
+			r1, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim1})
+			Expect(err).ToNot(HaveOccurred())
+			r1.Allocation.Commit(ctx)
+
+			// Second pod: 20Gi (remaining: 0)
+			claim2 := makeClaim("c2", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("20Gi"),
+			}))
+			r2, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			r2.Allocation.Commit(ctx)
+
+			// Third pod should fail (no capacity left)
+			claim3 := makeClaim("c3", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+				"gpu.example.com/vram": resource.MustParse("1Gi"),
+			}))
+			_, err = alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim3})
+			Expect(err).To(HaveOccurred())
+		})
+
+		Context("RequestPolicy integration", func() {
+			It("should use RequestPolicy.Default when no capacity request is specified", func() {
+				inClusterSlices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+						withGeneration(1, 1),
+						func(s *resourcev1.ResourceSlice) {
+							s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {
+										Value: resource.MustParse("80Gi"),
+										RequestPolicy: &resourcev1.CapacityRequestPolicy{
+											Default: ptr.To(resource.MustParse("8Gi")),
+										},
+									},
+								},
+							})
+						},
+					),
+				}
+				alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+					ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+					ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+						deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					},
+				}, nil, env.Client)
+
+				// Allocate 10 times (10 * 8Gi = 80Gi = full capacity)
+				for i := range 10 {
+					nc := makeNodeClaimWithID(fmt.Sprintf("nc-%d", i), "it-1")
+					claim := makeClaim(fmt.Sprintf("c%d", i), exactRequest("req-1", "gpu", 1))
+					r, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+					Expect(err).ToNot(HaveOccurred(), "allocation %d should succeed", i)
+					r.Allocation.Commit(ctx)
+				}
+
+				// 11th allocation should fail
+				nc11 := makeNodeClaimWithID("nc-10", "it-1")
+				_, err := alloc.Allocate(ctx, nc11, []*resourcev1.ResourceClaim{makeClaim("c10", exactRequest("req-1", "gpu", 1))})
+				Expect(err).To(HaveOccurred())
+
+				// Verify first allocation recorded 8Gi consumed
+				meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c0"})
+				Expect(meta).ToNot(BeNil())
+				allocResults := meta.Devices[unique.Make("it-1")]
+				Expect(allocResults).To(HaveLen(1))
+				Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("8Gi"),
+				))
+			})
+
+			It("should round up to the next ValidValue when request does not match exactly", func() {
+				inClusterSlices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+						withGeneration(1, 1),
+						func(s *resourcev1.ResourceSlice) {
+							s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {
+										Value: resource.MustParse("80Gi"),
+										RequestPolicy: &resourcev1.CapacityRequestPolicy{
+											Default:     ptr.To(resource.MustParse("4Gi")),
+											ValidValues: []resource.Quantity{resource.MustParse("4Gi"), resource.MustParse("8Gi"), resource.MustParse("16Gi")},
+										},
+									},
+								},
+							})
+						},
+					),
+				}
+				alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+					ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+					ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+						deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					},
+				}, nil, env.Client)
+
+				nc := makeNodeClaim("it-1")
+				claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("5Gi"),
+				}))
+				result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+				Expect(err).ToNot(HaveOccurred())
+				result.Allocation.Commit(ctx)
+
+				meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+				Expect(meta).ToNot(BeNil())
+				allocResults := meta.Devices[unique.Make("it-1")]
+				Expect(allocResults).To(HaveLen(1))
+				Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("8Gi"),
+				))
+			})
+
+			It("should fail when request exceeds all ValidValues", func() {
+				inClusterSlices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+						withGeneration(1, 1),
+						func(s *resourcev1.ResourceSlice) {
+							s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {
+										Value: resource.MustParse("80Gi"),
+										RequestPolicy: &resourcev1.CapacityRequestPolicy{
+											Default:     ptr.To(resource.MustParse("4Gi")),
+											ValidValues: []resource.Quantity{resource.MustParse("4Gi"), resource.MustParse("8Gi"), resource.MustParse("16Gi")},
+										},
+									},
+								},
+							})
+						},
+					),
+				}
+				alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+					ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+					ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+						deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					},
+				}, nil, env.Client)
+
+				nc := makeNodeClaim("it-1")
+				claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("20Gi"),
+				}))
+				_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+				Expect(err).To(HaveOccurred())
+			})
+
+			It("should round up to nearest step-aligned value with ValidRange policy", func() {
+				inClusterSlices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+						withGeneration(1, 1),
+						func(s *resourcev1.ResourceSlice) {
+							s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {
+										Value: resource.MustParse("80Gi"),
+										RequestPolicy: &resourcev1.CapacityRequestPolicy{
+											Default: ptr.To(resource.MustParse("4Gi")),
+											ValidRange: &resourcev1.CapacityRequestPolicyRange{
+												Min:  ptr.To(resource.MustParse("4Gi")),
+												Step: ptr.To(resource.MustParse("4Gi")),
+											},
+										},
+									},
+								},
+							})
+						},
+					),
+				}
+				alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+					ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+					ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+						deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					},
+				}, nil, env.Client)
+
+				nc := makeNodeClaim("it-1")
+				// Request 5Gi — should round up to 8Gi (Min=4Gi + 1*Step=4Gi)
+				claim := makeClaim("c1", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("5Gi"),
+				}))
+				result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+				Expect(err).ToNot(HaveOccurred())
+				result.Allocation.Commit(ctx)
+
+				meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+				Expect(meta).ToNot(BeNil())
+				allocResults := meta.Devices[unique.Make("it-1")]
+				Expect(allocResults).To(HaveLen(1))
+				Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("8Gi"),
+				))
+
+				// 80Gi - 8Gi = 72Gi remaining. Request 76Gi (rounds to 76Gi, step-aligned) should fail.
+				nc2 := makeNodeClaimWithID("nc-2", "it-1")
+				claim2 := makeClaim("c2", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("76Gi"),
+				}))
+				_, err = alloc.Allocate(ctx, nc2, []*resourcev1.ResourceClaim{claim2})
+				Expect(err).To(HaveOccurred())
+
+				// 72Gi should succeed
+				nc3 := makeNodeClaimWithID("nc-3", "it-1")
+				claim3 := makeClaim("c3", exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+					"gpu.example.com/vram": resource.MustParse("72Gi"),
+				}))
+				r3, err := alloc.Allocate(ctx, nc3, []*resourcev1.ResourceClaim{claim3})
+				Expect(err).ToNot(HaveOccurred())
+				r3.Allocation.Commit(ctx)
+			})
+
+			It("should account for rounded-up ValidValues capacity in intra-DFS deduction", func() {
+				inClusterSlices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+						withGeneration(1, 1),
+						func(s *resourcev1.ResourceSlice) {
+							s.Spec.Devices = append(s.Spec.Devices, resourcev1.Device{
+								Name:                     "gpu-0",
+								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {
+										Value: resource.MustParse("16Gi"),
+										RequestPolicy: &resourcev1.CapacityRequestPolicy{
+											Default:     ptr.To(resource.MustParse("4Gi")),
+											ValidValues: []resource.Quantity{resource.MustParse("4Gi"), resource.MustParse("8Gi"), resource.MustParse("16Gi")},
+										},
+									},
+								},
+							})
+						},
+					),
+				}
+				alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+					ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+					ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+						deviceID("gpu.example.com", "pool-a", "gpu-0").DeviceID: {},
+					},
+				}, nil, env.Client)
+
+				nc := makeNodeClaim("it-1")
+				// Two requests each asking 5Gi (rounds to 8Gi each) — 16Gi total, exact fit
+				claim := makeClaim("c1",
+					exactRequestWithCapacity("req-1", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+						"gpu.example.com/vram": resource.MustParse("5Gi"),
+					}),
+					exactRequestWithCapacity("req-2", "gpu", 1, map[resourcev1.QualifiedName]resource.Quantity{
+						"gpu.example.com/vram": resource.MustParse("5Gi"),
+					}),
+				)
+				result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+				Expect(err).ToNot(HaveOccurred())
+				result.Allocation.Commit(ctx)
+
+				meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+				Expect(meta).ToNot(BeNil())
+				allocResults := meta.Devices[unique.Make("it-1")]
+				Expect(allocResults).To(HaveLen(2))
+				Expect(allocResults[0].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("8Gi"),
+				))
+				Expect(allocResults[1].ConsumedCapacity).To(HaveKeyWithValue(
+					resourcev1.QualifiedName("gpu.example.com/vram"), resource.MustParse("8Gi"),
+				))
+
+				// No more capacity — even default (4Gi) should fail
+				nc2 := makeNodeClaimWithID("nc-2", "it-1")
+				_, err = alloc.Allocate(ctx, nc2, []*resourcev1.ResourceClaim{makeClaim("c2", exactRequest("req-1", "gpu", 1))})
+				Expect(err).To(HaveOccurred())
+			})
 		})
 	})
 
