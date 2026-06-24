@@ -2846,7 +2846,7 @@ var _ = Describe("Allocator", func() {
 			Expect(meta).ToNot(BeNil())
 			Expect(meta.Devices).To(HaveKey(unique.Make("it-1")))
 			Expect(meta.Devices[unique.Make("it-1")]).To(HaveLen(1))
-			Expect(meta.Devices[unique.Make("it-1")][0].Pool.Value()).To(ContainSubstring(expectedZone))
+			Expect(meta.Devices[unique.Make("it-1")][0].DeviceID.Pool.Value()).To(ContainSubstring(expectedZone))
 		})
 
 		It("should narrow pools when a zonal device tightens requirements", func() {
@@ -4824,7 +4824,7 @@ var _ = Describe("Allocator", func() {
 			Expect(claim2Meta.Devices).To(HaveKey(unique.Make("it-1")))
 			claim2Devices := claim2Meta.Devices[unique.Make("it-1")]
 			Expect(claim2Devices).To(HaveLen(1))
-			Expect(claim2Devices[0].Pool.Value()).To(ContainSubstring(expectedZone))
+			Expect(claim2Devices[0].DeviceID.Pool.Value()).To(ContainSubstring(expectedZone))
 		})
 
 		It("should fail when two in-memory allocated claims have incompatible zones", func() {
@@ -5304,12 +5304,15 @@ var _ = Describe("Allocator", func() {
 							resourcev1.Device{
 								Name:                     "gpu-shared",
 								AllowMultipleAllocations: ptr.To(true),
+								Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+									"gpu.example.com/vram": {Value: resource.MustParse("10Gi")},
+								},
 							},
 						)
 					},
 				),
 			}
-			// gpu-exclusive is exclusively allocated; gpu-shared is multi-alloc with capacity tracking.
+			// gpu-exclusive is exclusively allocated; gpu-shared is multi-alloc with capacity fully consumed.
 			consumedCapacity := map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
 				deviceID("gpu.example.com", "pool-a", "gpu-shared").DeviceID: {
 					"gpu.example.com/vram": resource.MustParse("10Gi"),
@@ -5321,16 +5324,10 @@ var _ = Describe("Allocator", func() {
 			}, nil, env.Client)
 
 			nc := makeNodeClaim("it-1")
-			// Request 2 devices: only gpu-shared is available (gpu-exclusive is blocked).
-			claim := makeClaim("c1", exactRequest("req-1", "gpu", 2))
+			// Request 1 device: gpu-exclusive is blocked, gpu-shared has no remaining capacity.
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 1))
 			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
 			Expect(err).To(HaveOccurred())
-
-			// Request 1 device: gpu-shared is available.
-			claim2 := makeClaim("c2", exactRequest("req-1", "gpu", 1))
-			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim2})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result).ToNot(BeNil())
 		})
 
 		It("should commit inflight consumed capacity with pessimistic-max across ITs", func() {

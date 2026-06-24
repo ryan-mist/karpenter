@@ -126,16 +126,21 @@ func (at *AllocationTracker) Commit(alloc *allocation) {
 	for it, deviceIDs := range alloc.deviceIDsByIT {
 		for _, id := range deviceIDs {
 			if id.Template {
+				// Template multi-alloc devices are tracked via templateConsumedCapacity, not
+				// binary allocation.
+				if itCapacity, ok := alloc.templateCapacityConsumptionByIT[it]; ok {
+					if _, hasCapacity := itCapacity[id]; hasCapacity {
+						continue
+					}
+				}
 				at.insertAllocation(at.InflightTemplateAllocations, id, alloc.nodeClaimID, it)
 				continue
 			}
 			// Multi-allocatable devices are tracked via capacity, not binary allocation.
-			// TODO(commit-5): This only catches devices with prior cluster allocations. Fresh multi-allocatable
-			// devices (never allocated before) will fall through and be inserted into InflightClusterAllocations,
-			// incorrectly blocking cross-NodeClaim sharing. Commit 5 should use device.AllowMultipleAllocations
-			// as the discriminator instead.
-			if _, isMultiAlloc := at.PreallocatedConsumedCapacity[id]; isMultiAlloc {
-				continue
+			if itCapacity, ok := alloc.capacityConsumptionByIT[it]; ok {
+				if _, hasCapacity := itCapacity[id]; hasCapacity {
+					continue
+				}
 			}
 			at.insertAllocation(at.InflightClusterAllocationsByNodeClaim, id, alloc.nodeClaimID, it)
 
@@ -186,7 +191,6 @@ func (at *AllocationTracker) insertAllocation(
 	itAllocs.Insert(deviceID)
 }
 
-
 func (at *AllocationTracker) ReleaseInstanceTypes(ctx context.Context, nodeClaim NodeClaimID, instanceTypes ...InstanceTypeID) {
 	released := make(map[InstanceTypeID]sets.Set[DeviceID])
 	for _, instanceType := range instanceTypes {
@@ -220,7 +224,6 @@ func (at *AllocationTracker) ReleaseInstanceTypes(ctx context.Context, nodeClaim
 	}
 }
 
-
 func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim, instanceType InstanceTypeID) bool {
 	if deviceID.Template {
 		// Template devices are NodeClaim and instance type local. The device is only considered allocated if there's an entry
@@ -241,8 +244,9 @@ func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim,
 
 	// Multi-allocatable devices are never "fully allocated" from a binary standpoint.
 	// The capacity check in tryDevice determines whether the device can accept the new allocation.
-	// TODO(commit-5): This misses fresh multi-allocatable devices with no prior cluster allocations.
-	// Commit 5 should also check InflightConsumedCapacity or device.AllowMultipleAllocations directly.
+	if _, isMultiAlloc := at.InflightConsumedCapacity[deviceID]; isMultiAlloc {
+		return false
+	}
 	if _, isMultiAlloc := at.PreallocatedConsumedCapacity[deviceID]; isMultiAlloc {
 		return false
 	}
@@ -267,4 +271,3 @@ func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim,
 	// The device is neither marked as allocating in the cluster nor in the allocator's state, it's not allocated
 	return false
 }
-

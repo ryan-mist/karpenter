@@ -21,7 +21,79 @@ import (
 
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
+
+// checkCapacity verifies that a multi-allocatable device has sufficient remaining capacity
+// for the given request. Returns the computed consumed capacity map and a pass/fail bool.
+// For non-multi-allocatable devices, returns (nil, true) immediately.
+func (a *allocator) checkCapacity(device cloudprovider.Device, deviceID DeviceID, rd *RequestData) (map[resourcev1.QualifiedName]resource.Quantity, bool) {
+	if !device.AllowMultipleAllocations {
+		return nil, true
+	}
+	if requestsContainNonExistCapacity(rd.CapacityRequests, device.Capacity) {
+		return nil, false
+	}
+	consumed, err := computeConsumedCapacity(rd.CapacityRequests, device.Capacity)
+	if err != nil {
+		return nil, false
+	}
+	if consumed == nil {
+		return nil, true
+	}
+	var sources []map[resourcev1.QualifiedName]resource.Quantity
+	if deviceID.Template {
+		if tc := a.allocationTracker.TemplateRemainingCapacityForIT(a.nodeClaim.ID(), a.itID); tc != nil {
+			sources = append(sources, tc[deviceID])
+		}
+		sources = append(sources, a.templateAllocatingCapacity[deviceID])
+	} else {
+		sources = append(sources,
+			a.allocationTracker.PreallocatedConsumedCapacity[deviceID],
+			a.allocationTracker.InflightConsumedCapacity[deviceID],
+			a.allocatingCapacity[deviceID],
+		)
+	}
+	for name, qty := range consumed {
+		total := device.Capacity[name].Value
+		var used resource.Quantity
+		for _, src := range sources {
+			if q, ok := src[name]; ok {
+				used.Add(q)
+			}
+		}
+		used.Add(qty)
+		if used.Cmp(total) > 0 {
+			return nil, false
+		}
+	}
+	return consumed, true
+}
+
+// deductAllocatingCapacity adds consumed capacity to the DFS-local allocating state.
+func (a *allocator) deductAllocatingCapacity(consumed map[resourcev1.QualifiedName]resource.Quantity, deviceID DeviceID, template bool) {
+	if len(consumed) == 0 {
+		return
+	}
+	if template {
+		a.templateAllocatingCapacity[deviceID] = addCapacity(a.templateAllocatingCapacity[deviceID], consumed)
+	} else {
+		a.allocatingCapacity[deviceID] = addCapacity(a.allocatingCapacity[deviceID], consumed)
+	}
+}
+
+// restoreAllocatingCapacity reverses consumed capacity from the DFS-local allocating state.
+func (a *allocator) restoreAllocatingCapacity(consumed map[resourcev1.QualifiedName]resource.Quantity, deviceID DeviceID, template bool) {
+	if len(consumed) == 0 {
+		return
+	}
+	if template {
+		a.templateAllocatingCapacity[deviceID] = subCapacity(a.templateAllocatingCapacity[deviceID], consumed)
+	} else {
+		a.allocatingCapacity[deviceID] = subCapacity(a.allocatingCapacity[deviceID], consumed)
+	}
+}
 
 // commitCapacity stores per-IT capacity consumption and increments InflightConsumedCapacity by
 // the delta between the new pessimistic max and the old one.
