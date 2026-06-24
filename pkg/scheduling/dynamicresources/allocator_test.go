@@ -6423,4 +6423,231 @@ var _ = Describe("Allocator", func() {
 			Expect(r2).ToNot(BeNil())
 		})
 	})
+
+	Describe("Consumable capacity + SharedCounters interaction", func() {
+		It("should deduct counters for preallocated multi-alloc devices", func() {
+			// A device with BOTH AllowMultipleAllocations and ConsumesCounters.
+			// The device is preallocated (via ConsumedCapacity, not ExclusiveDevices).
+			// Its counter consumption must still be deducted from the pool budget.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s-counters", "gpu.example.com", "pool-a",
+					withSharedCounters(counterSet("gpu-slices", map[string]resource.Quantity{
+						"memory": resource.MustParse("80Gi"),
+					})),
+					withGeneration(1, 2),
+				),
+				makeAPISlice("s-devices", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 2),
+					withDevicesConsumingCounters(
+						resourcev1.Device{
+							Name:                     "mig-0",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"memory": {Value: resource.MustParse("40Gi")}}},
+							},
+						},
+						resourcev1.Device{
+							Name:                     "mig-1",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"memory": {Value: resource.MustParse("40Gi")}}},
+							},
+						},
+					),
+				),
+			}
+			// mig-0 is preallocated as a multi-alloc device (tracked via ConsumedCapacity).
+			// Its 40Gi counter consumption must be deducted, leaving 40Gi for mig-1.
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "mig-0").DeviceID: {
+						"gpu.example.com/vram": resource.MustParse("10Gi"),
+					},
+				},
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			// Request 2 devices: mig-0 still has capacity (10Gi/20Gi used) and mig-1 is fresh.
+			// But budget is only 40Gi remaining (80Gi - 40Gi from mig-0's counter), so both
+			// mig-0 (40Gi) + mig-1 (40Gi) = 80Gi > 40Gi remaining → should fail.
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 2))
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+
+			// Request 1 device: only 40Gi counter budget needed → should succeed.
+			claim2 := makeClaim("c2", exactRequest("req-1", "gpu", 1))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+
+		It("should deduct counters for preallocated multi-alloc NonTargetingDevices", func() {
+			// Same scenario but with PerDeviceNodeSelection: the multi-alloc device is on
+			// a different node (NonTargeting). Its counter consumption must still be deducted.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s-counters", "gpu.example.com", "pool-a",
+					withPerDeviceNodeSelection(),
+					withSharedCounters(counterSet("gpu-slices", map[string]resource.Quantity{
+						"memory": resource.MustParse("80Gi"),
+					})),
+					withGeneration(1, 2),
+				),
+				makeAPISlice("s-devices", "gpu.example.com", "pool-a",
+					withPerDeviceNodeSelection(),
+					withPerDeviceDevices(
+						resourcev1.Device{
+							Name:                     "mig-a",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"memory": {Value: resource.MustParse("40Gi")}}},
+							},
+							NodeSelector: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{MatchExpressions: []corev1.NodeSelectorRequirement{
+									{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"us-west-2a"}},
+								}},
+							}},
+						},
+						resourcev1.Device{
+							Name:                     "mig-b",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"memory": {Value: resource.MustParse("40Gi")}}},
+							},
+							NodeSelector: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{MatchExpressions: []corev1.NodeSelectorRequirement{
+									{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"us-west-2b"}},
+								}},
+							}},
+						},
+						resourcev1.Device{
+							Name:                     "mig-c",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/vram": {Value: resource.MustParse("20Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"memory": {Value: resource.MustParse("40Gi")}}},
+							},
+							NodeSelector: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{MatchExpressions: []corev1.NodeSelectorRequirement{
+									{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"us-west-2a"}},
+								}},
+							}},
+						},
+					),
+					withGeneration(1, 2),
+				),
+			}
+			// mig-b is on zone-b (NonTargeting for our zone-a NodeClaim) and is preallocated
+			// as multi-alloc. Its 40Gi counter must be deducted from the 80Gi budget.
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+				ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{
+					deviceID("gpu.example.com", "pool-a", "mig-b").DeviceID: {
+						"gpu.example.com/vram": resource.MustParse("5Gi"),
+					},
+				},
+			}, nil, env.Client)
+
+			nc := &fakeNodeClaim{
+				id:         unique.Make("test-nc"),
+				nodePoolID: unique.Make("test-np"),
+				requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a"),
+				),
+				instanceTypes:  []dynamicresources.InstanceTypeID{unique.Make("it-1")},
+				resourceSlices: make(map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice),
+			}
+
+			// zone-a has mig-a and mig-c (2 devices × 40Gi = 80Gi needed).
+			// Budget: 80Gi - 40Gi (from NonTargeting mig-b) = 40Gi remaining.
+			// Requesting 2 devices should FAIL.
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 2))
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+
+			// Requesting 1 device should SUCCEED (40Gi needed, 40Gi available).
+			claim2 := makeClaim("c2", exactRequest("req-1", "gpu", 1))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+
+		It("should track both capacity and counters independently for multi-alloc devices", func() {
+			// A multi-alloc device with both capacity AND counters.
+			// Capacity allows multiple allocations but counters limit total pool usage.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s-counters", "gpu.example.com", "pool-a",
+					withSharedCounters(counterSet("gpu-slices", map[string]resource.Quantity{
+						"sm-count": resource.MustParse("40"),
+					})),
+					withGeneration(1, 2),
+				),
+				makeAPISlice("s-devices", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 2),
+					withDevicesConsumingCounters(
+						resourcev1.Device{
+							Name:                     "gpu-shared",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/bandwidth": {Value: resource.MustParse("100Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"sm-count": {Value: resource.MustParse("20")}}},
+							},
+						},
+						resourcev1.Device{
+							Name:                     "gpu-shared-2",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/bandwidth": {Value: resource.MustParse("100Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"sm-count": {Value: resource.MustParse("20")}}},
+							},
+						},
+						resourcev1.Device{
+							Name:                     "gpu-shared-3",
+							AllowMultipleAllocations: ptr.To(true),
+							Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+								"gpu.example.com/bandwidth": {Value: resource.MustParse("100Gi")},
+							},
+							ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+								{CounterSet: "gpu-slices", Counters: map[string]resourcev1.Counter{"sm-count": {Value: resource.MustParse("20")}}},
+							},
+						},
+					),
+				),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{
+				ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
+			}, nil, env.Client)
+
+			nc := makeNodeClaim("it-1")
+			// Each device consumes 20 SMs. Budget is 40. So at most 2 devices can be allocated.
+			// All 3 have plenty of bandwidth capacity, but counters limit to 2.
+			claim := makeClaim("c1", exactRequest("req-1", "gpu", 3))
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+
+			// 2 should succeed (2 × 20 = 40 = budget).
+			claim2 := makeClaim("c2", exactRequest("req-1", "gpu", 2))
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim2})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+		})
+	})
 })
