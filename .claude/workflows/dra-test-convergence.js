@@ -1,7 +1,7 @@
 export const meta = {
   name: 'dra-test-convergence',
   description: 'Generate DRA tests with 3-agent convergence: generator + design validator + implementation validator',
-  whenToUse: 'When you want to generate comprehensive DRA tests for a specific file/component with validation',
+  whenToUse: 'When you want to generate DRA tests for a specific file/component with validation. Pass args.commit to scope tests to a single commit diff instead of the full file.',
   phases: [
     { title: 'Generate', detail: 'Generator agent reads implementation + design and writes tests' },
     { title: 'Validate', detail: 'Two validators check coverage against design and implementation independently' },
@@ -20,6 +20,33 @@ const DESIGN_ROOT = '/Users/ryanmist/Desktop/karpenter-plan'
 
 const TARGET = args?.target || 'pkg/scheduling/dynamicresources/allocator.go'
 const MAX_ROUNDS = args?.maxRounds || 3
+// Optional: scope tests to a specific commit's changes only.
+// Pass as args.commit (a SHA, short SHA, or range like "abc123..def456").
+// When set, agents only generate/validate tests for changed code paths in that diff.
+const COMMIT = args?.commit || null
+
+// If a commit is specified, build scoping context for prompts.
+// The SCOPE_CONTEXT variable is injected into all agent prompts to restrict coverage.
+let SCOPE_CONTEXT = ''
+if (COMMIT) {
+  SCOPE_CONTEXT = `
+## SCOPE RESTRICTION — CRITICAL
+
+You are testing ONLY the changes introduced by commit(s): ${COMMIT}
+
+Before doing anything else, run this command to see the exact diff:
+\`\`\`bash
+cd ${IMPL_ROOT} && git diff ${COMMIT}~1..${COMMIT} -- ${TARGET}
+\`\`\`
+
+**Rules when scoped to a commit:**
+1. ONLY generate tests for code paths that were ADDED or MODIFIED in this diff.
+2. Do NOT generate tests for pre-existing code that was not touched by this commit.
+3. If the diff adds a new function, test that function. If it modifies an existing function, test the modified behavior.
+4. Use the surrounding context (unchanged lines) only to understand HOW to call the changed code — not as a test target.
+5. Validators: only flag gaps in coverage of the CHANGED code. Pre-existing untested code is out of scope.
+`
+}
 
 const REPO_CONTEXT = `
 ## Repository Layout
@@ -45,6 +72,7 @@ When reading files:
 const GENERATOR_PROMPT = `You are a DRA test generator for the Karpenter project. Your job is to write comprehensive Ginkgo tests.
 
 ${REPO_CONTEXT}
+${SCOPE_CONTEXT}
 
 ## Target
 Generate tests for: ${IMPL_ROOT}/${TARGET}
@@ -120,6 +148,7 @@ Do NOT return the full file — just the additions.`
 const DESIGN_VALIDATOR_PROMPT = `You are a DRA test coverage validator focused on DESIGN COMPLETENESS.
 
 ${REPO_CONTEXT}
+${SCOPE_CONTEXT}
 
 ## CRITICAL: Context Management
 - Read ONLY the design doc sections relevant to the target. Use grep to find section headings first.
@@ -149,6 +178,7 @@ Return a JSON object with:
 const IMPL_VALIDATOR_PROMPT = `You are a DRA test coverage validator focused on IMPLEMENTATION COMPLETENESS.
 
 ${REPO_CONTEXT}
+${SCOPE_CONTEXT}
 
 ## CRITICAL: Context Management
 - Read ONLY the target implementation file.
@@ -176,6 +206,7 @@ Return a JSON object with:
 const CONVERGENCE_PROMPT = `You are a DRA test generator incorporating validator feedback.
 
 ${REPO_CONTEXT}
+${SCOPE_CONTEXT}
 
 ## Target
 Tests for: ${IMPL_ROOT}/${TARGET}
@@ -227,7 +258,11 @@ const VALIDATION_SCHEMA = {
 
 // Phase 1: Generate initial tests
 phase('Generate')
-log(`Generating tests for ${TARGET} (impl: ${IMPL_ROOT}, design: ${DESIGN_ROOT})`)
+if (COMMIT) {
+  log(`Generating tests for ${TARGET} scoped to commit ${COMMIT} (impl: ${IMPL_ROOT})`)
+} else {
+  log(`Generating tests for ${TARGET} — full file (impl: ${IMPL_ROOT}, design: ${DESIGN_ROOT})`)
+}
 
 const initial = await agent(GENERATOR_PROMPT, {
   label: 'generator:initial',
@@ -304,6 +339,7 @@ while (!converged && round < MAX_ROUNDS) {
 
 return {
   target: TARGET,
+  commit: COMMIT,
   tests: currentTests,
   rounds: round,
   converged,
