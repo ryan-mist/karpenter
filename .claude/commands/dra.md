@@ -6,21 +6,27 @@ Load full DRA (Dynamic Resource Allocation) architecture context for working on 
 
 Read the following files to build context, then summarize what you've loaded:
 
+**Design docs (from this repo — `/Users/ryanmist/Desktop/karpenter-plan`):**
 1. `designs/dra/scheduling.md` - Full allocator design
 2. `designs/dra/cloudprovider.md` - Cloud provider interface extensions  
 3. `designs/dra/nodeclaim-lifecycle.md` - NodeClaim lifecycle with DRA
-4. `pkg/scheduling/dynamicresources/allocator.go` - Core allocator implementation
-5. `pkg/scheduling/dynamicresources/types.go` - Core types and interfaces
-6. `pkg/scheduling/dynamicresources/allocationtracker.go` - Device allocation state machine
-7. `pkg/scheduling/dynamicresources/pool.go` - Pool gathering and filtering
-8. `pkg/scheduling/dynamicresources/request.go` - Request validation
-9. `pkg/scheduling/dynamicresources/constraint.go` - MatchAttribute constraint
-10. `pkg/scheduling/dynamicresources/attributebindings.go` - Attribute binding graph
-11. `pkg/cloudprovider/dynamicresources.go` - Cloud provider DRA types
-12. `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking controller
-13. `designs/dra/consumable-capacity.md` - Upstream KEP-5075 semantics
-14. `designs/dra/consumable-capacity-integration.md` - Integration design for Karpenter
-15. `designs/dra/consumable-capacity-notes.md` - Implementation notes and scoping decisions
+4. `designs/dra/consumable-capacity.md` - Upstream KEP-5075 semantics (implemented)
+5. `designs/dra/consumable-capacity-integration.md` - CC integration design (implemented)
+6. `designs/dra/partitionable-devices.md` - Upstream KEP-4815 semantics (implemented)
+7. `designs/dra/partitionable-devices-integration.md` - PD integration design (implemented)
+8. `designs/dra/prioritized-alternatives.md` - Upstream KEP-4816 semantics (if exists — active work)
+9. `designs/dra/prioritized-alternatives-integration.md` - PA integration design (if exists — active work)
+
+**Implementation code (from `/Users/ryanmist/Desktop/karp/karpenter`):**
+10. `pkg/scheduling/dynamicresources/allocator.go` - Core allocator implementation
+11. `pkg/scheduling/dynamicresources/types.go` - Core types and interfaces
+12. `pkg/scheduling/dynamicresources/allocationtracker.go` - Device allocation state machine
+13. `pkg/scheduling/dynamicresources/pool.go` - Pool gathering and filtering
+14. `pkg/scheduling/dynamicresources/request.go` - Request validation
+15. `pkg/scheduling/dynamicresources/constraint.go` - MatchAttribute constraint
+16. `pkg/scheduling/dynamicresources/attributebindings.go` - Attribute binding graph
+17. `pkg/cloudprovider/dynamicresources.go` - Cloud provider DRA types
+18. `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking controller
 
 After reading, confirm context is loaded and summarize the architecture in 3-5 sentences. Then ask what DRA work the user wants to do.
 

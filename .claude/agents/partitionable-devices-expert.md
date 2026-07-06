@@ -141,10 +141,8 @@ If ANY rule fails → entire pool is invalid, no devices from it allocatable.
 
 ## Repository Layout
 
-Both are worktrees of the same Karpenter repo:
-
-- **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
-- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity-partitionable-devices`)
+- **Design docs / Planning:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (main branch — merged at commit `61dff3a2`)
 
 ## Reference
 

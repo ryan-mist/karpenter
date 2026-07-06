@@ -23,10 +23,8 @@ You are an expert on Karpenter's DRA (Dynamic Resource Allocation) implementatio
 
 ## Repository Layout
 
-Both are worktrees of the same Karpenter repo:
-
-- **Design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
-- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (branch `consumable-capacity-partitionable-devices`)
+- **Design docs / Planning:** `/Users/ryanmist/Desktop/karpenter-plan` (branch `consumable-capacity-plan`)
+- **Implementation:** `/Users/ryanmist/Desktop/karp/karpenter` (main branch — CC+PD merged at commit `61dff3a2`)
 
 ## Key Files (read these for implementation details)
 
@@ -57,18 +55,21 @@ Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
 5. **5-second timeout**: Hard bound per pod allocation to prevent pathological cases.
 6. **Pool cache**: Pre-filter superset cached per NodeClaim, re-filtered on tightened requirements.
 
+## Implemented Features
+
+- **Consumable capacity (KEP-5075)**: Merged — see `designs/dra/consumable-capacity-integration.md`
+- **Partitionable devices (KEP-4815)**: Merged — see `designs/dra/partitionable-devices-integration.md`
+
+## Active Design Work
+
+- **Prioritized alternatives (KEP-4816)**: FirstAvailable sub-request lists with ordered fallback. Design in progress.
+- **Known bug (constraint reset)**: After a successful IT DFS, constraints retain stale state across IT transitions. `restoreState()` doesn't reset them. Fix: add `Reset()` to `Constraint` interface.
+
 ## Scope Exclusions (not yet implemented)
 
 - Admin access
 - Device taints, non-node-local in-flight devices
 - Multi-solution optimization, consolidation
-- FirstAvailable (sub-request) claims
-
-## Active Design Work
-
-- **Consumable capacity (KEP-5075)**: Implemented on `consumable-capacity-partitionable-devices` branch — see `designs/dra/consumable-capacity-integration.md`
-- **Partitionable devices (KEP-4815)**: Implemented on same branch — see `designs/dra/partitionable-devices-integration.md`
-- **Known bug (constraint reset)**: After a successful IT DFS, constraints retain stale state across IT transitions. `restoreState()` doesn't reset them. Fix: add `Reset()` to `Constraint` interface.
 
 ## When Reviewing DRA Code
 

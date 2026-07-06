@@ -45,18 +45,38 @@ go test ./test/suites/dra/... -count=1
 
 ## DRA (Dynamic Resource Allocation)
 
-Active development branch: `feat/dra-allocator`. The DRA allocator simulates Kubernetes DRA scheduling for Karpenter's model where NodeClaims represent multiple candidate instance types.
+The DRA allocator simulates Kubernetes DRA scheduling for Karpenter's model where NodeClaims represent multiple candidate instance types.
 
-Key entry points:
+**Implementation code:** `/Users/ryanmist/Desktop/karp/karpenter` (main branch)
+**Planning/design docs:** `/Users/ryanmist/Desktop/karpenter-plan` (this repo)
+
+### Merged Features
+
+- **Base allocator** (DFS + commit protocol) — merged as `feat/dra-allocator`
+- **Consumable Capacity (KEP-5075)** + **Partitionable Devices (KEP-4815)** — merged in commit `61dff3a2` ("feat: dra consumable capacity + partitionable devices support (#3110)")
+
+### Active Development: Prioritized Alternatives (KEP-4816)
+
+FirstAvailable sub-request lists with ordered fallback semantics.
+
+- Upstream KEP: https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/4816-dra-prioritized-list/README.md
+- Feature gate: `DRAPrioritizedList` (alpha K8s 1.34)
+- Design docs (when created): `designs/dra/prioritized-alternatives.md`, `designs/dra/prioritized-alternatives-integration.md`
+
+### Key Entry Points
+
 - `pkg/scheduling/dynamicresources/allocator.go` - Core allocator (DFS + commit protocol)
 - `pkg/scheduling/dynamicresources/types.go` - NodeClaim/ResourceSlice interfaces
 - `pkg/controllers/dynamicresources/deviceallocation/controller.go` - Device tracking
-- `designs/dra/scheduling.md` - Authoritative design doc
+- `designs/dra/scheduling.md` - Authoritative allocator design doc
 
-Currently out of scope: adminAccess, device taints, consolidation, FirstAvailable requests.
+### Completed Design Docs
 
-Design docs for upcoming features:
 - `designs/dra/consumable-capacity.md` — KEP-5075 upstream semantics
-- `designs/dra/consumable-capacity-integration.md` — Karpenter integration plan
+- `designs/dra/consumable-capacity-integration.md` — Karpenter integration (implemented)
 - `designs/dra/partitionable-devices.md` — KEP-4815 upstream semantics
-- `designs/dra/partitionable-devices-integration.md` — Karpenter integration plan
+- `designs/dra/partitionable-devices-integration.md` — Karpenter integration (implemented)
+
+### Remaining Out of Scope
+
+adminAccess, device taints, consolidation, non-node-local in-flight devices, multi-solution optimization.
