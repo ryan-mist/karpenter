@@ -85,35 +85,25 @@ Integrating prioritized alternatives into Karpenter's allocator presents challen
 
 ### ClaimData and RequestData Extension
 
-The `RequestData` struct is extended to model the parent/sub-request relationship:
+The `RequestData` struct is extended with a unified design — the same struct represents both top-level requests and sub-requests. This mirrors upstream's single `requestData` type and eliminates duplicate fields:
 
 ```go
 type RequestData struct {
-    // Name is the request name from the claim spec (parent request name).
+    // Name is the request's own name.
+    // For top-level: the DeviceRequest.Name (e.g., "gpu").
+    // For sub-requests: the DeviceSubRequest.Name (e.g., "a100").
     Name string
+    // ParentName is the parent request's name. Empty for top-level (Exactly) requests.
+    // Non-empty for sub-requests within a FirstAvailable list.
+    ParentName string
+
     // SubRequests holds the ordered alternatives for a FirstAvailable request.
-    // nil when the request uses Exactly (single request, no alternatives).
-    // When non-nil, the fields below (Class, Selectors, NumDevices, etc.) are unused —
-    // each SubRequestData carries its own copy of these fields.
-    SubRequests []SubRequestData
+    // nil for Exactly requests and for sub-request entries themselves (no nesting).
+    SubRequests []RequestData
 
-    // Fields below are used for Exactly requests (SubRequests == nil):
-    Class          *resourcev1.DeviceClass
-    NumDevices     int
-    AllocationMode resourcev1.DeviceAllocationMode
-    AllDevices          []DeviceWithID
-    AllTemplateDevicesByIT map[InstanceTypeID][]DeviceWithID
-    Selectors      []resourcev1.DeviceSelector
-    CapacityRequests map[resourcev1.QualifiedName]resource.Quantity
-}
-
-// SubRequestData holds the parsed metadata for a single alternative within a FirstAvailable request.
-type SubRequestData struct {
-    // Name is the sub-request's own name (unique within the parent's FirstAvailable list).
-    Name string
-    // QualifiedName is "parentName/subName" — used for constraint matching and result recording.
-    QualifiedName string
-
+    // Shared fields — used identically by both top-level and sub-request entries.
+    // For FirstAvailable parents (SubRequests != nil), these fields are unused on the
+    // parent entry itself — each sub-request carries its own values.
     Class          *resourcev1.DeviceClass
     NumDevices     int
     AllocationMode resourcev1.DeviceAllocationMode
@@ -124,7 +114,31 @@ type SubRequestData struct {
 }
 ```
 
-A request with `SubRequests != nil` is a FirstAvailable request. The DFS detects this and iterates sub-requests. A request with `SubRequests == nil` is an Exactly request — unchanged behavior.
+**Discriminators:**
+- `len(rd.SubRequests) > 0` → FirstAvailable parent (iterate sub-requests)
+- `rd.ParentName != ""` → sub-request entry (has a parent)
+- Both empty/nil → plain Exactly request (existing behavior)
+
+**Why unified:** The DFS, `tryDevice`, `dfsExactCount`, `dfsAllMode`, constraint calls — all consume `*RequestData` uniformly. No separate `Sub`-variant functions needed. When the DFS operates on a sub-request, it reads `rd.Selectors`, `rd.NumDevices`, `rd.AllocationMode`, etc. from the sub-request's `RequestData` entry directly — the same code path as an Exactly request.
+
+**`QualifiedName()` helper** (not a stored field — computed):
+
+```go
+func (rd *RequestData) QualifiedName() string {
+    if rd.ParentName != "" {
+        return rd.ParentName + "/" + rd.Name
+    }
+    return rd.Name
+}
+```
+
+**`IsFirstAvailable()` helper:**
+
+```go
+func (rd *RequestData) IsFirstAvailable() bool {
+    return len(rd.SubRequests) > 0
+}
+```
 
 ### Parsing FirstAvailable
 
@@ -159,7 +173,7 @@ default:
 }
 ```
 
-The new `validateFirstAvailableRequest` iterates the sub-request list, calling `validateExactRequest` for each (since `DeviceSubRequest` fields match `ExactDeviceRequest`):
+The new `validateFirstAvailableRequest` iterates the sub-request list, calling `validateExactRequest` for each (since `DeviceSubRequest` fields match `ExactDeviceRequest`). Each sub-request produces a `RequestData` entry with `ParentName` set:
 
 ```go
 func validateFirstAvailableRequest(
@@ -174,7 +188,7 @@ func validateFirstAvailableRequest(
 ) (*RequestData, error) {
     rd := &RequestData{
         Name:        parentName,
-        SubRequests: make([]SubRequestData, 0, len(subRequests)),
+        SubRequests: make([]RequestData, 0, len(subRequests)),
     }
     for i := range subRequests {
         sub := &subRequests[i]
@@ -183,17 +197,9 @@ func validateFirstAvailableRequest(
         if err != nil {
             return nil, fmt.Errorf("claim %q request %q sub-request %q: %w", claimName, parentName, sub.Name, err)
         }
-        rd.SubRequests = append(rd.SubRequests, SubRequestData{
-            Name:                   sub.Name,
-            QualifiedName:          parentName + "/" + sub.Name,
-            Class:                  subRD.Class,
-            NumDevices:             subRD.NumDevices,
-            AllocationMode:         subRD.AllocationMode,
-            AllDevices:             subRD.AllDevices,
-            AllTemplateDevicesByIT: subRD.AllTemplateDevicesByIT,
-            Selectors:             subRD.Selectors,
-            CapacityRequests:       subRD.CapacityRequests,
-        })
+        // Tag with parent name — this is what makes it a sub-request entry.
+        subRD.ParentName = parentName
+        rd.SubRequests = append(rd.SubRequests, *subRD)
     }
     return rd, nil
 }
@@ -212,6 +218,8 @@ func subRequestToExact(sub *resourcev1.DeviceSubRequest) *resourcev1.ExactDevice
     }
 }
 ```
+
+**Key advantage of the unified model:** `validateExactRequest` returns a `*RequestData` directly. We just set `ParentName` on it and append. No field-by-field copying between two different struct types.
 
 ### Constraint Referencing
 
@@ -308,31 +316,31 @@ func (a *allocator) dfs(claimIdx, reqIdx, slotIdx int) bool {
 
     // Re-entry routing: if we're inside a sub-request (activeSubRequest != nil),
     // dfs() is being called from tryDevice's recursion (slotIdx > 0) or from the
-    // sub-request DFS functions. Route to the sub-request's slot-filling logic.
+    // sub-request DFS functions. Route to the sub-request's slot-filling logic
+    // using the EXISTING dfsExactCount/dfsAllMode functions (unified struct).
     if a.activeSubRequest != nil && rd.SubRequests != nil {
-        numSlots := a.numSlotsForSub(a.activeSubRequest)
+        numSlots := a.numSlots(a.activeSubRequest)
         if slotIdx >= numSlots {
             // All slots for this sub-request filled — advance to next request.
-            // This clears activeSubRequest context for subsequent requests.
             prevSub := a.activeSubRequest
             prevSubIdx := a.activeSubRequestIdx
             a.activeSubRequest = nil
             a.activeSubRequestIdx = -1
             result := a.dfs(claimIdx, reqIdx+1, 0)
             if !result {
-                // Restore sub-request context for proper backtracking.
                 a.activeSubRequest = prevSub
                 a.activeSubRequestIdx = prevSubIdx
             }
             return result
         }
+        // Unified: use existing dfsExactCount/dfsAllMode with the sub-request's RequestData.
         if a.activeSubRequest.AllocationMode == resourcev1.DeviceAllocationModeAll {
-            return a.dfsAllModeSub(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
+            return a.dfsAllMode(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
         }
-        return a.dfsExactCountSub(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
+        return a.dfsExactCount(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
     }
 
-    // Exactly request: existing behavior unchanged.
+    // Exactly request: existing behavior unchanged (passes rd directly).
     // ...
 }
 ```
@@ -350,14 +358,22 @@ The new `dfsFirstAvailable` function:
 ```go
 func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, cd *ClaimData, rd *RequestData) bool {
     for subIdx := range rd.SubRequests {
-        a.activeSubRequest = &rd.SubRequests[subIdx]
+        sub := &rd.SubRequests[subIdx]
+        a.activeSubRequest = sub
         a.activeSubRequestIdx = subIdx
 
-        if a.dfsSubRequest(claimIdx, reqIdx, cd, a.activeSubRequest) {
+        // Use existing DFS functions directly — unified RequestData makes this possible.
+        var success bool
+        if sub.AllocationMode == resourcev1.DeviceAllocationModeAll {
+            success = a.dfsAllMode(claimIdx, reqIdx, 0, cd, sub)
+        } else {
+            success = a.dfsExactCount(claimIdx, reqIdx, 0, cd, sub)
+        }
+        if success {
+            a.selectedSubRequests[requestKey{claimIdx, reqIdx}] = subIdx
             return true
         }
         // State is already clean — the DFS fully unwinds on failure.
-        // No explicit restore needed here.
     }
     a.activeSubRequest = nil
     a.activeSubRequestIdx = -1
@@ -365,7 +381,7 @@ func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, cd *ClaimData, rd *R
 }
 ```
 
-`dfsExactCountSub` and `dfsAllModeSub` are thin mirrors of `dfsExactCount`/`dfsAllMode` that use the sub-request's `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`, etc. They fill a single slot (calling `tryDevice`), and `tryDevice`'s recursion (`a.dfs(claimIdx, reqIdx, slotIdx+1)`) flows back through the re-entry routing in `dfs()` to fill subsequent slots.
+**Key benefit of the unified model:** No `dfsExactCountSub` or `dfsAllModeSub` functions needed. The existing `dfsExactCount` and `dfsAllMode` accept a `*RequestData` parameter — when passed a sub-request entry, they read its `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`, `NumDevices`, etc. identically to an Exactly request. The re-entry routing in `dfs()` simply passes `a.activeSubRequest` to these existing functions.
 
 After all slots are filled (via the re-entry path), `dfs` advances to the next request. If the entire remaining DFS tree succeeds (subsequent claims satisfied), the sub-request is "locked in" for this IT. If it fails, backtracking unwinds all the way and `dfsFirstAvailable` tries the next sub-request.
 
@@ -394,7 +410,7 @@ Per instance type:
     For each request:
       If FirstAvailable:
         For each sub-request (priority order):      ← NEW LEVEL
-          Fill all slots via dfsExactCountSub/dfsAllModeSub
+          Fill all slots via existing dfsExactCount/dfsAllMode (unified RequestData)
             tryDevice (existing) — auto-backtracks on failure
           If all slots filled:
             Recurse to next request → if true, done
@@ -410,7 +426,7 @@ The only new responsibility is tracking WHICH sub-request succeeded for result r
 
 A sub-request can use `AllocationMode: All`. If the all-mode sub-request fails (e.g., not enough matching devices in the pool for this IT), the DFS for that sub-request fails, backtracking unwinds all tentative allocations, and the next sub-request is tried.
 
-`dfsAllModeSub` uses `sub.AllDevices` and `sub.AllTemplateDevicesByIT[a.itID]` to determine the slot count — each sub-request has independently computed eligible device sets. A sub-request requesting "all A100s" may have 0 eligible devices for an IT that only has H100s, causing immediate failure and fallthrough to the next alternative.
+Each sub-request `RequestData` has independently computed `AllDevices` and `AllTemplateDevicesByIT` — the existing `dfsAllMode` uses these directly. A sub-request requesting "all A100s" may have 0 eligible devices for an IT that only has H100s, causing immediate failure and fallthrough to the next alternative.
 
 ---
 
@@ -441,12 +457,24 @@ con.Add(parentName, subName, dw.Device, deviceID)
 con.Remove(parentName, subName, dw.Device, deviceID)
 ```
 
-Where `constraintNames` resolves based on whether we're inside a sub-request:
+Where `constraintNames` resolves based on the active request's unified fields:
 
 ```go
 func (a *allocator) constraintNames(rd *RequestData) (string, string) {
     if a.activeSubRequest != nil {
+        // rd.Name is the parent name; activeSubRequest.Name is the sub-request name.
         return rd.Name, a.activeSubRequest.Name
+    }
+    return rd.Name, ""
+}
+```
+
+Alternatively, using the unified `ParentName` field directly from the request being processed:
+
+```go
+func (rd *RequestData) constraintNames() (string, string) {
+    if rd.ParentName != "" {
+        return rd.ParentName, rd.Name
     }
     return rd.Name, ""
 }
@@ -494,9 +522,9 @@ The child `allocator` struct gains a field tracking the active sub-request:
 type allocator struct {
     // ... existing fields ...
 
-    // activeSubRequest points to the sub-request currently being filled during DFS.
-    // nil when processing an Exactly request.
-    activeSubRequest *SubRequestData
+    // activeSubRequest points to the sub-request's RequestData currently being filled during DFS.
+    // nil when processing an Exactly request. Same type as top-level requests (unified model).
+    activeSubRequest *RequestData
     // activeSubRequestIdx is the index of the active sub-request within rd.SubRequests.
     // -1 when not in a FirstAvailable request.
     activeSubRequestIdx int
@@ -512,14 +540,7 @@ type requestKey struct {
 }
 ```
 
-When `dfsFirstAvailable` finds a successful sub-request:
-
-```go
-if a.dfsSubRequest(claimIdx, reqIdx, cd, a.activeSubRequest) {
-    a.selectedSubRequests[requestKey{claimIdx, reqIdx}] = subIdx
-    return true
-}
-```
+When `dfsFirstAvailable` finds a successful sub-request, it records the selection (shown in the `dfsFirstAvailable` function above).
 
 ### DeviceAllocationResult Extension
 
@@ -562,11 +583,13 @@ a.allocatedDevicesMetadata = append(a.allocatedDevicesMetadata, deviceAllocation
 ```go
 func (a *allocator) currentRequestName(rd *RequestData) string {
     if a.activeSubRequest != nil {
-        return a.activeSubRequest.QualifiedName
+        return a.activeSubRequest.QualifiedName()  // returns "parent/sub"
     }
     return rd.Name
 }
 ```
+
+With the unified model, this can also be expressed as just calling `QualifiedName()` on whichever `*RequestData` is being processed — it returns `"parent/sub"` when `ParentName != ""`, or just `Name` otherwise.
 
 ### Metadata Propagation
 
@@ -596,11 +619,17 @@ Karpenter doesn't implement kube-scheduler's multi-node scoring (it creates new 
 
 ## Key Design Decisions
 
-### 1. Sub-request iteration inline in the DFS, not a separate recursive level
+### 1. Unified RequestData struct (no separate SubRequestData type)
 
-**Decision:** `dfsFirstAvailable` is called directly from `dfs()` when `slotIdx == 0` and the request has sub-requests. It loops over sub-requests, calling sub-type-specific DFS functions that mirror `dfsExactCount`/`dfsAllMode`.
+**Decision:** A single `RequestData` struct represents both top-level requests and sub-requests. The discriminator is `ParentName != ""` (sub-request) vs `len(SubRequests) > 0` (FirstAvailable parent) vs both empty/nil (Exactly request).
 
-**Rationale:** Adding a formal `subReqIdx` parameter to `dfs()` would require changing the signature everywhere and complicating the base cases. Instead, the sub-request iteration is encapsulated — `dfs()` only needs to detect FirstAvailable and delegate. Mirrors upstream's approach of handling sub-requests as a loop within `allocateOne`.
+**Rationale:** Upstream uses a single `requestData` struct with a `requestAccessor` interface for polymorphism. We achieve the same result more simply — since `RequestData` already has all the fields a sub-request needs (`Class`, `Selectors`, `NumDevices`, etc.), making `SubRequests []RequestData` self-referential eliminates field duplication, removes the need for separate `dfsExactCountSub`/`dfsAllModeSub` functions, and lets `validateExactRequest` return a `*RequestData` that's directly usable as a sub-request entry (just set `ParentName`).
+
+### 2. Sub-request iteration inline in the DFS, not a separate recursive level
+
+**Decision:** `dfsFirstAvailable` is called directly from `dfs()` when `slotIdx == 0` and the request has sub-requests. It loops over sub-requests, calling the existing `dfsExactCount`/`dfsAllMode` with the active sub-request's `*RequestData`.
+
+**Rationale:** Adding a formal `subReqIdx` parameter to `dfs()` would require changing the signature everywhere and complicating the base cases. Instead, the sub-request iteration is encapsulated — `dfs()` only needs to detect FirstAvailable and delegate. The unified struct means the existing DFS functions work unmodified with sub-request entries. Mirrors upstream's approach of handling sub-requests as a loop within `allocateOne`.
 
 ### 2. No explicit state checkpoint at the sub-request level
 
@@ -608,7 +637,7 @@ Karpenter doesn't implement kube-scheduler's multi-node scoring (it creates new 
 
 **Rationale:** The upstream allocator uses the same approach. When a sub-request's DFS fails, it means all recursive slot-filling attempts returned false, which means all `tryDevice` calls that allocated devices have already backtracked (removed from `allocatedDevices`, restored counters/capacity, removed constraints, popped requirement snapshots). No residual state remains. This is simpler and more correct than maintaining an explicit checkpoint/restore — there's no risk of forgetting to restore a field.
 
-**Verification:** After `dfsSubRequest` returns false, assert in debug builds:
+**Verification:** After a sub-request's DFS returns false, assert in debug builds:
 - `len(a.allocatedDevicesMetadata)` equals what it was before the call
 - `a.allocatedDevices.Len()` equals what it was before the call
 
@@ -664,9 +693,9 @@ type matchKey struct {
 
 ## Implementation Sequencing
 
-### Commit 1: Request Validation (ClaimData/RequestData extension + parsing)
+### Commit 1: Request Validation (unified RequestData + parsing)
 
-Foundation layer. Extends the request model to parse `FirstAvailable` into `SubRequestData`.
+Foundation layer. Adds `ParentName`, `SubRequests []RequestData`, `QualifiedName()`, `IsFirstAvailable()` to `RequestData`. Implements `validateFirstAvailableRequest`.
 
 - [ClaimData and RequestData Extension](#claimdata-and-requestdata-extension)
 - [Parsing FirstAvailable](#parsing-firstavailable)
@@ -685,7 +714,7 @@ For Exactly requests, callers pass `subName=""` — no behavior change. This unb
 
 ### Commit 3: DFS Extension (sub-request iteration)
 
-The core feature. Adds `dfsFirstAvailable`, `dfsSubRequest`, `dfsExactCountSub`, `dfsAllModeSub`.
+The core feature. Adds `dfsFirstAvailable` and re-entry routing in `dfs()`. Reuses existing `dfsExactCount`/`dfsAllMode` via the unified `*RequestData` (no separate `Sub` variants needed).
 
 - [New Iteration Level](#new-iteration-level)
 - [State Management](#state-management)
