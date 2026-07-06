@@ -301,15 +301,49 @@ func (a *allocator) dfs(claimIdx, reqIdx, slotIdx int) bool {
     rd := &cd.Requests[reqIdx]
 
     // FirstAvailable: iterate sub-requests in priority order.
+    // Only triggers at slotIdx == 0 (entry point for this request).
     if rd.SubRequests != nil && slotIdx == 0 {
         return a.dfsFirstAvailable(claimIdx, reqIdx, cd, rd)
     }
 
-    // Exactly: existing behavior (or continuing within a sub-request after dfsFirstAvailable
-    // has set up the active sub-request).
+    // Re-entry routing: if we're inside a sub-request (activeSubRequest != nil),
+    // dfs() is being called from tryDevice's recursion (slotIdx > 0) or from the
+    // sub-request DFS functions. Route to the sub-request's slot-filling logic.
+    if a.activeSubRequest != nil && rd.SubRequests != nil {
+        numSlots := a.numSlotsForSub(a.activeSubRequest)
+        if slotIdx >= numSlots {
+            // All slots for this sub-request filled — advance to next request.
+            // This clears activeSubRequest context for subsequent requests.
+            prevSub := a.activeSubRequest
+            prevSubIdx := a.activeSubRequestIdx
+            a.activeSubRequest = nil
+            a.activeSubRequestIdx = -1
+            result := a.dfs(claimIdx, reqIdx+1, 0)
+            if !result {
+                // Restore sub-request context for proper backtracking.
+                a.activeSubRequest = prevSub
+                a.activeSubRequestIdx = prevSubIdx
+            }
+            return result
+        }
+        if a.activeSubRequest.AllocationMode == resourcev1.DeviceAllocationModeAll {
+            return a.dfsAllModeSub(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
+        }
+        return a.dfsExactCountSub(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
+    }
+
+    // Exactly request: existing behavior unchanged.
     // ...
 }
 ```
+
+**Re-entry routing explained:** When `tryDevice` allocates a device and recurses via `a.dfs(claimIdx, reqIdx, slotIdx+1)`, the re-entered `dfs()` must continue filling slots for the active sub-request (not re-enter `dfsFirstAvailable`). The `slotIdx == 0` guard prevents re-entry into the sub-request loop, and the `activeSubRequest != nil` check routes subsequent slot fills to the correct sub-request DFS function.
+
+When all slots are filled (`slotIdx >= numSlots`), `dfs` advances to the next request (`reqIdx+1`). If that recursion fails (returns false), the sub-request context is restored so `tryDevice`'s backtracking can try the next candidate device for the current slot.
+
+**Cross-claim backtracking works naturally:** When the final slot's `tryDevice` recurses and `dfs` advances to subsequent claims, those claims run their full DFS. If a subsequent claim fails (e.g., insufficient capacity because this sub-request consumed too much), the entire recursive chain unwinds — through the subsequent claims, back through this sub-request's slots — and `dfsFirstAvailable` tries the next sub-request with a clean slate.
+
+Example: Claim 1 sub-request 0 (80Gi GPU) fills its slot, recurses to claim 2 (20Gi) which fails (capacity exhausted). Backtracking unwinds claim 1's allocation, `dfsFirstAvailable` tries sub-request 1 (20Gi), which succeeds and leaves room for claim 2.
 
 The new `dfsFirstAvailable` function:
 
@@ -331,21 +365,9 @@ func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, cd *ClaimData, rd *R
 }
 ```
 
-`dfsSubRequest` drives the slot iteration for the active sub-request, using the sub-request's own fields:
+`dfsExactCountSub` and `dfsAllModeSub` are thin mirrors of `dfsExactCount`/`dfsAllMode` that use the sub-request's `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`, etc. They fill a single slot (calling `tryDevice`), and `tryDevice`'s recursion (`a.dfs(claimIdx, reqIdx, slotIdx+1)`) flows back through the re-entry routing in `dfs()` to fill subsequent slots.
 
-```go
-func (a *allocator) dfsSubRequest(claimIdx, reqIdx int, cd *ClaimData, sub *SubRequestData) bool {
-    numSlots := a.numSlotsForSub(sub)
-    if sub.AllocationMode == resourcev1.DeviceAllocationModeAll {
-        return a.dfsAllModeSub(claimIdx, reqIdx, 0, cd, sub)
-    }
-    return a.dfsExactCountSub(claimIdx, reqIdx, 0, cd, sub)
-}
-```
-
-These are thin wrappers that use the sub-request's `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`, etc. instead of `rd`'s fields.
-
-After a sub-request's DFS succeeds (the recursion into `dfs(claimIdx, reqIdx+1, 0)` at the end of slots returns true), the sub-request is "locked in" for this IT and we proceed to the next request.
+After all slots are filled (via the re-entry path), `dfs` advances to the next request. If the entire remaining DFS tree succeeds (subsequent claims satisfied), the sub-request is "locked in" for this IT. If it fails, backtracking unwinds all the way and `dfsFirstAvailable` tries the next sub-request.
 
 ### State Management
 
