@@ -142,84 +142,84 @@ func (rd *RequestData) IsFirstAvailable() bool {
 
 ### Parsing FirstAvailable
 
-In `ValidateClaimRequest`, the existing check:
+#### Shared Validation Helpers
+
+Both `validateExactRequest` and `validateFirstAvailableRequest` share extracted helper functions for each validation concern. No intermediate types or pipeline frameworks — just functions that both entry points call:
 
 ```go
-if req.Exactly == nil {
-    return nil, fmt.Errorf("claim %q request %q: only Exactly requests are supported", claim.Name, req.Name)
+// resolveDeviceClass fetches and returns the DeviceClass for the given class name.
+func resolveDeviceClass(ctx context.Context, kubeClient client.Client, className string) (*resourcev1.DeviceClass, error)
+
+// combineSelectors merges class-level and request-level selectors, validating all are CEL type.
+func combineSelectors(class *resourcev1.DeviceClass, requestSelectors []resourcev1.DeviceSelector) ([]resourcev1.DeviceSelector, error)
+
+// compileCEL validates that all selector CEL expressions compile successfully.
+func compileCEL(selectors []resourcev1.DeviceSelector, celCache *dracel.Cache) error
+
+// collectAllModeDevices pre-computes eligible devices for All-mode requests (in-cluster + per-IT template).
+func collectAllModeDevices(ctx context.Context, selectors []resourcev1.DeviceSelector, pools []*Pool,
+    templateDevicesByIT map[InstanceTypeID][]DeviceWithID, celCache *dracel.Cache,
+) (inCluster []DeviceWithID, perIT map[InstanceTypeID][]DeviceWithID, err error)
+```
+
+#### Entry Points
+
+`validateExactRequest` stays as the entry point for `Exactly` requests — its body calls the shared helpers:
+
+```go
+func validateExactRequest(ctx, kubeClient, claimName, requestName string, req *resourcev1.ExactDeviceRequest, ...) (*RequestData, error) {
+    class, err := resolveDeviceClass(ctx, kubeClient, req.DeviceClassName)
+    if err != nil { return nil, ... }
+    selectors, err := combineSelectors(class, req.Selectors)
+    if err != nil { return nil, ... }
+    if err := compileCEL(selectors, celCache); err != nil { return nil, ... }
+
+    rd := &RequestData{Name: requestName, Class: class, Selectors: selectors, ...}
+    // handle AllocationMode, Count, Capacity...
+    return rd, nil
 }
 ```
 
-Becomes:
+`validateFirstAvailableRequest` loops over sub-requests, calling the same helpers for each:
+
+```go
+func validateFirstAvailableRequest(ctx, kubeClient, claimName, parentName string,
+    subRequests []resourcev1.DeviceSubRequest, ...) (*RequestData, error) {
+
+    parent := &RequestData{Name: parentName, SubRequests: make([]RequestData, 0, len(subRequests))}
+    for i := range subRequests {
+        sub := &subRequests[i]
+        class, err := resolveDeviceClass(ctx, kubeClient, sub.DeviceClassName)
+        if err != nil { return nil, ... }
+        selectors, err := combineSelectors(class, sub.Selectors)
+        if err != nil { return nil, ... }
+        if err := compileCEL(selectors, celCache); err != nil { return nil, ... }
+
+        rd := &RequestData{Name: sub.Name, ParentName: parentName, Class: class, Selectors: selectors, ...}
+        // handle AllocationMode, Count, Capacity...
+        parent.SubRequests = append(parent.SubRequests, *rd)
+    }
+    return parent, nil
+}
+```
+
+#### Top-Level Dispatch (unchanged)
 
 ```go
 switch {
 case req.Exactly != nil:
     rd, err := validateExactRequest(ctx, kubeClient, claim.Name, req.Name, req.Exactly, pools, templateDevicesByIT, celCache)
-    if err != nil {
-        return nil, err
-    }
-    data.Requests = append(data.Requests, *rd)
-
 case len(req.FirstAvailable) > 0:
     rd, err := validateFirstAvailableRequest(ctx, kubeClient, claim.Name, req.Name, req.FirstAvailable, pools, templateDevicesByIT, celCache)
-    if err != nil {
-        return nil, err
-    }
-    data.Requests = append(data.Requests, *rd)
-
-default:
-    return nil, fmt.Errorf("claim %q request %q: neither Exactly nor FirstAvailable set", claim.Name, req.Name)
 }
 ```
 
-The new `validateFirstAvailableRequest` iterates the sub-request list, calling `validateExactRequest` for each (since `DeviceSubRequest` fields match `ExactDeviceRequest`). Each sub-request produces a `RequestData` entry with `ParentName` set:
-
-```go
-func validateFirstAvailableRequest(
-    ctx context.Context,
-    kubeClient client.Client,
-    claimName string,
-    parentName string,
-    subRequests []resourcev1.DeviceSubRequest,
-    pools []*Pool,
-    templateDevicesByIT map[InstanceTypeID][]DeviceWithID,
-    celCache *dracel.Cache,
-) (*RequestData, error) {
-    rd := &RequestData{
-        Name:        parentName,
-        SubRequests: make([]RequestData, 0, len(subRequests)),
-    }
-    for i := range subRequests {
-        sub := &subRequests[i]
-        exactReq := subRequestToExact(sub)
-        subRD, err := validateExactRequest(ctx, kubeClient, claimName, sub.Name, exactReq, pools, templateDevicesByIT, celCache)
-        if err != nil {
-            return nil, fmt.Errorf("claim %q request %q sub-request %q: %w", claimName, parentName, sub.Name, err)
-        }
-        // Tag with parent name — this is what makes it a sub-request entry.
-        subRD.ParentName = parentName
-        rd.SubRequests = append(rd.SubRequests, *subRD)
-    }
-    return rd, nil
-}
-```
-
-`subRequestToExact` converts a `DeviceSubRequest` into an `ExactDeviceRequest` for reuse of the existing validation logic:
-
-```go
-func subRequestToExact(sub *resourcev1.DeviceSubRequest) *resourcev1.ExactDeviceRequest {
-    return &resourcev1.ExactDeviceRequest{
-        DeviceClassName: sub.DeviceClassName,
-        Selectors:       sub.Selectors,
-        AllocationMode:  sub.AllocationMode,
-        Count:           sub.Count,
-        // Capacity, Tolerations, etc. — pass through if present on DeviceSubRequest
-    }
-}
-```
-
-**Key advantage of the unified model:** `validateExactRequest` returns a `*RequestData` directly. We just set `ParentName` on it and append. No field-by-field copying between two different struct types.
+**Key advantages:**
+- **Clear entry points** — `validateExactRequest` and `validateFirstAvailableRequest` each read naturally; no need to understand a pipeline/spec abstraction
+- **Shared logic via helpers** — `resolveDeviceClass`, `combineSelectors`, `compileCEL`, `collectAllModeDevices` are called by both; each validates one concern
+- **No type conversion** — sub-requests read their own fields directly (no `subRequestToExact`)
+- **Testable in isolation** — each helper can be unit-tested independently
+- **Easy to extend** — adding a new validation concern (e.g., tolerations) is adding a helper call in both entry points
 
 ### Constraint Referencing
 
