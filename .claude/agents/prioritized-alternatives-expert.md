@@ -134,9 +134,15 @@ Both are worktrees of the same Karpenter repo:
 
 Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
 
+- `designs/dra/prioritized-alternatives.md` — Upstream KEP-4816 semantics (authoritative reference)
+- `designs/dra/prioritized-alternatives-integration.md` — Karpenter integration design (when created)
 - `designs/dra/scheduling.md` — Karpenter DRA allocator design (base)
 - `designs/dra/consumable-capacity-integration.md` — CC integration (context for capacity interaction)
 - `designs/dra/partitionable-devices-integration.md` — PD integration (context for counter interaction)
 
 Upstream KEP:
 - https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/4816-dra-prioritized-list/README.md
+
+Upstream code:
+- `k8s.io/dynamic-resource-allocation/structured/internal/incubating/allocator_incubating.go` — `allocateOne()` sub-request loop
+- `pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go` — Score/NormalizeScore
