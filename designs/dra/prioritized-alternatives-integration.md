@@ -142,61 +142,118 @@ func (rd *RequestData) IsFirstAvailable() bool {
 
 ### Parsing FirstAvailable
 
-#### Shared Validation Helpers
+#### Interface-Based Shared Validation
 
-Both `validateExactRequest` and `validateFirstAvailableRequest` share extracted helper functions for each validation concern. No intermediate types or pipeline frameworks — just functions that both entry points call:
+Following upstream's `requestAccessor` pattern, we define an interface over the common fields shared by `ExactDeviceRequest` and `DeviceSubRequest`. This eliminates duplication between the two entry points entirely — one `buildRequestData` function handles both:
 
 ```go
-// resolveDeviceClass fetches and returns the DeviceClass for the given class name.
-func resolveDeviceClass(ctx context.Context, kubeClient client.Client, className string) (*resourcev1.DeviceClass, error)
-
-// combineSelectors merges class-level and request-level selectors, validating all are CEL type.
-func combineSelectors(class *resourcev1.DeviceClass, requestSelectors []resourcev1.DeviceSelector) ([]resourcev1.DeviceSelector, error)
-
-// compileCEL validates that all selector CEL expressions compile successfully.
-func compileCEL(selectors []resourcev1.DeviceSelector, celCache *dracel.Cache) error
-
-// collectAllModeDevices pre-computes eligible devices for All-mode requests (in-cluster + per-IT template).
-func collectAllModeDevices(ctx context.Context, selectors []resourcev1.DeviceSelector, pools []*Pool,
-    templateDevicesByIT map[InstanceTypeID][]DeviceWithID, celCache *dracel.Cache,
-) (inCluster []DeviceWithID, perIT map[InstanceTypeID][]DeviceWithID, err error)
+// deviceRequestAccessor abstracts the common fields between ExactDeviceRequest and DeviceSubRequest.
+type deviceRequestAccessor interface {
+    GetDeviceClassName() string
+    GetSelectors() []resourcev1.DeviceSelector
+    GetAllocationMode() resourcev1.DeviceAllocationMode
+    GetCount() int64
+    GetCapacity() *resourcev1.CapacityRequirements
+}
 ```
 
-#### Entry Points
-
-`validateExactRequest` stays as the entry point for `Exactly` requests — its body calls the shared helpers:
+Two thin wrapper types implement it:
 
 ```go
-func validateExactRequest(ctx, kubeClient, claimName, requestName string, req *resourcev1.ExactDeviceRequest, ...) (*RequestData, error) {
-    class, err := resolveDeviceClass(ctx, kubeClient, req.DeviceClassName)
-    if err != nil { return nil, ... }
-    selectors, err := combineSelectors(class, req.Selectors)
-    if err != nil { return nil, ... }
-    if err := compileCEL(selectors, celCache); err != nil { return nil, ... }
+type exactRequestAccessor struct{ req *resourcev1.ExactDeviceRequest }
+func (a exactRequestAccessor) GetDeviceClassName() string                        { return a.req.DeviceClassName }
+func (a exactRequestAccessor) GetSelectors() []resourcev1.DeviceSelector         { return a.req.Selectors }
+func (a exactRequestAccessor) GetAllocationMode() resourcev1.DeviceAllocationMode { return a.req.AllocationMode }
+func (a exactRequestAccessor) GetCount() int64                                   { return a.req.Count }
+func (a exactRequestAccessor) GetCapacity() *resourcev1.CapacityRequirements     { return a.req.Capacity }
 
-    rd := &RequestData{Name: requestName, Class: class, Selectors: selectors, ...}
-    // handle AllocationMode, Count, Capacity...
+type subRequestAccessor struct{ sub *resourcev1.DeviceSubRequest }
+func (a subRequestAccessor) GetDeviceClassName() string                        { return a.sub.DeviceClassName }
+func (a subRequestAccessor) GetSelectors() []resourcev1.DeviceSelector         { return a.sub.Selectors }
+func (a subRequestAccessor) GetAllocationMode() resourcev1.DeviceAllocationMode { return a.sub.AllocationMode }
+func (a subRequestAccessor) GetCount() int64                                   { return a.sub.Count }
+func (a subRequestAccessor) GetCapacity() *resourcev1.CapacityRequirements     { return a.sub.Capacity }
+```
+
+#### Core Validation Function
+
+All validation logic lives in one place:
+
+```go
+func buildRequestData(
+    ctx context.Context,
+    kubeClient client.Client,
+    claimName string,
+    requestName string,
+    req deviceRequestAccessor,
+    pools []*Pool,
+    templateDevicesByIT map[InstanceTypeID][]DeviceWithID,
+    celCache *dracel.Cache,
+) (*RequestData, error) {
+    // 1. Resolve DeviceClass
+    class := &resourcev1.DeviceClass{}
+    if err := kubeClient.Get(ctx, types.NamespacedName{Name: req.GetDeviceClassName()}, class); err != nil {
+        return nil, fmt.Errorf("claim %q request %q: DeviceClass %q not found: %w",
+            claimName, requestName, req.GetDeviceClassName(), err)
+    }
+
+    // 2. Combine and validate selectors
+    selectors, err := combineSelectors(class, req.GetSelectors())
+    if err != nil {
+        return nil, fmt.Errorf("claim %q request %q: %w", claimName, requestName, err)
+    }
+    if err := compileCEL(selectors, celCache); err != nil {
+        return nil, fmt.Errorf("claim %q request %q: %w", claimName, requestName, err)
+    }
+
+    // 3. Build RequestData
+    rd := &RequestData{
+        Name:           requestName,
+        Class:          class,
+        Selectors:      selectors,
+        NumDevices:     int(req.GetCount()),
+        AllocationMode: resourcev1.DeviceAllocationModeExactCount,
+    }
+    if req.GetCapacity() != nil {
+        rd.CapacityRequests = req.GetCapacity().Requests
+    }
+
+    // 4. Handle All mode
+    if req.GetAllocationMode() == resourcev1.DeviceAllocationModeAll {
+        rd.AllocationMode = resourcev1.DeviceAllocationModeAll
+        rd.NumDevices = 0
+        rd.AllDevices, err = collectAllModePoolDevices(ctx, selectors, pools, celCache)
+        if err != nil {
+            return nil, fmt.Errorf("claim %q request %q: %w", claimName, requestName, err)
+        }
+        rd.AllTemplateDevicesByIT = collectAllModeTemplateDevices(ctx, selectors, rd.AllDevices, templateDevicesByIT, celCache)
+    }
+
     return rd, nil
 }
 ```
 
-`validateFirstAvailableRequest` loops over sub-requests, calling the same helpers for each:
+#### Entry Points (now trivial)
 
 ```go
-func validateFirstAvailableRequest(ctx, kubeClient, claimName, parentName string,
-    subRequests []resourcev1.DeviceSubRequest, ...) (*RequestData, error) {
+func validateExactRequest(ctx, kubeClient, claimName, requestName string,
+    req *resourcev1.ExactDeviceRequest, pools, templateDevicesByIT, celCache,
+) (*RequestData, error) {
+    return buildRequestData(ctx, kubeClient, claimName, requestName,
+        exactRequestAccessor{req}, pools, templateDevicesByIT, celCache)
+}
 
+func validateFirstAvailableRequest(ctx, kubeClient, claimName, parentName string,
+    subRequests []resourcev1.DeviceSubRequest, pools, templateDevicesByIT, celCache,
+) (*RequestData, error) {
     parent := &RequestData{Name: parentName, SubRequests: make([]RequestData, 0, len(subRequests))}
     for i := range subRequests {
-        sub := &subRequests[i]
-        class, err := resolveDeviceClass(ctx, kubeClient, sub.DeviceClassName)
-        if err != nil { return nil, ... }
-        selectors, err := combineSelectors(class, sub.Selectors)
-        if err != nil { return nil, ... }
-        if err := compileCEL(selectors, celCache); err != nil { return nil, ... }
-
-        rd := &RequestData{Name: sub.Name, ParentName: parentName, Class: class, Selectors: selectors, ...}
-        // handle AllocationMode, Count, Capacity...
+        rd, err := buildRequestData(ctx, kubeClient, claimName, subRequests[i].Name,
+            subRequestAccessor{&subRequests[i]}, pools, templateDevicesByIT, celCache)
+        if err != nil {
+            return nil, err
+        }
+        rd.ParentName = parentName
         parent.SubRequests = append(parent.SubRequests, *rd)
     }
     return parent, nil
@@ -215,11 +272,11 @@ case len(req.FirstAvailable) > 0:
 ```
 
 **Key advantages:**
-- **Clear entry points** — `validateExactRequest` and `validateFirstAvailableRequest` each read naturally; no need to understand a pipeline/spec abstraction
-- **Shared logic via helpers** — `resolveDeviceClass`, `combineSelectors`, `compileCEL`, `collectAllModeDevices` are called by both; each validates one concern
-- **No type conversion** — sub-requests read their own fields directly (no `subRequestToExact`)
-- **Testable in isolation** — each helper can be unit-tested independently
-- **Easy to extend** — adding a new validation concern (e.g., tolerations) is adding a helper call in both entry points
+- **Zero duplication** — all validation logic (class resolution, selector merging, CEL, allocation mode, capacity) lives in `buildRequestData` exactly once
+- **Trivial entry points** — `validateExactRequest` is 1 line; `validateFirstAvailableRequest` is a loop of 1 line + set ParentName
+- **No type conversion** — no `subRequestToExact`; each accessor reads fields from its own API type directly
+- **Upstream pattern** — mirrors `requestAccessor` in `k8s.io/dynamic-resource-allocation/structured/internal/incubating`
+- **Easy to extend** — new fields (tolerations, etc.) are added to the interface + both accessors; `buildRequestData` handles them once
 
 ### Constraint Referencing
 
