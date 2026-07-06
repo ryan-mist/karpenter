@@ -6,11 +6,10 @@ Load full DRA Prioritized Alternatives (KEP-4816) context for working on this fe
 
 Read the following files to build context:
 
-1. `designs/dra/prioritized-alternatives.md` - Upstream KEP-4816 semantics (if exists)
-2. `designs/dra/prioritized-alternatives-integration.md` - Karpenter integration design (if exists)
+1. `designs/dra/prioritized-alternatives.md` - Upstream KEP-4816 semantics
+2. `designs/dra/prioritized-alternatives-integration.md` - Karpenter integration design
 3. `designs/dra/scheduling.md` - Base allocator design (for understanding DFS/backtracking context)
 
-If design docs don't exist yet, note that and load the base allocator design for context on where FirstAvailable fits.
 
 After reading, confirm context is loaded and provide a 3-sentence summary. Then ask what prioritized alternatives work the user wants to do.
 

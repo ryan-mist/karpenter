@@ -44,6 +44,8 @@ Design docs (relative to `/Users/ryanmist/Desktop/karpenter-plan`):
 
 - `designs/dra/scheduling.md` - Authoritative allocator design doc
 - `designs/dra/consumable-capacity-integration.md` - Consumable capacity integration design
+- `designs/dra/partitionable-devices-integration.md` - Partitionable devices integration design
+- `designs/dra/prioritized-alternatives-integration.md` - Prioritized alternatives integration design (active)
 - `designs/dra/consumable-capacity-notes.md` - Implementation notes, known bugs, scoping decisions
 
 ## Design Principles
