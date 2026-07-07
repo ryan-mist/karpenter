@@ -184,6 +184,9 @@ func ValidateClaimRequest(
 		data.Requests = append(data.Requests, *rd)
 	}
 
+	// TODO: should we not do worst case for FirstAvailable - similar to upstream
+	// we could do min for upfront validation and then check during DFS?
+
 	// Compute the base device total: ExactCount requests contribute NumDevices,
 	// All-mode requests contribute their in-cluster device count (len(AllDevices)).
 	// This base total is constant regardless of instance type.
