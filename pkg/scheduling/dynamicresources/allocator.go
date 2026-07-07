@@ -857,9 +857,9 @@ func (a *allocator) tryDevice(
 	// 3. Constraint satisfaction.
 	constraintsAdded := 0
 	for _, con := range cd.Constraints {
-		if !con.Add(rd.Name.Parent, dw.Device, deviceID) {
+		if !con.Add(rd.Name, dw.Device, deviceID) {
 			for j := constraintsAdded - 1; j >= 0; j-- {
-				cd.Constraints[j].Remove(rd.Name.Parent, dw.Device, deviceID)
+				cd.Constraints[j].Remove(rd.Name, dw.Device, deviceID)
 			}
 			return false
 		}
@@ -871,7 +871,7 @@ func (a *allocator) tryDevice(
 	if dw.TopologyRequirements != nil {
 		if !a.requirements.IsCompatible(*dw.TopologyRequirements, scheduling.AllowUndefinedWellKnownLabels) {
 			for j := constraintsAdded - 1; j >= 0; j-- {
-				cd.Constraints[j].Remove(rd.Name.Parent, dw.Device, deviceID)
+				cd.Constraints[j].Remove(rd.Name, dw.Device, deviceID)
 			}
 			return false
 		}
@@ -925,7 +925,7 @@ func (a *allocator) tryDevice(
 	}
 
 	for j := constraintsAdded - 1; j >= 0; j-- {
-		cd.Constraints[j].Remove(rd.Name.Parent, dw.Device, deviceID)
+		cd.Constraints[j].Remove(rd.Name, dw.Device, deviceID)
 	}
 
 	return false
