@@ -117,7 +117,7 @@ var _ = Describe("Request Validation", func() {
 			data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(data.Requests).To(HaveLen(1))
-			Expect(data.Requests[0].Name).To(Equal("gpu-req"))
+			Expect(data.Requests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req"}))
 			Expect(data.Requests[0].NumDevices).To(Equal(2))
 			Expect(data.Requests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
 			Expect(data.Requests[0].CapacityRequests).To(BeNil())
@@ -181,9 +181,9 @@ var _ = Describe("Request Validation", func() {
 			data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(data.Requests).To(HaveLen(2))
-			Expect(data.Requests[0].Name).To(Equal("req-a"))
+			Expect(data.Requests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "req-a"}))
 			Expect(data.Requests[0].NumDevices).To(Equal(2))
-			Expect(data.Requests[1].Name).To(Equal("req-b"))
+			Expect(data.Requests[1].Name).To(Equal(dynamicresources.RequestName{Parent: "req-b"}))
 			Expect(data.Requests[1].NumDevices).To(Equal(1))
 			Expect(data.Requests[1].Selectors).To(HaveLen(1))
 		})
@@ -1278,10 +1278,9 @@ var _ = Describe("Request Validation", func() {
 				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(data.Requests).To(HaveLen(1))
-				Expect(data.Requests[0].Name).To(Equal("gpu-req"))
+				Expect(data.Requests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req"}))
 				Expect(data.Requests[0].SubRequests).To(HaveLen(1))
-				Expect(data.Requests[0].SubRequests[0].Name).To(Equal("h100"))
-				Expect(data.Requests[0].SubRequests[0].ParentName).To(Equal("gpu-req"))
+				Expect(data.Requests[0].SubRequests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req", Sub: "h100"}))
 				Expect(data.Requests[0].SubRequests[0].NumDevices).To(Equal(2))
 				Expect(data.Requests[0].SubRequests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
 				// 1 from "gpu" class + 1 from sub-request
@@ -1323,11 +1322,11 @@ var _ = Describe("Request Validation", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Expect(data.Requests[0].SubRequests).To(HaveLen(3))
 				// Order preserved
-				Expect(data.Requests[0].SubRequests[0].Name).To(Equal("h100"))
+				Expect(data.Requests[0].SubRequests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req", Sub: "h100"}))
 				Expect(data.Requests[0].SubRequests[0].NumDevices).To(Equal(4))
-				Expect(data.Requests[0].SubRequests[1].Name).To(Equal("nic-fallback"))
+				Expect(data.Requests[0].SubRequests[1].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req", Sub: "nic-fallback"}))
 				Expect(data.Requests[0].SubRequests[1].NumDevices).To(Equal(2))
-				Expect(data.Requests[0].SubRequests[2].Name).To(Equal("any"))
+				Expect(data.Requests[0].SubRequests[2].Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req", Sub: "any"}))
 				Expect(data.Requests[0].SubRequests[2].NumDevices).To(Equal(1))
 				// Each sub-request resolves its own class
 				Expect(data.Requests[0].SubRequests[0].Class.Name).To(Equal("gpu"))
@@ -1338,7 +1337,7 @@ var _ = Describe("Request Validation", func() {
 				Expect(data.Requests[0].SubRequests[2].Selectors).To(BeEmpty())
 				// All sub-requests share the same parent
 				for _, sub := range data.Requests[0].SubRequests {
-					Expect(sub.ParentName).To(Equal("gpu-req"))
+					Expect(sub.Name.Parent).To(Equal("gpu-req"))
 				}
 			})
 
@@ -1894,11 +1893,11 @@ var _ = Describe("Request Validation", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Expect(data.Requests).To(HaveLen(2))
 				// First is Exactly
-				Expect(data.Requests[0].Name).To(Equal("exact-req"))
+				Expect(data.Requests[0].Name).To(Equal(dynamicresources.RequestName{Parent: "exact-req"}))
 				Expect(data.Requests[0].NumDevices).To(Equal(2))
 				Expect(data.Requests[0].SubRequests).To(BeNil())
 				// Second is FirstAvailable
-				Expect(data.Requests[1].Name).To(Equal("fa-req"))
+				Expect(data.Requests[1].Name).To(Equal(dynamicresources.RequestName{Parent: "fa-req"}))
 				Expect(data.Requests[1].SubRequests).To(HaveLen(2))
 			})
 
@@ -1926,7 +1925,7 @@ var _ = Describe("Request Validation", func() {
 				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
 				Expect(err).ToNot(HaveOccurred())
 				parent := data.Requests[0]
-				Expect(parent.Name).To(Equal("gpu-req"))
+				Expect(parent.Name).To(Equal(dynamicresources.RequestName{Parent: "gpu-req"}))
 				Expect(parent.SubRequests).To(HaveLen(1))
 				// Parent should not have class/selectors — those belong to sub-requests
 				Expect(parent.Class).To(BeNil())
@@ -1934,7 +1933,7 @@ var _ = Describe("Request Validation", func() {
 				Expect(parent.NumDevices).To(Equal(0))
 				Expect(parent.AllDevices).To(BeNil())
 				Expect(parent.AllTemplateDevicesByIT).To(BeNil())
-				Expect(parent.ParentName).To(BeEmpty())
+				Expect(parent.Name.Sub).To(BeEmpty())
 			})
 		})
 	})

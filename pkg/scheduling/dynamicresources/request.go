@@ -88,11 +88,10 @@ type RequestKey struct {
 
 // RequestData holds the parsed and validated metadata for a single device request.
 type RequestData struct {
-	// Name is the request name from the claim spec.
-	Name string
-	// ParentName is the parents request's name. Empty for top-level requests and Exactly
-	// requests, non-empty for sub-requests within a FirstAvailable list.
-	ParentName string
+	// Name identifies this request. For Exactly requests, Parent is set and Sub is empty.
+	// For FirstAvailable sub-requests, Parent is the top-level request name and Sub is
+	// the sub-request's own name.
+	Name RequestName
 
 	// SubRequests holds the ordered alternatives for a FirstAvailable request.
 	// nil for Exactly requests and for sub-request entries.
@@ -289,13 +288,13 @@ func validateFirstAvailableRequest(
 	templateDevicesByIT map[InstanceTypeID][]DeviceWithID,
 	celCache *dracel.Cache,
 ) (*RequestData, error) {
-	parent := &RequestData{Name: parentName, SubRequests: make([]RequestData, 0, len(subRequests))}
+	parent := &RequestData{Name: RequestName{Parent: parentName}, SubRequests: make([]RequestData, 0, len(subRequests))}
 	for i := range subRequests {
 		rd, err := buildRequestData(ctx, kubeClient, claimName, subRequests[i].Name, subRequestAccessor{&subRequests[i]}, pools, templateDevicesByIT, celCache)
 		if err != nil {
 			return nil, err
 		}
-		rd.ParentName = parentName
+		rd.Name = RequestName{Parent: parentName, Sub: rd.Name.Parent}
 
 		parent.SubRequests = append(parent.SubRequests, *rd)
 	}
@@ -342,7 +341,7 @@ func buildRequestData(
 	}
 
 	rd := &RequestData{
-		Name:           requestName,
+		Name:           RequestName{Parent: requestName},
 		Class:          class,
 		Selectors:      selectors,
 		NumDevices:     int(req.Count()),
