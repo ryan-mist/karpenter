@@ -4180,12 +4180,11 @@ var _ = Describe("Allocator", func() {
 			Expect(err.Error()).To(ContainSubstring("unsupported selector"))
 		})
 
-		It("should return error for FirstAvailable request", func() {
+		It("should return error when request has neither Exactly nor FirstAvailable", func() {
 			alloc = dynamicresources.NewAllocator(nil, dynamicresources.AllocatedDeviceState{ExclusiveDevices: sets.New[cloudprovider.DeviceID]()}, nil, env.Client, nil)
 			nc := makeNodeClaimWithTemplates(
 				makeTemplate("gpu.example.com", "pool-a", "tgpu-0"),
 			)
-			// A request with no Exactly field (FirstAvailable).
 			claim := &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
 				Spec: resourcev1.ResourceClaimSpec{
@@ -4199,7 +4198,7 @@ var _ = Describe("Allocator", func() {
 
 			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("only Exactly requests"))
+			Expect(err.Error()).To(ContainSubstring("only Exactly and FirstAvailable requests are supported"))
 		})
 
 		It("should return error for unsupported constraint type", func() {

@@ -54,6 +54,14 @@ var _ = Describe("Request Validation", func() {
 				},
 			},
 			&resourcev1.DeviceClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "nic"},
+				Spec: resourcev1.DeviceClassSpec{
+					Selectors: []resourcev1.DeviceSelector{
+						{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["nic.example.com"].speed == "100G"`}},
+					},
+				},
+			},
+			&resourcev1.DeviceClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "empty-class"},
 				Spec:       resourcev1.DeviceClassSpec{},
 			},
@@ -217,7 +225,7 @@ var _ = Describe("Request Validation", func() {
 			Expect(err.Error()).To(ContainSubstring("not found"))
 		})
 
-		It("should fail when a request uses FirstAvailable", func() {
+		It("should fail when a request has neither Exactly nor FirstAvailable", func() {
 			claim := &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
 				Spec: resourcev1.ResourceClaimSpec{
@@ -231,7 +239,7 @@ var _ = Describe("Request Validation", func() {
 
 			_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("only Exactly requests"))
+			Expect(err.Error()).To(ContainSubstring("only Exactly and FirstAvailable requests are supported"))
 		})
 
 		It("should fail when an All mode request encounters an invalid pool", func() {
@@ -1239,6 +1247,694 @@ var _ = Describe("Request Validation", func() {
 				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, templateDevices, celCache, nil)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(data.Requests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
+			})
+		})
+
+		Context("FirstAvailable", func() {
+			It("should validate a FirstAvailable request with class and sub-request selector merging", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "gpu",
+											Count:           2,
+											Selectors: []resourcev1.DeviceSelector{
+												{CEL: &resourcev1.CELDeviceSelector{Expression: `device.attributes["gpu.example.com"].memory > 40`}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests).To(HaveLen(1))
+				Expect(data.Requests[0].Name).To(Equal("gpu-req"))
+				Expect(data.Requests[0].SubRequests).To(HaveLen(1))
+				Expect(data.Requests[0].SubRequests[0].Name).To(Equal("h100"))
+				Expect(data.Requests[0].SubRequests[0].ParentName).To(Equal("gpu-req"))
+				Expect(data.Requests[0].SubRequests[0].NumDevices).To(Equal(2))
+				Expect(data.Requests[0].SubRequests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
+				// 1 from "gpu" class + 1 from sub-request
+				Expect(data.Requests[0].SubRequests[0].Selectors).To(HaveLen(2))
+			})
+
+			It("should validate multiple sub-requests preserving priority order", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "gpu",
+											Count:           4,
+										},
+										{
+											Name:            "nic-fallback",
+											DeviceClassName: "nic",
+											Count:           2,
+										},
+										{
+											Name:            "any",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests).To(HaveLen(3))
+				// Order preserved
+				Expect(data.Requests[0].SubRequests[0].Name).To(Equal("h100"))
+				Expect(data.Requests[0].SubRequests[0].NumDevices).To(Equal(4))
+				Expect(data.Requests[0].SubRequests[1].Name).To(Equal("nic-fallback"))
+				Expect(data.Requests[0].SubRequests[1].NumDevices).To(Equal(2))
+				Expect(data.Requests[0].SubRequests[2].Name).To(Equal("any"))
+				Expect(data.Requests[0].SubRequests[2].NumDevices).To(Equal(1))
+				// Each sub-request resolves its own class
+				Expect(data.Requests[0].SubRequests[0].Class.Name).To(Equal("gpu"))
+				Expect(data.Requests[0].SubRequests[0].Selectors).To(HaveLen(1))
+				Expect(data.Requests[0].SubRequests[1].Class.Name).To(Equal("nic"))
+				Expect(data.Requests[0].SubRequests[1].Selectors).To(HaveLen(1))
+				Expect(data.Requests[0].SubRequests[2].Class.Name).To(Equal("empty-class"))
+				Expect(data.Requests[0].SubRequests[2].Selectors).To(BeEmpty())
+				// All sub-requests share the same parent
+				for _, sub := range data.Requests[0].SubRequests {
+					Expect(sub.ParentName).To(Equal("gpu-req"))
+				}
+			})
+
+			It("should populate CapacityRequests on sub-requests", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "empty-class",
+											Count:           1,
+											Capacity: &resourcev1.CapacityRequirements{
+												Requests: map[resourcev1.QualifiedName]resource.Quantity{
+													"gpu.example.com/vram": resource.MustParse("40Gi"),
+												},
+											},
+										},
+										{
+											Name:            "a100",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests[0].CapacityRequests).To(HaveLen(1))
+				Expect(data.Requests[0].SubRequests[0].CapacityRequests["gpu.example.com/vram"]).To(Equal(resource.MustParse("40Gi")))
+				Expect(data.Requests[0].SubRequests[1].CapacityRequests).To(BeNil())
+			})
+
+			It("should fail when a sub-request references a nonexistent DeviceClass", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "bad",
+											DeviceClassName: "nonexistent",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("not found"))
+			})
+
+			It("should fail when a sub-request has an invalid CEL selector", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "bad-cel",
+											DeviceClassName: "empty-class",
+											Count:           1,
+											Selectors: []resourcev1.DeviceSelector{
+												{CEL: &resourcev1.CELDeviceSelector{Expression: `this is not valid CEL`}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("failed to compile"))
+			})
+
+			It("should fail when a sub-request has a non-CEL selector", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "bad-selector",
+											DeviceClassName: "empty-class",
+											Count:           1,
+											Selectors: []resourcev1.DeviceSelector{
+												{},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("unsupported selector type"))
+			})
+
+			It("should use worst-case (max) device count across sub-requests for limit check", func() {
+				// Sub-request 0 wants 4 devices, sub-request 1 wants 2 devices.
+				// Worst case is 4. With another request of 29, total is 33 > 32 = fail.
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "empty-class",
+											Count:           4,
+										},
+										{
+											Name:            "a100",
+											DeviceClassName: "empty-class",
+											Count:           2,
+										},
+									},
+								},
+								{
+									Name: "other",
+									Exactly: &resourcev1.ExactDeviceRequest{
+										DeviceClassName: "empty-class",
+										Count:           29,
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("exceeding maximum"))
+			})
+
+			It("should pass when worst-case count fits within limit", func() {
+				// Sub-request 0 wants 4, sub-request 1 wants 2.
+				// Worst case is 4. With another request of 28, total is 32 = OK.
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "empty-class",
+											Count:           4,
+										},
+										{
+											Name:            "a100",
+											DeviceClassName: "empty-class",
+											Count:           2,
+										},
+									},
+								},
+								{
+									Name: "other",
+									Exactly: &resourcev1.ExactDeviceRequest{
+										DeviceClassName: "empty-class",
+										Count:           28,
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("should include All-mode sub-request device counts in worst-case", func() {
+				// Sub-request 0: All mode with 3 in-cluster devices.
+				// Sub-request 1: ExactCount 1.
+				// Worst case is 3 (from All). With another request of 30, total is 33 > 32 = fail.
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+										{
+											Name:            "one-gpu",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+								{
+									Name: "other",
+									Exactly: &resourcev1.ExactDeviceRequest{
+										DeviceClassName: "empty-class",
+										Count:           30,
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("exceeding maximum"))
+			})
+
+			It("should populate AllDevices for an All-mode sub-request", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeAll))
+				Expect(data.Requests[0].SubRequests[0].NumDevices).To(Equal(0))
+				Expect(data.Requests[0].SubRequests[0].AllDevices).To(HaveLen(3))
+			})
+
+			It("should populate AllTemplateDevicesByIT for an All-mode sub-request", func() {
+				templateDevices := makeTemplateDevices(map[string]int{
+					"c5.large":  5,
+					"c5.xlarge": 10,
+				})
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, nil, templateDevices, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveLen(2))
+			})
+
+			It("should fail when an All-mode sub-request encounters an invalid pool", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+				invalidPools := []*dynamicresources.Pool{{
+					Key:     dynamicresources.PoolKey{Driver: pools[0].Key.Driver, Pool: pools[0].Key.Pool},
+					Invalid: true,
+				}}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, invalidPools, nil, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("invalid"))
+			})
+
+			It("should mix ExactCount and All-mode sub-requests in the same FirstAvailable", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+										{
+											Name:            "one-gpu",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests[0].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeAll))
+				Expect(data.Requests[0].SubRequests[0].AllDevices).To(HaveLen(3))
+				Expect(data.Requests[0].SubRequests[1].AllocationMode).To(Equal(resourcev1.DeviceAllocationModeExactCount))
+				Expect(data.Requests[0].SubRequests[1].NumDevices).To(Equal(1))
+				Expect(data.Requests[0].SubRequests[1].AllDevices).To(BeNil())
+			})
+
+			It("should prune ITs based on worst-case sub-request template count", func() {
+				// 20 in-cluster devices. Sub-request 0 uses All mode.
+				// c5.large has 10 template devices: 20 + 10 = 30 <= 32, keep.
+				// c5.xlarge has 20 template devices: 20 + 20 = 40 > 32, prune.
+				deviceNames := make([]string, 20)
+				for i := range deviceNames {
+					deviceNames[i] = fmt.Sprintf("dev-%d", i)
+				}
+				reqs := scheduling.NewRequirements()
+				slices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s-20", "gpu.example.com", "pool-20", withAllNodes(), withGeneration(1, 1),
+						withAPIDevices(deviceNames...)),
+				}
+				largePools := dynamicresources.GatherPools(slices, reqs, "")
+
+				templateDevices := makeTemplateDevices(map[string]int{
+					"c5.large":  10,
+					"c5.xlarge": 20,
+				})
+
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+										{
+											Name:            "one-gpu",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, largePools, templateDevices, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				// c5.large should remain (sub-request 0's template devices used for pruning)
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveKey(unique.Make("c5.large")))
+				// c5.xlarge should be pruned
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).ToNot(HaveKey(unique.Make("c5.xlarge")))
+			})
+
+			It("should fail when all ITs are pruned due to sub-request template overflow", func() {
+				// 30 in-cluster devices. Any IT with template devices > 2 exceeds 32.
+				deviceNames := make([]string, 30)
+				for i := range deviceNames {
+					deviceNames[i] = fmt.Sprintf("dev-%d", i)
+				}
+				reqs := scheduling.NewRequirements()
+				slices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s-30", "gpu.example.com", "pool-30", withAllNodes(), withGeneration(1, 1),
+						withAPIDevices(deviceNames...)),
+				}
+				bigPools := dynamicresources.GatherPools(slices, reqs, "")
+
+				templateDevices := makeTemplateDevices(map[string]int{
+					"c5.large":  5,
+					"c5.xlarge": 5,
+				})
+
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, bigPools, templateDevices, celCache, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("all instance types pruned"))
+			})
+
+			It("should use max template count across sub-requests when pruning ITs", func() {
+				// Sub-request 0: All mode (templates from IT contribute).
+				// Sub-request 1: ExactCount 1 (no templates).
+				// Pruning uses max across sub-requests for each IT.
+				// 25 in-cluster devices.
+				// c5.large: sub-req0 has 5 templates, sub-req1 has 0. Max = 5. 25+5=30 <= 32, keep.
+				// c5.xlarge: sub-req0 has 10 templates, sub-req1 has 0. Max = 10. 25+10=35 > 32, prune.
+				deviceNames := make([]string, 25)
+				for i := range deviceNames {
+					deviceNames[i] = fmt.Sprintf("dev-%d", i)
+				}
+				reqs := scheduling.NewRequirements()
+				slices := []dynamicresources.ResourceSlice{
+					makeAPISlice("s-25", "gpu.example.com", "pool-25", withAllNodes(), withGeneration(1, 1),
+						withAPIDevices(deviceNames...)),
+				}
+				medPools := dynamicresources.GatherPools(slices, reqs, "")
+
+				templateDevices := makeTemplateDevices(map[string]int{
+					"c5.large":  5,
+					"c5.xlarge": 10,
+				})
+
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "all-gpus",
+											DeviceClassName: "empty-class",
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
+										},
+										{
+											Name:            "one-gpu",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, medPools, templateDevices, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveKey(unique.Make("c5.large")))
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).ToNot(HaveKey(unique.Make("c5.xlarge")))
+			})
+
+			It("should validate a claim with both Exactly and FirstAvailable requests", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "exact-req",
+									Exactly: &resourcev1.ExactDeviceRequest{
+										DeviceClassName: "empty-class",
+										Count:           2,
+									},
+								},
+								{
+									Name: "fa-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "empty-class",
+											Count:           3,
+										},
+										{
+											Name:            "a100",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(data.Requests).To(HaveLen(2))
+				// First is Exactly
+				Expect(data.Requests[0].Name).To(Equal("exact-req"))
+				Expect(data.Requests[0].NumDevices).To(Equal(2))
+				Expect(data.Requests[0].SubRequests).To(BeNil())
+				// Second is FirstAvailable
+				Expect(data.Requests[1].Name).To(Equal("fa-req"))
+				Expect(data.Requests[1].SubRequests).To(HaveLen(2))
+			})
+
+			It("should set parent RequestData with name and SubRequests only (no class/selectors)", func() {
+				claim := &resourcev1.ResourceClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "gpu-req",
+									FirstAvailable: []resourcev1.DeviceSubRequest{
+										{
+											Name:            "h100",
+											DeviceClassName: "empty-class",
+											Count:           1,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+				Expect(err).ToNot(HaveOccurred())
+				parent := data.Requests[0]
+				Expect(parent.Name).To(Equal("gpu-req"))
+				Expect(parent.SubRequests).To(HaveLen(1))
+				// Parent should not have class/selectors — those belong to sub-requests
+				Expect(parent.Class).To(BeNil())
+				Expect(parent.Selectors).To(BeNil())
+				Expect(parent.NumDevices).To(Equal(0))
+				Expect(parent.AllDevices).To(BeNil())
+				Expect(parent.AllTemplateDevicesByIT).To(BeNil())
+				Expect(parent.ParentName).To(BeEmpty())
 			})
 		})
 	})
