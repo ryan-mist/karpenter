@@ -750,7 +750,7 @@ type matchKey struct {
 
 ## Implementation Sequencing
 
-### Commit 1: Request Validation (unified RequestData + parsing)
+### Commit 1: Request Validation (unified RequestData + parsing) ✓
 
 Foundation layer. Adds `ParentName`, `SubRequests []RequestData`, `QualifiedName()`, `IsFirstAvailable()` to `RequestData`. Implements `validateFirstAvailableRequest`.
 
@@ -758,7 +758,7 @@ Foundation layer. Adds `ParentName`, `SubRequests []RequestData`, `QualifiedName
 - [Parsing FirstAvailable](#parsing-firstavailable)
 - [Device Limit Validation](#device-limit-validation)
 
-No behavioral change — requests with `FirstAvailable` are parsed but the DFS still rejects them until commit 2.
+No behavioral change — requests with `FirstAvailable` are parsed but the DFS still rejects them until commit 2. Implemented in commits `ac9948f8` + `96471594`.
 
 ### Commit 2: Constraint Interface Change
 
@@ -792,7 +792,7 @@ Records which sub-request was selected per-IT in the allocation metadata.
 ### Dependency Graph
 
 ```
-Commit 1: Request Validation
+Commit 1: Request Validation ✓
   │
   ├──→ Commit 2: Constraint Interface
   │       │
