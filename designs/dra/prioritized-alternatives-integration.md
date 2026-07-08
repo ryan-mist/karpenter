@@ -760,14 +760,14 @@ Foundation layer. Adds `ParentName`, `SubRequests []RequestData`, `QualifiedName
 
 No behavioral change — requests with `FirstAvailable` are parsed but the DFS still rejects them until commit 2. Implemented in commits `ac9948f8` + `96471594`.
 
-### Commit 2: Constraint Interface Change
+### Commit 2: Constraint Interface Change ✓
 
 Updates the `Constraint` interface to pass `parentName` + `subName`, and updates `appliesTo` on all constraint types.
 
 - [Constraint Interface Change](#constraint-interface-change)
 - [Request Name Matching](#request-name-matching)
 
-For Exactly requests, callers pass `subName=""` — no behavior change. This unblocks commit 3.
+For Exactly requests, callers pass `subName=""` — no behavior change. This unblocks commit 3. Implemented using a `RequestName{Parent, Sub}` struct parameter (semantically equivalent to separate string args). Implemented in commit `0e2751e1`.
 
 ### Commit 3: DFS Extension (sub-request iteration)
 
@@ -794,7 +794,7 @@ Records which sub-request was selected per-IT in the allocation metadata.
 ```
 Commit 1: Request Validation ✓
   │
-  ├──→ Commit 2: Constraint Interface
+  ├──→ Commit 2: Constraint Interface ✓
   │       │
   │       ▼
   ├──→ Commit 3: DFS Extension (depends on 1 + 2)
