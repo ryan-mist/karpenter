@@ -74,6 +74,8 @@ type AttributeBindingFallback struct {
 	InstanceTypeID InstanceTypeID
 }
 
+// TODO: do we want to do requestName, subRequestName like upstream?
+//
 //nolint:gocyclo
 func (m *MatchAttributeConstraint) Add(requestName RequestName, device cloudprovider.Device, deviceID DeviceID) bool {
 	if !m.appliesTo(requestName) {
