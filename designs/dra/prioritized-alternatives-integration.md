@@ -350,97 +350,113 @@ This is conservative — it prevents accepting claims that MIGHT exceed the limi
 
 ### New Iteration Level
 
-The current DFS signature is:
+> **Implemented (`a413c929`).** The final implementation diverged from the stateful
+> `activeSubRequest` design originally sketched here. Instead of tracking the active
+> sub-request in allocator fields with "re-entry routing," the DFS threads the sub-request
+> index as an explicit parameter (`subReqIdx`). This is simpler — no field to save/restore,
+> no re-entry guards — and is documented below as-built.
+
+The DFS signature gains a `subReqIdx` parameter (`-1` for Exactly requests and for the
+FirstAvailable parent before a sub-request is chosen):
 
 ```go
+// Before:
 func (a *allocator) dfs(claimIdx, reqIdx, slotIdx int) bool
+// After:
+func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool
 ```
 
-With FirstAvailable, when `reqIdx` points to a request with `SubRequests != nil`, we iterate sub-requests before proceeding to slots. The signature remains unchanged — the sub-request iteration is handled inline:
+The effective request is resolved inline from `(reqIdx, subReqIdx)`. When the parent is a
+FirstAvailable request (`subReqIdx < 0 && len(rd.SubRequests) > 0`), the DFS delegates to
+`dfsFirstAvailable`, which iterates sub-requests by re-entering `dfs` with a concrete
+`subReqIdx`:
 
 ```go
-func (a *allocator) dfs(claimIdx, reqIdx, slotIdx int) bool {
-    // ... existing base cases (claimIdx >= len, reqIdx >= len) ...
+func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool {
+    // ... ctx cancellation + base case (claimIdx >= len) ...
 
     cd := a.claimData[claimIdx]
-    rd := &cd.Requests[reqIdx]
 
-    // FirstAvailable: iterate sub-requests in priority order.
-    // Only triggers at slotIdx == 0 (entry point for this request).
-    if rd.SubRequests != nil && slotIdx == 0 {
-        return a.dfsFirstAvailable(claimIdx, reqIdx, cd, rd)
+    // Advance past completed requests/claims.
+    if reqIdx >= len(cd.Requests) {
+        return a.dfs(claimIdx+1, 0, -1, 0)
     }
 
-    // Re-entry routing: if we're inside a sub-request (activeSubRequest != nil),
-    // dfs() is being called from tryDevice's recursion (slotIdx > 0) or from the
-    // sub-request DFS functions. Route to the sub-request's slot-filling logic
-    // using the EXISTING dfsExactCount/dfsAllMode functions (unified struct).
-    if a.activeSubRequest != nil && rd.SubRequests != nil {
-        numSlots := a.numSlots(a.activeSubRequest)
-        if slotIdx >= numSlots {
-            // All slots for this sub-request filled — advance to next request.
-            prevSub := a.activeSubRequest
-            prevSubIdx := a.activeSubRequestIdx
-            a.activeSubRequest = nil
-            a.activeSubRequestIdx = -1
-            result := a.dfs(claimIdx, reqIdx+1, 0)
-            if !result {
-                a.activeSubRequest = prevSub
-                a.activeSubRequestIdx = prevSubIdx
-            }
-            return result
-        }
-        // Unified: use existing dfsExactCount/dfsAllMode with the sub-request's RequestData.
-        if a.activeSubRequest.AllocationMode == resourcev1.DeviceAllocationModeAll {
-            return a.dfsAllMode(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
-        }
-        return a.dfsExactCount(claimIdx, reqIdx, slotIdx, cd, a.activeSubRequest)
+    // Resolve the effective request: top-level for Exactly/parent, sub-request for FirstAvailable.
+    var rd *RequestData
+    if subReqIdx < 0 {
+        rd = &cd.Requests[reqIdx]
+    } else {
+        rd = &cd.Requests[reqIdx].SubRequests[subReqIdx]
     }
 
-    // Exactly request: existing behavior unchanged (passes rd directly).
-    // ...
+    // Parent-level FirstAvailable: begin sub-request iteration.
+    if subReqIdx < 0 && len(rd.SubRequests) > 0 {
+        return a.dfsFirstAvailable(claimIdx, reqIdx, rd)
+    }
+
+    numSlots := a.numSlots(rd)
+    // All mode requires at least one device (see "Zero-device All mode requires an explicit
+    // guard" below). Without this, a zero-slot All-mode (sub-)request would fall into the
+    // slotIdx >= numSlots branch and "succeed" by allocating nothing.
+    if rd.AllocationMode == resourcev1.DeviceAllocationModeAll && numSlots == 0 {
+        return false
+    }
+    if slotIdx >= numSlots {
+        return a.dfs(claimIdx, reqIdx+1, -1, 0)
+    }
+    if rd.AllocationMode == resourcev1.DeviceAllocationModeAll {
+        return a.dfsAllMode(claimIdx, reqIdx, subReqIdx, slotIdx, cd, rd)
+    }
+    return a.dfsExactCount(claimIdx, reqIdx, subReqIdx, slotIdx, cd, rd)
 }
 ```
 
-**Re-entry routing explained:** When `tryDevice` allocates a device and recurses via `a.dfs(claimIdx, reqIdx, slotIdx+1)`, the re-entered `dfs()` must continue filling slots for the active sub-request (not re-enter `dfsFirstAvailable`). The `slotIdx == 0` guard prevents re-entry into the sub-request loop, and the `activeSubRequest != nil` check routes subsequent slot fills to the correct sub-request DFS function.
+**Why no re-entry guard is needed:** because `subReqIdx` is a parameter (not allocator
+state), every re-entry into `dfs` — whether from `tryDevice`'s `slotIdx+1` recursion or from
+advancing to `reqIdx+1` — carries the correct sub-request context explicitly. Advancing to the
+next request resets `subReqIdx` to `-1` (`a.dfs(claimIdx, reqIdx+1, -1, 0)`), so the next
+request re-enters `dfsFirstAvailable` if it too is a FirstAvailable parent. There is nothing to
+save or restore.
 
-When all slots are filled (`slotIdx >= numSlots`), `dfs` advances to the next request (`reqIdx+1`). If that recursion fails (returns false), the sub-request context is restored so `tryDevice`'s backtracking can try the next candidate device for the current slot.
+**Cross-claim backtracking works naturally:** When the final slot's `tryDevice` recurses and
+`dfs` advances to subsequent claims, those claims run their full DFS. If a subsequent claim
+fails (e.g., insufficient capacity because this sub-request consumed too much), the entire
+recursive chain unwinds — through the subsequent claims, back through this sub-request's
+slots — and `dfsFirstAvailable`'s loop tries the next sub-request with a clean slate.
 
-**Cross-claim backtracking works naturally:** When the final slot's `tryDevice` recurses and `dfs` advances to subsequent claims, those claims run their full DFS. If a subsequent claim fails (e.g., insufficient capacity because this sub-request consumed too much), the entire recursive chain unwinds — through the subsequent claims, back through this sub-request's slots — and `dfsFirstAvailable` tries the next sub-request with a clean slate.
+Example: Claim 1 sub-request 0 (80Gi GPU) fills its slot, recurses to claim 2 (20Gi) which
+fails (capacity exhausted). Backtracking unwinds claim 1's allocation, `dfsFirstAvailable`
+tries sub-request 1 (20Gi), which succeeds and leaves room for claim 2. (Covered by the
+"should backtrack across claims when sub-request consumes too much capacity" test.)
 
-Example: Claim 1 sub-request 0 (80Gi GPU) fills its slot, recurses to claim 2 (20Gi) which fails (capacity exhausted). Backtracking unwinds claim 1's allocation, `dfsFirstAvailable` tries sub-request 1 (20Gi), which succeeds and leaves room for claim 2.
-
-The new `dfsFirstAvailable` function:
+The `dfsFirstAvailable` function is a plain priority-order loop — the slot-count / All-mode
+branching happens on re-entry into `dfs`, so it needs neither `cd` nor a manual dispatch to
+`dfsExactCount`/`dfsAllMode`:
 
 ```go
-func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, cd *ClaimData, rd *RequestData) bool {
+// dfsFirstAvailable iterates sub-requests in priority order for a FirstAvailable request.
+func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, rd *RequestData) bool {
     for subIdx := range rd.SubRequests {
-        sub := &rd.SubRequests[subIdx]
-        a.activeSubRequest = sub
-        a.activeSubRequestIdx = subIdx
-
-        // Use existing DFS functions directly — unified RequestData makes this possible.
-        var success bool
-        if sub.AllocationMode == resourcev1.DeviceAllocationModeAll {
-            success = a.dfsAllMode(claimIdx, reqIdx, 0, cd, sub)
-        } else {
-            success = a.dfsExactCount(claimIdx, reqIdx, 0, cd, sub)
-        }
-        if success {
-            a.selectedSubRequests[requestKey{claimIdx, reqIdx}] = subIdx
+        if a.dfs(claimIdx, reqIdx, subIdx, 0) {
+            a.selectedSubRequests[RequestKey{ClaimIndex: claimIdx, RequestIndex: reqIdx}] = subIdx
             return true
         }
-        // State is already clean — the DFS fully unwinds on failure.
     }
-    a.activeSubRequest = nil
-    a.activeSubRequestIdx = -1
     return false
 }
 ```
 
-**Key benefit of the unified model:** No `dfsExactCountSub` or `dfsAllModeSub` functions needed. The existing `dfsExactCount` and `dfsAllMode` accept a `*RequestData` parameter — when passed a sub-request entry, they read its `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`, `NumDevices`, etc. identically to an Exactly request. The re-entry routing in `dfs()` simply passes `a.activeSubRequest` to these existing functions.
+**Key benefit of the unified model:** No `dfsExactCountSub` or `dfsAllModeSub` functions
+needed. `dfsExactCount`, `dfsAllMode`, and `tryDevice` each gained the `subReqIdx` parameter
+(threaded through purely so `matchKey` can distinguish sub-requests — see design decision #6)
+and otherwise read the sub-request's `Selectors`, `AllDevices`, `AllTemplateDevicesByIT`,
+`NumDevices`, etc. identically to an Exactly request, since `rd` was resolved to the
+sub-request entry in `dfs`.
 
-After all slots are filled (via the re-entry path), `dfs` advances to the next request. If the entire remaining DFS tree succeeds (subsequent claims satisfied), the sub-request is "locked in" for this IT. If it fails, backtracking unwinds all the way and `dfsFirstAvailable` tries the next sub-request.
+If the entire remaining DFS tree succeeds (subsequent claims satisfied), the sub-request is
+"locked in" for this IT and recorded in `selectedSubRequests`. If it fails, backtracking
+unwinds all the way and `dfsFirstAvailable` tries the next sub-request.
 
 ### State Management
 
@@ -466,7 +482,8 @@ Per instance type:
   For each claim:
     For each request:
       If FirstAvailable:
-        For each sub-request (priority order):      ← NEW LEVEL
+        For each sub-request (priority order):      ← NEW LEVEL (re-enter dfs with subReqIdx)
+          If All-mode with 0 eligible devices → fail this sub-request  ← min-1 guard
           Fill all slots via existing dfsExactCount/dfsAllMode (unified RequestData)
             tryDevice (existing) — auto-backtracks on failure
           If all slots filled:
@@ -483,7 +500,43 @@ The only new responsibility is tracking WHICH sub-request succeeded for result r
 
 A sub-request can use `AllocationMode: All`. If the all-mode sub-request fails (e.g., not enough matching devices in the pool for this IT), the DFS for that sub-request fails, backtracking unwinds all tentative allocations, and the next sub-request is tried.
 
-Each sub-request `RequestData` has independently computed `AllDevices` and `AllTemplateDevicesByIT` — the existing `dfsAllMode` uses these directly. A sub-request requesting "all A100s" may have 0 eligible devices for an IT that only has H100s, causing immediate failure and fallthrough to the next alternative.
+Each sub-request `RequestData` has independently computed `AllDevices` and `AllTemplateDevicesByIT` — the existing `dfsAllMode` uses these directly. A sub-request requesting "all A100s" may have 0 eligible devices for an IT that only has H100s.
+
+#### Zero-device All mode requires an explicit guard
+
+Upstream enforces a hard rule: **All mode requires at least one device.** An `All` request (or sub-request) that matches zero eligible devices is *unsatisfiable*, not a trivial success. See `allocator_incubating.go` (`allocateOne`):
+
+```go
+// At least one device is required for 'All' allocation mode.
+if doAllDevices && len(requestData.allDevices) == 0 {
+    return false, nil
+}
+```
+
+Karpenter's DFS must special-case this because `numSlots` for an All-mode request is `len(AllDevices) + len(AllTemplateDevicesByIT[itID])`. When that is `0`, the natural `slotIdx >= numSlots` check would treat the request as *already fully satisfied* (all zero slots filled) and advance to the next request — succeeding with an empty allocation. For a FirstAvailable All-mode sub-request that is actively wrong: the empty sub-request would "lock in" and the fallback would never be tried; for a standalone All-mode request it would report an allocation the real kube-scheduler rejects.
+
+The guard sits in `dfs()` immediately after computing `numSlots`, mirroring upstream:
+
+```go
+numSlots := a.numSlots(rd)
+// All mode requires at least one device (matches upstream): a zero-device All-mode
+// (sub-)request is unsatisfiable, not a trivial success.
+if rd.AllocationMode == resourcev1.DeviceAllocationModeAll && numSlots == 0 {
+    return false
+}
+if slotIdx >= numSlots {
+    return a.dfs(claimIdx, reqIdx+1, -1, 0)
+}
+```
+
+Because the guard lives in the shared `dfs()` path, it fires uniformly for both standalone All-mode requests and FirstAvailable All-mode sub-requests. A sub-request requesting "all A100s" with 0 eligible devices for an IT that only has H100s now fails immediately and falls through to the next alternative — the intended behavior.
+
+> **Note — this fixed a latent base-allocator bug.** Before this guard, a standalone
+> (non-FirstAvailable) All-mode request matching zero devices also succeeded with an empty
+> allocation. That path predates prioritized alternatives; the guard corrects both cases at
+> once since they share `dfs()`. Covered by the "should fail when an All-mode request matches
+> zero devices" (standalone) and "should fall back from All-mode to ExactCount when All-mode
+> matches zero devices" (FirstAvailable) tests.
 
 ---
 
@@ -573,33 +626,44 @@ No special handling is needed — the existing `Add`/`Remove` protocol on `tryDe
 
 ### Selected Sub-Request Recording
 
-The child `allocator` struct gains a field tracking the active sub-request:
+> **As-built (`a413c929`).** There are no `activeSubRequest` / `activeSubRequestIdx` fields —
+> the active sub-request is carried by the `subReqIdx` DFS parameter, not allocator state. The
+> only recording field added in commit 3 is `selectedSubRequests`.
+
+The child `allocator` struct gains a single map recording which sub-request won:
 
 ```go
 type allocator struct {
     // ... existing fields ...
 
-    // activeSubRequest points to the sub-request's RequestData currently being filled during DFS.
-    // nil when processing an Exactly request. Same type as top-level requests (unified model).
-    activeSubRequest *RequestData
-    // activeSubRequestIdx is the index of the active sub-request within rd.SubRequests.
-    // -1 when not in a FirstAvailable request.
-    activeSubRequestIdx int
-
-    // selectedSubRequests records which sub-request was selected for each FirstAvailable request
-    // during a successful DFS for this IT. Keyed by (claimIdx, reqIdx).
-    selectedSubRequests map[requestKey]int
-}
-
-type requestKey struct {
-    claimIdx int
-    reqIdx   int
+    // selectedSubRequests records which sub-request index was selected for each FirstAvailable
+    // request during a successful DFS for this IT. Keyed by (claimIdx, reqIdx).
+    selectedSubRequests map[RequestKey]int
 }
 ```
 
-When `dfsFirstAvailable` finds a successful sub-request, it records the selection (shown in the `dfsFirstAvailable` function above).
+`RequestKey` is the existing type from `request.go` (added in commit 1):
+
+```go
+type RequestKey struct {
+    ClaimIndex   int
+    RequestIndex int
+}
+```
+
+When `dfsFirstAvailable` finds a successful sub-request, it records the selection (shown in the
+`dfsFirstAvailable` function above). The write happens only on the `a.dfs(...) == true` path,
+so it always lands on the globally-winning branch — abandoned branches leave no stale entries.
+The map is initialized in `Allocate` and cleared per-IT in `restoreState`.
+
+The value is **write-only in commit 3** — nothing reads `selectedSubRequests` yet. Surfacing it
+into the allocation metadata is [Commit 4](#commit-4-result-tracking).
 
 ### DeviceAllocationResult Extension
+
+> **Not yet implemented — this is [Commit 4](#commit-4-result-tracking).** As of commit 3,
+> `DeviceAllocationResult` still has only `DeviceID` + `ConsumedCapacity`, and
+> `deviceAllocationMetadata` has no `requestName` field. The design below is the commit-4 plan.
 
 The `DeviceAllocationResult` struct in `ResourceClaimAllocationMetadata.Devices` is extended to track the request name (including qualified sub-request name if applicable):
 
@@ -626,27 +690,22 @@ for di, da := range a.allocatedDevicesMetadata {
 }
 ```
 
-Where `da.requestName` is populated during `tryDevice` recording:
+Where `da.requestName` is populated during `tryDevice` recording. Because `dfs` already
+resolved `rd` to the effective (sub-)request entry, no `activeSubRequest` lookup is needed — the
+name is read directly off `rd.Name`, which is a `RequestName{Parent, Sub}` struct whose
+`String()` returns `"parent/sub"` for sub-requests and just `Parent` for Exactly requests:
 
 ```go
 a.allocatedDevicesMetadata = append(a.allocatedDevicesMetadata, deviceAllocationMetadata{
     claimIndex:       claimIdx,
     deviceWithID:     dw,
     consumedCapacity: consumed,
-    requestName:      a.currentRequestName(rd),
+    requestName:      rd.Name.String(),  // "parent/sub" for sub-requests, "parent" otherwise
 })
 ```
 
-```go
-func (a *allocator) currentRequestName(rd *RequestData) string {
-    if a.activeSubRequest != nil {
-        return a.activeSubRequest.QualifiedName()  // returns "parent/sub"
-    }
-    return rd.Name
-}
-```
-
-With the unified model, this can also be expressed as just calling `QualifiedName()` on whichever `*RequestData` is being processed — it returns `"parent/sub"` when `ParentName != ""`, or just `Name` otherwise.
+This is the natural payoff of threading `subReqIdx`: the request being processed is always the
+correct one, so the qualified name falls out of `rd.Name` with no extra state.
 
 ### Metadata Propagation
 
@@ -769,9 +828,12 @@ Updates the `Constraint` interface to pass `parentName` + `subName`, and updates
 
 For Exactly requests, callers pass `subName=""` — no behavior change. This unblocks commit 3. Implemented using a `RequestName{Parent, Sub}` struct parameter (semantically equivalent to separate string args). Implemented in commit `0e2751e1`.
 
-### Commit 3: DFS Extension (sub-request iteration)
+### Commit 3: DFS Extension (sub-request iteration) ✓
 
-The core feature. Adds `dfsFirstAvailable` and re-entry routing in `dfs()`. Reuses existing `dfsExactCount`/`dfsAllMode` via the unified `*RequestData` (no separate `Sub` variants needed).
+The core feature. Adds `dfsFirstAvailable` and threads a `subReqIdx` parameter through
+`dfs`/`dfsExactCount`/`dfsAllMode`/`tryDevice`. Reuses the existing slot-filling functions via
+the unified `*RequestData` (no separate `Sub` variants needed). Implemented in commit
+`a413c929`.
 
 - [New Iteration Level](#new-iteration-level)
 - [State Management](#state-management)
@@ -780,6 +842,21 @@ The core feature. Adds `dfsFirstAvailable` and re-entry routing in `dfs()`. Reus
 - [matchKey extension](#6-matchkey-for-cel-cache-includes-sub-request-identity)
 
 After this commit, FirstAvailable requests are fully functional.
+
+**Divergences from the original sketch (all documented in-place above):**
+- Used a threaded `subReqIdx` parameter instead of stateful `activeSubRequest` fields + re-entry
+  routing — simpler, nothing to save/restore.
+- Added a **min-1 guard for zero-device All mode** in `dfs()` — required for correctness, also
+  fixes the pre-existing standalone-All-mode case. See [All Mode Interaction](#all-mode-interaction).
+- Extended `countersFeasible` (partitionable devices) to handle FirstAvailable: an IT is pruned
+  only if *every* sub-request is All-mode and all fail their counter budget; any ExactCount
+  sub-request short-circuits to "assume feasible." Conservative — never prunes a viable IT.
+
+**Test coverage note:** the core allocator behaviors (fallback ordering, per-IT selection,
+cross-claim backtracking, constraints scoped to parent vs. `parent/sub`, template devices, All
+mode + zero-device fallthrough, IT pruning) are covered. Some edge cases were intentionally left
+for later (noted here rather than silently skipped): consumable-capacity interaction with
+FirstAvailable sub-request backtracking, and DistinctAttribute (still unsupported at parse time).
 
 ### Commit 4: Result Tracking
 
@@ -797,7 +874,7 @@ Commit 1: Request Validation ✓
   ├──→ Commit 2: Constraint Interface ✓
   │       │
   │       ▼
-  ├──→ Commit 3: DFS Extension (depends on 1 + 2)
+  ├──→ Commit 3: DFS Extension ✓ (depends on 1 + 2)
   │       │
   │       ▼
   └──→ Commit 4: Result Tracking (depends on 3)
