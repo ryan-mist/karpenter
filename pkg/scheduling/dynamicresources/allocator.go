@@ -745,6 +745,10 @@ func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool {
 	}
 
 	numSlots := a.numSlots(rd)
+	// All-mode requires at least one device to be satisfiable
+	if rd.AllocationMode == resourcev1.DeviceAllocationModeAll && numSlots == 0 {
+		return false
+	}
 	if slotIdx >= numSlots {
 		return a.dfs(claimIdx, reqIdx+1, -1, 0)
 	}

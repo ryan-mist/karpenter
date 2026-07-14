@@ -2616,6 +2616,22 @@ var _ = Describe("Allocator", func() {
 			Expect(result.InstanceTypes).To(HaveLen(2))
 		})
 
+		It("should fail when an All-mode request matches zero devices", func() {
+			// Only NIC devices exist; the All-mode request targets the gpu class, which
+			// matches nothing. Upstream requires at least one device for All mode, so this
+			// request is unsatisfiable rather than a trivial success with an empty set.
+			inClusterSlices := []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "nic.example.com", "nic-pool", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices("nic-0")),
+			}
+			alloc = dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{ExclusiveDevices: sets.New[cloudprovider.DeviceID]()}, nil, env.Client, nil)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", allRequest("req-1", "gpu"))
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+		})
+
 		It("should fail when an already-allocated device is in the all set", func() {
 			inClusterSlices := []dynamicresources.ResourceSlice{
 				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
