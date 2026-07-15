@@ -624,96 +624,107 @@ No special handling is needed — the existing `Add`/`Remove` protocol on `tryDe
 
 ## Result Tracking
 
-### Selected Sub-Request Recording
+> **Implemented (commit 4).** The design diverged from the commit-3 sketch below in two ways, both
+> validated against upstream: the per-device request name is stored as the `RequestName{Parent, Sub}`
+> **struct** (not a pre-joined string), and the commit-3 `selectedSubRequests` map is **removed**
+> rather than surfaced — the per-device name subsumes it. Documented as-built below.
 
-> **As-built (`a413c929`).** There are no `activeSubRequest` / `activeSubRequestIdx` fields —
-> the active sub-request is carried by the `subReqIdx` DFS parameter, not allocator state. The
-> only recording field added in commit 3 is `selectedSubRequests`.
+### Design: record the selected name per-device, not the index
 
-The child `allocator` struct gains a single map recording which sub-request won:
+Upstream never persists the selected sub-request *index*. The only thing in the API result that
+encodes the choice is the per-device `DeviceRequestAllocationResult.Request` string:
+`internalDeviceResult.requestName()` returns `parentRequest + "/" + request` for a selected
+sub-request and just `request` for a plain request (`allocator_incubating.go`). Downstream tooling
+(e.g. kube-scheduler's `computeScore`) *reconstructs* the index by matching that string back against
+`req.FirstAvailable[i].Name`. Two consequences for Karpenter:
 
-```go
-type allocator struct {
-    // ... existing fields ...
+1. **The name must round-trip.** We record `parent/sub` where `sub` is exactly the sub-request's
+   `Name`, so `resourceclaim.IsSubRequestRef` / `BaseRequestRef` parse it correctly.
+2. **The commit-3 `selectedSubRequests` map is redundant.** Once every allocated device carries its
+   qualified request name, the selection is fully recoverable from the per-device metadata — the same
+   way upstream recovers it. The map (and its commit-1 `RequestKey` helper type) were **deleted** in
+   commit 4; nothing read them.
 
-    // selectedSubRequests records which sub-request index was selected for each FirstAvailable
-    // request during a successful DFS for this IT. Keyed by (claimIdx, reqIdx).
-    selectedSubRequests map[RequestKey]int
-}
-```
-
-`RequestKey` is the existing type from `request.go` (added in commit 1):
-
-```go
-type RequestKey struct {
-    ClaimIndex   int
-    RequestIndex int
-}
-```
-
-When `dfsFirstAvailable` finds a successful sub-request, it records the selection (shown in the
-`dfsFirstAvailable` function above). The write happens only on the `a.dfs(...) == true` path,
-so it always lands on the globally-winning branch — abandoned branches leave no stale entries.
-The map is initialized in `Allocate` and cleared per-IT in `restoreState`.
-
-The value is **write-only in commit 3** — nothing reads `selectedSubRequests` yet. Surfacing it
-into the allocation metadata is [Commit 4](#commit-4-result-tracking).
+Upstream stores the two names *separately* on `internalDeviceResult` (`parentRequest` + `request`)
+and joins them once at result-emit time. We mirror this by storing the `RequestName{Parent, Sub}`
+struct from commit 2 and calling `.String()` only at the API-emit / binding boundary — avoiding
+early joining and any double-join risk.
 
 ### DeviceAllocationResult Extension
 
-> **Not yet implemented — this is [Commit 4](#commit-4-result-tracking).** As of commit 3,
-> `DeviceAllocationResult` still has only `DeviceID` + `ConsumedCapacity`, and
-> `deviceAllocationMetadata` has no `requestName` field. The design below is the commit-4 plan.
-
-The `DeviceAllocationResult` struct in `ResourceClaimAllocationMetadata.Devices` is extended to track the request name (including qualified sub-request name if applicable):
+`DeviceAllocationResult` (in `ResourceClaimAllocationMetadata.Devices`) gains the owning request name:
 
 ```go
 type DeviceAllocationResult struct {
     DeviceID         DeviceID
     ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
-    // RequestName is the request name for this allocation result.
-    // For Exactly requests: the parent request name (e.g., "gpu").
-    // For FirstAvailable: qualified "parent/sub" format (e.g., "gpu/a100").
-    RequestName string
+    // RequestName is the claim request that owns this device. For Exactly requests, only Parent is
+    // set (e.g. "gpu"); for a selected FirstAvailable sub-request, both Parent and Sub are set so
+    // RequestName.String() yields the qualified "parent/sub" form (e.g. "gpu/a100") that the API
+    // server requires in DeviceRequestAllocationResult.Request.
+    RequestName RequestName
 }
 ```
 
-When recording results in the IT success path (after `dfs` returns true), the metadata builder uses:
-
-```go
-for di, da := range a.allocatedDevicesMetadata {
-    meta.Devices[itID] = append(meta.Devices[itID], DeviceAllocationResult{
-        DeviceID:         da.deviceWithID.ID,
-        ConsumedCapacity: da.consumedCapacity,
-        RequestName:      da.requestName,
-    })
-}
-```
-
-Where `da.requestName` is populated during `tryDevice` recording. Because `dfs` already
-resolved `rd` to the effective (sub-)request entry, no `activeSubRequest` lookup is needed — the
-name is read directly off `rd.Name`, which is a `RequestName{Parent, Sub}` struct whose
-`String()` returns `"parent/sub"` for sub-requests and just `Parent` for Exactly requests:
+`deviceAllocationMetadata` gains a matching `requestName RequestName` field, populated in `tryDevice`
+directly off the effective request `rd` — which `dfs` has already resolved to the concrete
+(sub-)request entry, so no `activeSubRequest` lookup or index bookkeeping is needed:
 
 ```go
 a.allocatedDevicesMetadata = append(a.allocatedDevicesMetadata, deviceAllocationMetadata{
     claimIndex:       claimIdx,
     deviceWithID:     dw,
     consumedCapacity: consumed,
-    requestName:      rd.Name.String(),  // "parent/sub" for sub-requests, "parent" otherwise
+    requestName:      rd.Name,  // {Parent, Sub} for a selected sub-request; {Parent} for Exactly
 })
 ```
 
-This is the natural payoff of threading `subReqIdx`: the request being processed is always the
-correct one, so the qualified name falls out of `rd.Name` with no extra state.
+The IT success path copies it onto the result verbatim:
 
-### Metadata Propagation
+```go
+meta.Devices[itID] = append(meta.Devices[itID], DeviceAllocationResult{
+    DeviceID:         da.deviceWithID.ID,
+    ConsumedCapacity: da.consumedCapacity,
+    RequestName:      da.requestName,
+})
+```
 
-The selected sub-request index per-IT is stored in metadata for potential use by:
-- Integration tests (verifying the correct alternative was chosen)
-- Future optimization (preferring ITs where higher-priority sub-requests succeeded)
+This is the natural payoff of threading `subReqIdx` in commit 3: the request being processed is
+always the correct one, so the qualified name falls out of `rd.Name` with no extra state. Since the
+name is recorded per allocated device, a Count=2 sub-request produces two device results that both
+carry the same qualified name — matching upstream's per-device denormalization.
 
-This is informational — no correctness logic depends on it.
+### `dfsFirstAvailable` simplification
+
+With the `selectedSubRequests` write removed, `dfsFirstAvailable` is a plain priority-order loop that
+returns on the first sub-request whose subtree completes:
+
+```go
+func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, rd *RequestData) bool {
+    for subIdx := range rd.SubRequests {
+        if a.dfs(claimIdx, reqIdx, subIdx, 0) {
+            return true
+        }
+    }
+    return false
+}
+```
+
+### Integration payoff: real bindings for FirstAvailable
+
+The consumer this unblocks is `ExpectDRAResourceClaimsBound` (test framework). Before commit 4 it
+reverse-engineered each device's request name via `requestNamesForDevices`, walking `claim.Spec` in
+order and consuming each request's `Count`. That hack **cannot** produce a valid binding for a
+FirstAvailable request: the parent request has no `Count`, and the API server requires the qualified
+`parent/sub` name, not the bare parent name. Commit 4 replaces the reconstruction with a direct read:
+
+```go
+Request: device.RequestName.String(),
+```
+
+`requestNamesForDevices` was deleted. This is what makes FirstAvailable claims actually bindable in
+integration tests — previously there was zero FirstAvailable coverage under `test/suites/dra/`
+because there was no correct way to form the binding.
 
 ---
 
@@ -858,13 +869,23 @@ mode + zero-device fallthrough, IT pruning) are covered. Some edge cases were in
 for later (noted here rather than silently skipped): consumable-capacity interaction with
 FirstAvailable sub-request backtracking, and DistinctAttribute (still unsupported at parse time).
 
-### Commit 4: Result Tracking
+### Commit 4: Result Tracking ✓
 
-Records which sub-request was selected per-IT in the allocation metadata.
+Records the selected (sub-)request name on each allocated device and surfaces it through the
+allocation metadata, replacing the integration-test reverse-engineering hack.
 
-- [Selected Sub-Request Recording](#selected-sub-request-recording)
 - [DeviceAllocationResult Extension](#deviceallocationresult-extension)
-- [Metadata Propagation](#metadata-propagation)
+- [Integration payoff: real bindings for FirstAvailable](#integration-payoff-real-bindings-for-firstavailable)
+
+Adds `RequestName` to `DeviceAllocationResult` and `requestName` to `deviceAllocationMetadata`
+(read off `rd.Name` in `tryDevice`). Rewires `ExpectDRAResourceClaimsBound` to read
+`device.RequestName.String()` instead of `requestNamesForDevices` (deleted).
+
+**Divergences from the commit-3 sketch (all documented in-place above):**
+- Stored the `RequestName{Parent, Sub}` **struct** per device rather than a pre-joined string —
+  matches upstream's store-separately-join-once (`internalDeviceResult`).
+- **Removed** the commit-3 `selectedSubRequests` map and the commit-1 `RequestKey` type — the
+  per-device name subsumes the selected index (upstream never persists the index either).
 
 ### Dependency Graph
 
@@ -877,7 +898,7 @@ Commit 1: Request Validation ✓
   ├──→ Commit 3: DFS Extension ✓ (depends on 1 + 2)
   │       │
   │       ▼
-  └──→ Commit 4: Result Tracking (depends on 3)
+  └──→ Commit 4: Result Tracking ✓ (depends on 3)
 ```
 
 All commits are incremental — each compiles and passes tests independently. Commit 3 is the bulk of the work.
