@@ -19,6 +19,7 @@ package dynamicresources
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/samber/lo"
 	resourcev1 "k8s.io/api/resource/v1"
@@ -178,21 +179,20 @@ func ValidateClaimRequest(
 		data.Requests = append(data.Requests, *rd)
 	}
 
-	// TODO: should we not do worst case for FirstAvailable - similar to upstream
-	// we could do min for upfront validation and then check during DFS?
-
 	// Compute the base device total: ExactCount requests contribute NumDevices,
 	// All-mode requests contribute their in-cluster device count (len(AllDevices)).
 	// This base total is constant regardless of instance type.
-	// For FirstAvailable, we use the worst-case (max across sub-requests).
+	// For FirstAvailable, we use the min across sub-requests. Because this can pass while
+	// no combination of sub-request selections actually fits, the per-claim check runs
+	// during the DFS.
 	var baseTotalDevices int
 	for _, req := range data.Requests {
 		if len(req.SubRequests) > 0 {
-			maxDevices := 0
+			minDevices := math.MaxInt
 			for _, sub := range req.SubRequests {
-				maxDevices = max(maxDevices, sub.NumDevices+len(sub.AllDevices))
+				minDevices = min(minDevices, sub.NumDevices+len(sub.AllDevices))
 			}
-			baseTotalDevices += maxDevices
+			baseTotalDevices += minDevices
 		} else {
 			baseTotalDevices += req.NumDevices
 			baseTotalDevices += len(req.AllDevices)
@@ -225,11 +225,11 @@ func ValidateClaimRequest(
 		var templateCount int
 		for _, req := range data.Requests {
 			if len(req.SubRequests) > 0 {
-				maxForReq := 0
+				minForReq := math.MaxInt
 				for _, sub := range req.SubRequests {
-					maxForReq = max(maxForReq, len(sub.AllTemplateDevicesByIT[itID]))
+					minForReq = min(minForReq, len(sub.AllTemplateDevicesByIT[itID]))
 				}
-				templateCount += maxForReq
+				templateCount += minForReq
 			} else {
 				templateCount += len(req.AllTemplateDevicesByIT[itID])
 			}

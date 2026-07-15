@@ -748,6 +748,12 @@ func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool {
 	if rd.AllocationMode == resourcev1.DeviceAllocationModeAll && numSlots == 0 {
 		return false
 	}
+	// Per-claim device limit must not exceed AllocationResultsMaxSize. This will only ever fire for a
+	// claim containing a FirstAvailable request. As the upfront validation is the min across sub-requests,
+	// or a lower bound.
+	if slotIdx == 0 && a.claimDeviceCount(claimIdx)+numSlots > int(resourcev1.AllocationResultsMaxSize) {
+		return false
+	}
 	if slotIdx >= numSlots {
 		return a.dfs(claimIdx, reqIdx+1, -1, 0)
 	}
@@ -755,6 +761,18 @@ func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool {
 		return a.dfsAllMode(claimIdx, reqIdx, subReqIdx, slotIdx, cd, rd)
 	}
 	return a.dfsExactCount(claimIdx, reqIdx, subReqIdx, slotIdx, cd, rd)
+}
+
+// claimDeviceCount returns the number of devices currently allocated for the given claim along the
+// active DFS path.
+func (a *allocator) claimDeviceCount(claimIdx int) int {
+	count := 0
+	for i := range a.allocatedDevicesMetadata {
+		if a.allocatedDevicesMetadata[i].claimIndex == claimIdx {
+			count++
+		}
+	}
+	return count
 }
 
 // dfsFirstAvailable iterates sub-requests in priority order for a FirstAvailable request. The first

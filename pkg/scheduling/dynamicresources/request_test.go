@@ -1484,9 +1484,11 @@ var _ = Describe("Request Validation", func() {
 				Expect(err.Error()).To(ContainSubstring("unsupported selector type"))
 			})
 
-			It("should use worst-case (max) device count across sub-requests for limit check", func() {
-				// Sub-request 0 wants 4 devices, sub-request 1 wants 2 devices.
-				// Worst case is 4. With another request of 29, total is 33 > 32 = fail.
+			It("should use the MIN device count across sub-requests for the upfront limit check", func() {
+				// Sub-request 0 wants 4 devices, sub-request 1 wants 2 devices — the MIN floor is 2. With
+				// another request of 31, the floor is 2+31 = 33 > 32, so the claim is rejected upfront: even
+				// picking the smallest sub-request cannot fit. (Worst-case max would use 4, also rejecting,
+				// but the point here is that the floor uses the smaller sub-request.)
 				claim := &resourcev1.ResourceClaim{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
 					Spec: resourcev1.ResourceClaimSpec{
@@ -1511,7 +1513,7 @@ var _ = Describe("Request Validation", func() {
 									Name: "other",
 									Exactly: &resourcev1.ExactDeviceRequest{
 										DeviceClassName: "empty-class",
-										Count:           29,
+										Count:           31,
 									},
 								},
 							},
@@ -1524,9 +1526,11 @@ var _ = Describe("Request Validation", func() {
 				Expect(err.Error()).To(ContainSubstring("exceeding maximum"))
 			})
 
-			It("should pass when worst-case count fits within limit", func() {
-				// Sub-request 0 wants 4, sub-request 1 wants 2.
-				// Worst case is 4. With another request of 28, total is 32 = OK.
+			It("should pass upfront when only the smaller sub-request fits within the limit", func() {
+				// Sub-request 0 wants 4, sub-request 1 wants 2 — MIN floor is 2. With another request of 30,
+				// the floor is 2+30 = 32 = OK, so the claim passes the upfront check even though the larger
+				// (worst-case) sub-request would sum to 4+30 = 34 > 32. The authoritative check that the
+				// selected combination fits happens during the DFS.
 				claim := &resourcev1.ResourceClaim{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
 					Spec: resourcev1.ResourceClaimSpec{
@@ -1551,7 +1555,7 @@ var _ = Describe("Request Validation", func() {
 									Name: "other",
 									Exactly: &resourcev1.ExactDeviceRequest{
 										DeviceClassName: "empty-class",
-										Count:           28,
+										Count:           30,
 									},
 								},
 							},
@@ -1563,10 +1567,12 @@ var _ = Describe("Request Validation", func() {
 				Expect(err).ToNot(HaveOccurred())
 			})
 
-			It("should include All-mode sub-request device counts in worst-case", func() {
-				// Sub-request 0: All mode with 3 in-cluster devices.
-				// Sub-request 1: ExactCount 1.
-				// Worst case is 3 (from All). With another request of 30, total is 33 > 32 = fail.
+			It("should include All-mode sub-request device counts in the MIN floor", func() {
+				// Sub-request 0: All mode with 3 in-cluster devices. Sub-request 1: ExactCount 1. The MIN
+				// floor across the two sub-requests is 1 (the ExactCount one). With another request of 31,
+				// the floor is 1+31 = 32 = OK, so the claim passes upfront — the All-mode sub-request's 3
+				// devices are the larger alternative and don't set the floor. (Worst-case max would use 3
+				// and reject at 3+31 = 34 > 32.)
 				claim := &resourcev1.ResourceClaim{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
 					Spec: resourcev1.ResourceClaimSpec{
@@ -1591,7 +1597,7 @@ var _ = Describe("Request Validation", func() {
 									Name: "other",
 									Exactly: &resourcev1.ExactDeviceRequest{
 										DeviceClassName: "empty-class",
-										Count:           30,
+										Count:           31,
 									},
 								},
 							},
@@ -1600,8 +1606,7 @@ var _ = Describe("Request Validation", func() {
 				}
 
 				_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("exceeding maximum"))
+				Expect(err).ToNot(HaveOccurred())
 			})
 
 			It("should populate AllDevices for an All-mode sub-request", func() {
@@ -1727,10 +1732,12 @@ var _ = Describe("Request Validation", func() {
 				Expect(data.Requests[0].SubRequests[1].AllDevices).To(BeNil())
 			})
 
-			It("should prune ITs based on worst-case sub-request template count", func() {
-				// 20 in-cluster devices. Sub-request 0 uses All mode.
-				// c5.large has 10 template devices: 20 + 10 = 30 <= 32, keep.
-				// c5.xlarge has 20 template devices: 20 + 20 = 40 > 32, prune.
+			It("should prune ITs based on the MIN sub-request template count", func() {
+				// 20 in-cluster devices. Both sub-requests are All mode, so each contributes its own template
+				// device count per IT; pruning uses the MIN across sub-requests (only one is ever selected).
+				// makeTemplateDevices assigns each IT its device count to BOTH sub-requests, so:
+				//   c5.large:  min(10, 10) = 10 → 20 + 10 = 30 <= 32, keep.
+				//   c5.xlarge: min(20, 20) = 20 → 20 + 20 = 40 > 32, prune.
 				deviceNames := make([]string, 20)
 				for i := range deviceNames {
 					deviceNames[i] = fmt.Sprintf("dev-%d", i)
@@ -1756,14 +1763,14 @@ var _ = Describe("Request Validation", func() {
 									Name: "gpu-req",
 									FirstAvailable: []resourcev1.DeviceSubRequest{
 										{
-											Name:            "all-gpus",
+											Name:            "all-gpus-a",
 											DeviceClassName: "empty-class",
 											AllocationMode:  resourcev1.DeviceAllocationModeAll,
 										},
 										{
-											Name:            "one-gpu",
+											Name:            "all-gpus-b",
 											DeviceClassName: "empty-class",
-											Count:           1,
+											AllocationMode:  resourcev1.DeviceAllocationModeAll,
 										},
 									},
 								},
@@ -1774,9 +1781,9 @@ var _ = Describe("Request Validation", func() {
 
 				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, largePools, templateDevices, celCache, nil)
 				Expect(err).ToNot(HaveOccurred())
-				// c5.large should remain (sub-request 0's template devices used for pruning)
+				// c5.large should remain (min template count 10 fits).
 				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveKey(unique.Make("c5.large")))
-				// c5.xlarge should be pruned
+				// c5.xlarge should be pruned (min template count 20 overflows).
 				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).ToNot(HaveKey(unique.Make("c5.xlarge")))
 			})
 
@@ -1823,13 +1830,12 @@ var _ = Describe("Request Validation", func() {
 				Expect(err.Error()).To(ContainSubstring("all instance types pruned"))
 			})
 
-			It("should use max template count across sub-requests when pruning ITs", func() {
-				// Sub-request 0: All mode (templates from IT contribute).
-				// Sub-request 1: ExactCount 1 (no templates).
-				// Pruning uses max across sub-requests for each IT.
-				// 25 in-cluster devices.
-				// c5.large: sub-req0 has 5 templates, sub-req1 has 0. Max = 5. 25+5=30 <= 32, keep.
-				// c5.xlarge: sub-req0 has 10 templates, sub-req1 has 0. Max = 10. 25+10=35 > 32, prune.
+			It("should not prune any IT when a template-free sub-request sets the MIN to zero", func() {
+				// Sub-request 0: All mode (template devices from the IT contribute). Sub-request 1: ExactCount
+				// 1, which uses NO template devices. Because pruning uses the MIN template count across
+				// sub-requests and the ExactCount sub-request contributes 0, the MIN is 0 for every IT — so no
+				// IT is pruned regardless of how many template devices the All-mode alternative would need.
+				// The ExactCount fallback keeps every IT viable. (Worst-case max would prune c5.xlarge here.)
 				deviceNames := make([]string, 25)
 				for i := range deviceNames {
 					deviceNames[i] = fmt.Sprintf("dev-%d", i)
@@ -1873,8 +1879,9 @@ var _ = Describe("Request Validation", func() {
 
 				data, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, medPools, templateDevices, celCache, nil)
 				Expect(err).ToNot(HaveOccurred())
+				// Neither IT is pruned: the template-free ExactCount fallback sets the MIN floor to 0.
 				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveKey(unique.Make("c5.large")))
-				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).ToNot(HaveKey(unique.Make("c5.xlarge")))
+				Expect(data.Requests[0].SubRequests[0].AllTemplateDevicesByIT).To(HaveKey(unique.Make("c5.xlarge")))
 			})
 
 			It("should validate a claim with both Exactly and FirstAvailable requests", func() {

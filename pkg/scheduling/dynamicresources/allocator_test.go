@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -8288,6 +8289,134 @@ var _ = Describe("Allocator", func() {
 			devices := meta.Devices[unique.Make("it-1")]
 			Expect(devices).To(HaveLen(1))
 			Expect(devices[0].RequestName.String()).To(Equal("gpu-req/fallback-1"))
+		})
+
+		// Device-limit enforcement across sub-requests (AllocationResultsMaxSize = 32). The upfront check
+		// in ValidateClaimRequest uses the MIN device count across sub-requests (a feasibility floor), and
+		// the authoritative per-claim check runs during the DFS — so a claim that only fits by choosing a
+		// smaller sub-request is accepted, not rejected upfront.
+		It("should allow FirstAvailable requests that fit only by selecting smaller sub-requests", func() {
+			// 32 GPUs. Two FirstAvailable requests each offer {prefer-20, fallback-10}. The MIN upfront floor
+			// sums 10+10 = 20 <= 32 (accepted; worst-case max would sum 20+20 = 40 and wrongly reject). During
+			// the DFS: gpu-a takes its preferred 20 (guard 0+20 <= 32); gpu-b's prefer-20 is then rejected by
+			// the per-claim guard (20+20 = 40 > 32) and falls through to fallback-10 (20+10 = 30 <= 32). This
+			// converges without backtracking — the requests are sized to leave headroom, so gpu-a never has to
+			// abandon its preferred sub-request. It exercises the guard firing MID-claim (after a sibling has
+			// already consumed devices) and per-request-independent selection: one request keeps its preferred
+			// alternative while the other degrades.
+			names := make([]string, 32)
+			for i := range names {
+				names[i] = fmt.Sprintf("gpu-%d", i)
+			}
+			inClusterSlices = []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices(names...)),
+			}
+			alloc := dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{ExclusiveDevices: sets.New[cloudprovider.DeviceID]()}, nil, env.Client, nil)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1",
+				resourcev1.DeviceRequest{
+					Name: "gpu-a",
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{Name: "prefer-20", DeviceClassName: "gpu", Count: 20},
+						{Name: "fallback-10", DeviceClassName: "gpu", Count: 10},
+					},
+				},
+				resourcev1.DeviceRequest{
+					Name: "gpu-b",
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{Name: "prefer-20", DeviceClassName: "gpu", Count: 20},
+						{Name: "fallback-10", DeviceClassName: "gpu", Count: 10},
+					},
+				},
+			)
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			devices := meta.Devices[unique.Make("it-1")]
+			// gpu-a keeps its preferred 20; gpu-b degrades to its 10-device fallback. Total 30.
+			Expect(devices).To(HaveLen(30))
+			var reqNames []string
+			for _, d := range devices {
+				reqNames = append(reqNames, d.RequestName.String())
+			}
+			Expect(lo.Count(reqNames, "gpu-a/prefer-20")).To(Equal(20))
+			Expect(lo.Count(reqNames, "gpu-b/fallback-10")).To(Equal(10))
+		})
+
+		It("should fall back to a smaller sub-request when the larger one exceeds the device limit", func() {
+			// A single FirstAvailable request whose first sub-request (40) exceeds AllocationResultsMaxSize
+			// (32). The DFS device-limit guard fails prefer-40 before it consumes any device and falls
+			// through to fallback-20, which fits.
+			names := make([]string, 40)
+			for i := range names {
+				names[i] = fmt.Sprintf("gpu-%d", i)
+			}
+			inClusterSlices = []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices(names...)),
+			}
+			alloc := dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{ExclusiveDevices: sets.New[cloudprovider.DeviceID]()}, nil, env.Client, nil)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1", resourcev1.DeviceRequest{
+				Name: "gpu-req",
+				FirstAvailable: []resourcev1.DeviceSubRequest{
+					{Name: "prefer-40", DeviceClassName: "gpu", Count: 40},
+					{Name: "fallback-20", DeviceClassName: "gpu", Count: 20},
+				},
+			})
+
+			result, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result).ToNot(BeNil())
+			result.Allocation.Commit(ctx)
+			meta := alloc.ResourceClaimAllocationMetadataForClaim(types.NamespacedName{Namespace: "default", Name: "c1"})
+			Expect(meta).ToNot(BeNil())
+			devices := meta.Devices[unique.Make("it-1")]
+			Expect(devices).To(HaveLen(20))
+			for _, d := range devices {
+				Expect(d.RequestName.String()).To(Equal("gpu-req/fallback-20"))
+			}
+		})
+
+		It("should reject a claim whose smallest sub-request selection still exceeds the device limit", func() {
+			// Even the MIN floor exceeds the limit: two FirstAvailable requests each with a minimum of 20
+			// devices sum to 40 > 32, so no combination of sub-requests can fit. This is rejected upfront by
+			// the MIN-floor check (before the DFS), not silently accepted.
+			names := make([]string, 40)
+			for i := range names {
+				names[i] = fmt.Sprintf("gpu-%d", i)
+			}
+			inClusterSlices = []dynamicresources.ResourceSlice{
+				makeAPISlice("s1", "gpu.example.com", "pool-a", withAllNodes(),
+					withGeneration(1, 1), withAPIDevices(names...)),
+			}
+			alloc := dynamicresources.NewAllocator(inClusterSlices, dynamicresources.AllocatedDeviceState{ExclusiveDevices: sets.New[cloudprovider.DeviceID]()}, nil, env.Client, nil)
+			nc := makeNodeClaim("it-1")
+			claim := makeClaim("c1",
+				resourcev1.DeviceRequest{
+					Name: "gpu-a",
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{Name: "prefer-24", DeviceClassName: "gpu", Count: 24},
+						{Name: "fallback-20", DeviceClassName: "gpu", Count: 20},
+					},
+				},
+				resourcev1.DeviceRequest{
+					Name: "gpu-b",
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{Name: "prefer-24", DeviceClassName: "gpu", Count: 24},
+						{Name: "fallback-20", DeviceClassName: "gpu", Count: 20},
+					},
+				},
+			)
+
+			_, err := alloc.Allocate(ctx, nc, []*resourcev1.ResourceClaim{claim})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exceeding maximum"))
 		})
 	})
 
