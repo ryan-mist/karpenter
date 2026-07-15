@@ -134,10 +134,12 @@ type ResourceClaimAllocationMetadata struct {
 }
 
 // DeviceAllocationResult pairs a device ID with the capacity consumed by this specific allocation.
-// ConsumedCapacity is nil for exclusive (non-multi-allocatable) devices.
+// ConsumedCapacity is nil for exclusive (non-multi-allocatable) devices. RequestName is the claim
+// request that owns this allocation.
 type DeviceAllocationResult struct {
 	DeviceID         DeviceID
 	ConsumedCapacity map[resourcev1.QualifiedName]resource.Quantity
+	RequestName      RequestName
 }
 
 type AllocatedDeviceState struct {
@@ -371,7 +373,6 @@ func (a *Allocator) Allocate(
 		templateAllocatingCounters: make(map[PoolKey]map[string]map[string]resourcev1.Counter),
 		allocatingCapacity:         make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
 		templateAllocatingCapacity: make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity),
-		selectedSubRequests:        make(map[RequestKey]int),
 		deviceMatchesRequest:       make(map[matchKey]bool),
 		requirements:               classifyRes.requirements,
 	}
@@ -526,10 +527,6 @@ type allocator struct {
 	// cross-contamination when template and in-cluster pools share the same device names.
 	templateAllocatingCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
 
-	// selectedSubRequests records which sub-request index was selected for each FirstAvailable
-	// request during a successful DFS for this IT. Keyed by (claimIdx, reqIdx).
-	selectedSubRequests map[RequestKey]int
-
 	// requirements are the topology requirements that are incrementally built up by the DFS. Each time an in-cluster
 	// device with topology requirements is allocated, those requirements are added to these requirements. These are
 	// restored during backtracking from the snapshots.
@@ -562,6 +559,7 @@ type deviceAllocationMetadata struct {
 	claimIndex       int
 	deviceWithID     DeviceWithID
 	consumedCapacity map[resourcev1.QualifiedName]resource.Quantity
+	requestName      RequestName
 }
 
 // allocate runs a per-instance-type DFS over in-cluster and template devices.
@@ -659,6 +657,7 @@ func (a *allocator) allocate(instanceTypes []InstanceTypeID) (*AllocationResult,
 				meta.Devices[itID] = append(meta.Devices[itID], DeviceAllocationResult{
 					DeviceID:         da.deviceWithID.ID,
 					ConsumedCapacity: da.consumedCapacity,
+					RequestName:      da.requestName,
 				})
 			}
 			// Update the baseline requirements for subsequent instance type simulations based on the contributed requirements
@@ -758,11 +757,11 @@ func (a *allocator) dfs(claimIdx, reqIdx, subReqIdx, slotIdx int) bool {
 	return a.dfsExactCount(claimIdx, reqIdx, subReqIdx, slotIdx, cd, rd)
 }
 
-// dfsFirstAvailable iterates sub-requests in priority order for a FirstAvailable request.
+// dfsFirstAvailable iterates sub-requests in priority order for a FirstAvailable request. The first
+// sub-request whose subtree leads to a complete solution wins.
 func (a *allocator) dfsFirstAvailable(claimIdx, reqIdx int, rd *RequestData) bool {
 	for subIdx := range rd.SubRequests {
 		if a.dfs(claimIdx, reqIdx, subIdx, 0) {
-			a.selectedSubRequests[RequestKey{ClaimIndex: claimIdx, RequestIndex: reqIdx}] = subIdx
 			return true
 		}
 	}
@@ -924,6 +923,7 @@ func (a *allocator) tryDevice(
 		claimIndex:       claimIdx,
 		deviceWithID:     dw,
 		consumedCapacity: consumed,
+		requestName:      rd.Name,
 	})
 	if dw.AllowMultipleAllocations {
 		// Ensures a multi-allocatable device has a allocating capacity map, even if it has no capacity dimensions.
@@ -974,7 +974,6 @@ func (a *allocator) restoreState(pools []*Pool) {
 	a.templateRemainingCounters = a.buildTemplateCounters()
 	a.allocatingCapacity = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
 	a.templateAllocatingCapacity = make(map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity)
-	a.selectedSubRequests = make(map[RequestKey]int)
 	a.snapshots = nil
 	for _, cd := range a.claimData {
 		for _, c := range cd.Constraints {

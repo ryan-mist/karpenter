@@ -80,12 +80,6 @@ func (a subRequestAccessor) Capacity() *resourcev1.CapacityRequirements {
 	return a.sub.Capacity
 }
 
-// RequestKey identifies a specific request within a claim.
-type RequestKey struct {
-	ClaimIndex   int
-	RequestIndex int
-}
-
 // RequestData holds the parsed and validated metadata for a single device request.
 type RequestData struct {
 	// Name identifies this request. For Exactly requests, Parent is set and Sub is empty.
