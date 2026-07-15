@@ -242,6 +242,27 @@ var _ = Describe("Request Validation", func() {
 			Expect(err.Error()).To(ContainSubstring("only Exactly and FirstAvailable requests are supported"))
 		})
 
+		It("should fail when a request has an empty FirstAvailable list", func() {
+			// A request with Exactly==nil and an empty (len 0) FirstAvailable list satisfies neither dispatch
+			// arm, so it falls through to the unsupported-request error. The API server also guards this, but
+			// the allocator must reject it independently rather than silently producing a request with no
+			// sub-requests (which would iterate zero alternatives and vacuously "succeed").
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
+				Spec: resourcev1.ResourceClaimSpec{
+					Devices: resourcev1.DeviceClaim{
+						Requests: []resourcev1.DeviceRequest{
+							{Name: "req", FirstAvailable: []resourcev1.DeviceSubRequest{}},
+						},
+					},
+				},
+			}
+
+			_, err := dynamicresources.ValidateClaimRequest(ctx, env.Client, claim, pools, nil, celCache, nil)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("only Exactly and FirstAvailable requests are supported"))
+		})
+
 		It("should fail when an All mode request encounters an invalid pool", func() {
 			claim := &resourcev1.ResourceClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-claim"},
