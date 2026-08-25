@@ -121,16 +121,24 @@ func skewCountFeasible(existing, capacity []int, P, k int) bool {
 	return false
 }
 
-// eligibleGroup is a cleanly-identified homogeneous single-zonal-TSC group.
+// eligibleGroup is a cleanly-identified homogeneous single-zonal-TSC group. A TSC
+// selects within the pod's own namespace, so groups are scoped by (namespace, app);
+// same-app pods in different namespaces are distinct spread groups and must not merge.
 type eligibleGroup struct {
-	app     string
-	request map[string]int64 // per-dim request signature (the group is homogeneous)
-	maxSkew int
+	namespace string
+	app       string
+	request   map[string]int64 // per-dim request signature (the group is homogeneous)
+	maxSkew   int
 }
 
 // zonalTSC returns the pod's single zonal DoNotSchedule TSC, or (nil,false) if the pod
-// is not a clean single-zonal-TSC pod (0 or >1 TSC, non-zone key, ScheduleAnyway, or
-// carries (anti)affinity — any coupling that makes a plain zonal count unsound).
+// is not a clean single-zonal-TSC pod. The exclusions below are LOAD-BEARING for
+// soundness: an adversarial + semantics audit confirmed that matchLabelKeys and
+// node-affinity/nodeSelector pinning each produce real false negatives (the real
+// scheduler spreads per-revision and over a node-affinity-restricted domain set, both
+// narrower than our all-live-zones app-level model). Anything that breaks the "plain
+// zonal count over a homogeneous app group reaching all zones" assumption is excluded
+// and falls through to the exact scheduler.
 func zonalTSC(p *corev1.Pod) (*corev1.TopologySpreadConstraint, bool) {
 	if p.Spec.Affinity != nil &&
 		(p.Spec.Affinity.PodAffinity != nil || p.Spec.Affinity.PodAntiAffinity != nil) {
@@ -146,6 +154,21 @@ func zonalTSC(p *corev1.Pod) (*corev1.TopologySpreadConstraint, bool) {
 	if tsc.WhenUnsatisfiable != corev1.DoNotSchedule {
 		return nil, false // soft TSC -> must NOT model as hard -> exclude
 	}
+	if len(tsc.MatchLabelKeys) > 0 {
+		return nil, false // per-revision spread; app-grouping would conflate revisions (FN hazard)
+	}
+	if tsc.MinDomains != nil {
+		return nil, false // reality is stricter; exclude to stay fail-closed
+	}
+	// Node pinning shrinks the pod's reachable domain set vs our all-live-zones model
+	// (real nodeAffinityPolicy defaults to Honor) -> exclude (FN hazard).
+	if len(p.Spec.NodeSelector) > 0 {
+		return nil, false
+	}
+	if a := p.Spec.Affinity; a != nil && a.NodeAffinity != nil &&
+		a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		return nil, false
+	}
 	return tsc, true
 }
 
@@ -156,18 +179,21 @@ func zonalTSC(p *corev1.Pod) (*corev1.TopologySpreadConstraint, bool) {
 func (h *harness) eligibleGroups(t *testing.T) []eligibleGroup {
 	t.Helper()
 	pods := h.allPods(t)
-	// Candidate apps: those named by some pod's zonal TSC selector matchLabels[app].
-	candApps := map[string]bool{}
+	// Candidate groups, keyed by (namespace, app) named by some pod's zonal TSC selector.
+	type nsApp struct{ ns, app string }
+	cand := map[nsApp]bool{}
 	for _, p := range pods {
 		if tsc, ok := zonalTSC(p); ok && tsc.LabelSelector != nil {
 			if app := tsc.LabelSelector.MatchLabels["app"]; app != "" {
-				candApps[app] = true
+				cand[nsApp{p.Namespace, app}] = true
 			}
 		}
 	}
 	var groups []eligibleGroup
-	for app := range candApps {
-		members := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return p.Labels["app"] == app })
+	for key := range cand {
+		members := lo.Filter(pods, func(p *corev1.Pod, _ int) bool {
+			return p.Namespace == key.ns && p.Labels["app"] == key.app
+		})
 		if len(members) == 0 {
 			continue
 		}
@@ -176,7 +202,7 @@ func (h *harness) eligibleGroups(t *testing.T) []eligibleGroup {
 		skew := -1
 		for _, p := range members {
 			tsc, ok := zonalTSC(p)
-			if !ok || tsc.LabelSelector == nil || tsc.LabelSelector.MatchLabels["app"] != app {
+			if !ok || tsc.LabelSelector == nil || tsc.LabelSelector.MatchLabels["app"] != key.app {
 				clean = false // a same-app pod that isn't a clean member of THIS group
 				break
 			}
@@ -189,7 +215,7 @@ func (h *harness) eligibleGroups(t *testing.T) []eligibleGroup {
 			}
 		}
 		if clean {
-			groups = append(groups, eligibleGroup{app: app, request: sig, maxSkew: skew})
+			groups = append(groups, eligibleGroup{namespace: key.ns, app: key.app, request: sig, maxSkew: skew})
 		}
 	}
 	return groups
@@ -211,6 +237,14 @@ func sameSignature(a, b map[string]int64) bool {
 		}
 	}
 	return true
+}
+
+// terminalForTopology reports whether a pod should be ignored when counting spread
+// (terminal or terminating) — mirrors the scheduler's IgnoredForTopology so a
+// draining pod doesn't inflate a zone's count and cause a false reject.
+func terminalForTopology(p *corev1.Pod) bool {
+	return p.DeletionTimestamp != nil ||
+		p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed
 }
 
 // skewInfeasible reports whether removal set S provably violates a clean zonal TSC —
@@ -253,14 +287,17 @@ func (h *harness) skewInfeasible(t *testing.T, S []*disruption.Candidate) bool {
 
 	pods := h.allPods(t)
 	for _, g := range groups {
-		members := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return p.Labels["app"] == g.app })
+		members := lo.Filter(pods, func(p *corev1.Pod, _ int) bool {
+			return p.Namespace == g.namespace && p.Labels["app"] == g.app
+		})
 
-		// Live zones = zones with >=1 REMAINING node; ONLY these (plus a replacement's
-		// zone) are TSC domains. A zone with no node is NOT a spread domain, so it must
-		// NOT be modeled as a 0-count domain — doing so wrongly inflates skew and
-		// causes false rejects (Kubernetes computes skew over domains that have
-		// eligible nodes). Staying pods land only in live zones; displaced pods (on S)
-		// must be re-homed.
+		// Live zones = zones with >=1 REMAINING node; only these (plus a replacement's
+		// zone) enter the model as domains. Dropping an empty zone is sound because
+		// dropping a domain is MONOTONICALLY MORE PERMISSIVE (fewer bands to satisfy) —
+		// NOT because it matches Kubernetes semantics (real Karpenter counts empty
+		// pool-permitted zones as 0-count domains and can provision into them). Modeling
+		// an empty zone as a stuck 0-count domain inflates skew and false-rejects.
+		// Staying pods land only in live zones; displaced pods (on S) must be re-homed.
 		capMap := map[string]int{}   // additional D-pods each live zone can hold
 		existMap := map[string]int{} // staying D-pods per live zone
 		var liveZones []string
@@ -275,6 +312,9 @@ func (h *harness) skewInfeasible(t *testing.T, S []*disruption.Candidate) bool {
 		}
 		displaced := 0
 		for _, p := range members {
+			if terminalForTopology(p) {
+				continue // terminal/terminating pods don't count toward the spread (IgnoredForTopology)
+			}
 			if sNames[p.Spec.NodeName] {
 				if podutils.IsReschedulable(p) {
 					displaced++
@@ -302,9 +342,12 @@ func (h *harness) skewInfeasible(t *testing.T, S []*disruption.Candidate) bool {
 		// DELETE (no new node): domains are exactly the live zones.
 		feasible := feasibleOver(capMap, existMap, liveZones)
 		// REPLACE: one new node in zone z* boosts that zone's capacity — and, if z* is
-		// currently empty, ADDS it as a domain. Enumerate z* over all zones the pool
-		// can launch in. REJECT only if neither delete nor any z* is feasible.
-		for _, zStar := range zoneOrder {
+		// currently empty, ADDS it as a domain. Enumerate z* over the pool's FULL zone
+		// universe (`zones`), not just occupied zones: the scheduler can launch a
+		// replacement into a zone that currently has no node to rescue a single-zone
+		// shortage, and omitting those z* candidates would false-reject. REJECT only if
+		// neither delete nor any z* is feasible.
+		for _, zStar := range zones {
 			if feasible {
 				break
 			}
