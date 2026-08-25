@@ -49,19 +49,25 @@ flowchart LR
 
 ### The Three Checks
 
-For a candidate set $S$, let the *displaced* pods be those on the removed nodes and the *remaining* nodes be the survivors. Per resource dimension $d\in\{\text{cpu},\text{mem},\dots\}$, the **overflow** is the part of displaced demand no surviving node can absorb:
+For a candidate set $S$, the **displaced** pods are those on the removed nodes and the **remaining** nodes are the survivors. Per resource dimension $d\in\{\text{cpu},\text{mem},\dots\}$, the **overflow** is the part of displaced demand no surviving node can absorb:
 
 $$o_d(S) \;=\; \max\!\Big(0,\; \sum_{p\,\in\,\text{displaced}} \text{req}_d(p) \;-\; \sum_{n\,\in\,\text{remaining}} \text{avail}_d(n)\Big)$$
 
-and $\text{price}(S)$ is the summed price of the removed nodes. The checks cost $O(P{+}T)$ / $O(\#\text{instance types})$ / $O(Z{\cdot}m)$ respectively, where $P,T$ are displaced-pod and remaining-node counts, $Z$ the number of zones, $m$ the enumerated skew level.
+| symbol | meaning |
+|---|---|
+| $\text{displaced}(S)$, $\text{remaining}(S)$ | pods on removed nodes (to re-home); the surviving nodes |
+| $o_d(S)$ | overflow in dimension $d$ (above) — what one new node must absorb |
+| $\text{price}(S)$ | summed price of the removed nodes |
+| $P$, $T$ | number of displaced pods / remaining nodes |
+| $Z$, $m$ | number of zones / enumerated skew minimum-level |
+
+Costs are `O(P+T)` (capacity), `O(#instance types)` (cost), and `O(Z·m)` (skew).
 
 #### 1. Capacity — DELETE feasibility · O(P+T)
 
 A DELETE adds no new node, so every displaced pod must fit onto a survivor. If in any dimension the displaced demand exceeds the surviving headroom — equivalently $o_d(S) > 0$ — the pods cannot all fit and the DELETE is infeasible → `REJECT`. One sum per dimension; no packing, no graph.
 
-**Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not.
-
-**Validated.** 0 false negatives across 2,745 sets, and **provably equivalent to a max-flow** for pure capacity (see [Alternatives Considered](#alternative-max-flow-prefilter)).
+**Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not. (For pure capacity this is *provably equivalent* to a max-flow — see [Alternatives Considered](#alternative-max-flow-prefilter).)
 
 #### 2. Cost — REPLACE worthwhileness · O(#instance types)
 
@@ -70,8 +76,6 @@ A REPLACE re-homes the displaced pods onto the remaining nodes **plus one** new 
 **Why this is a separate check — the replacement sinkhole.** A capacity check with a *generous* replacement is a sinkhole on the replace path: a big new node absorbs almost any small replace, so a feasibility check prunes nothing there. Only *cost* distinguishes a worthwhile replace from a no-op.
 
 **Soundness.** By conservation, in any replace the remaining nodes hold at most their headroom, so the single new node must hold $\ge o_d(S)$ in every dimension — a viable replacement's allocatable $\ge o_d(S)$ is *necessary*. If no permitted type both meets that and is cheaper than $\text{price}(S)$, the oracle can only no-op. The check is generous in every uncertain direction (largest capacity for "does it fit", cheapest permitted offering for "is it cheaper", ignoring the pods' own scheduling constraints), so it only ever errs toward `PASS`. The price basis **must** come from the candidate's real nodepool (e.g. spot, if the pool allows it) — pricing against a narrower set could wrongly reject a cheaper replace.
-
-**Validated.** 0 false negatives across 1,764 sets; **+23–61% marginal prune over the capacity check** in the cost-dominated regime the capacity sinkhole is blind to.
 
 #### 3. Skew — TSC feasibility · O(Z·m)
 
@@ -86,8 +90,6 @@ $\text{maxSkew}$ is encoded by **enumerating the minimum level $m$**: feasible-f
 **Eligibility is fail-closed — and the exclusions are load-bearing.** An adversarial audit against the real scheduler produced concrete false negatives when the gate was too loose, so a group qualifies **only** as a single zonal `DoNotSchedule` TSC with exact request homogeneity, grouped by **(namespace, workload/`app` label)**, that additionally has: **no `matchLabelKeys`** (it spreads each revision independently — app-level grouping would conflate revisions into one stricter band: *8 demonstrated FN*); **no `nodeSelector` or required `nodeAffinity`** (pinning shrinks the pod's reachable domain set under the default `nodeAffinityPolicy=Honor`: *2 demonstrated FN*); **no `minDomains`** (safe to ignore since reality is stricter, but excluded conservatively); and no other coupling (multiple TSCs, (anti)affinity, `ScheduleAnyway`, non-zone `topologyKey`, heterogeneous requests, volume pinning). Additionally the replacement zone $z^\*$ must range over the **full pool zone universe** (including zones with no current node — the scheduler can launch there to rescue a single-zone shortage), **terminal/terminating** pods are skipped when counting $e_z$, and demand must be sized by the scheduler's `Ceiling`. Groups are keyed by workload label, *not* by reusing Karpenter's `TopologyGroup`s (see [Alternatives Considered](#alternative-topologygroup-reuse)).
 
 **Soundness.** $c_z$ is exact-or-over (identical items ⇒ $\sum$ per-node floors is exact; ignoring within-zone anti-affinity only over-counts); the $m$-equivalence for $\max-\min \le k$ is exact; the replacement is modeled as the largest instance in whichever single zone helps most (most permissive); unmodeled constraints only make reality stricter or the model more permissive. So a group infeasible for all $(z^\*, m)$ is truly infeasible — *given* the eligibility gate above, whose omissions are the only false-negative source and are all closed.
-
-**Validated.** 0 false negatives across 590 sets plus targeted adversarial probes; the check earns real prune only in the **tight, low-`maxSkew`, multi-zone-shortage** regime a single replacement can't rescue (up to **77–97%**, where the capacity check gets **0%** — the aggregate check is blind to skew) and adds **+42% marginal even beyond the combined capacity+cost gate**; the core count runs in **5–42 ns**. See [Preliminary Simulations](#preliminary-simulations).
 
 ### Combine Rule
 
