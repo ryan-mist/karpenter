@@ -78,6 +78,8 @@ $$\text{DELETE fits} \iff o_d(S) = 0 \ \text{ for every dimension } d \quad\Long
 
 **Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not. (For pure capacity this is *provably equivalent* to a max-flow — see [Alternatives Considered](#alternative-max-flow-prefilter).)
 
+**When it bites.** Since `demand + headroom = capacity` on every node, this rejects exactly when $\sum_{i\in S}\text{capacity}_i > \sum_{\text{all}}\text{headroom}_i$ — in a uniform cluster, simply when $k/N > (1-\bar u)$: the removed *fraction* of nodes exceeds the cluster's *free fraction* (mean utilization $\bar u$). So a small removal in a large, underutilized cluster always passes ($k/N \to 0$), and the check's prune concentrates on **over-aggressive (big-$k$) removals and tight clusters**. Its leverage therefore *grows* with a more aggressive generator (e.g. the big-$k$ merges of the repacking pivot) — the capacity check earns its keep precisely where a many-candidate generator needs it most.
+
 #### 2. Cost — REPLACE worthwhileness · O(#instance types)
 
 *If the pods don't fit as-is ($o_d(S) > 0$), the only option is one new node to hold the leftover — is that worth buying?* Karpenter adds at most one replacement (the *m→1* rule), and by conservation it must hold at least the overflow. So a worthwhile REPLACE needs an instance type that is both **big enough** and **cheaper** than what we removed. `REJECT the replace` if **no permitted instance type $I$ satisfies both conditions**:
