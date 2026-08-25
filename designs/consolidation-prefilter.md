@@ -65,17 +65,26 @@ In words: the total dimension-$d$ request of the displaced pods, minus the total
 
 Costs are `O(P+T)` (capacity), `O(#instance types)` (cost), and `O(Z·m)` (skew).
 
+Removing $S$ evicts the pods on those nodes; to consolidate, they must land **somewhere else in the cluster**. There are only two ways that saves money, and checks 1–2 are exactly those two questions (check 3 is an orthogonal topology guard):
+
+- **DELETE** — do the displaced pods fit on the *existing* cluster, with **no new node**? (Check 1.)
+- **REPLACE** — if not, the leftover goes on **one new node**; is there an instance type that's both **big enough** to hold it and **cheaper** than what we removed? (Check 2.)
+
 #### 1. Capacity — DELETE feasibility · O(P+T)
 
-A DELETE adds no new node, so every displaced pod must fit onto a survivor. If in any dimension the displaced demand exceeds the surviving headroom — equivalently $o_d(S) > 0$ — the pods cannot all fit and the DELETE is infeasible → `REJECT`. One sum per dimension; no packing, no graph.
+*Do the displaced pods fit on the cluster as-is, without adding a node?* Per dimension, compare their total request to the free room on the surviving nodes. If demand exceeds headroom anywhere — equivalently $o_d(S) > 0$ — they cannot all fit, so no DELETE exists. The leftover $o_d(S)$ is precisely the capacity a new node would have to supply, which is what check 2 then prices. (One sum per dimension; no packing, no graph.)
 
-**The overflow is the bridge to cost.** $o_d(S)$ is exactly the demand that *won't* fit on the survivors — i.e. the **extra capacity a new node would have to supply**. So $o_d(S)=0$ means a DELETE fits and needs no new node, while $o_d(S)>0$ means the only remaining option is a REPLACE that puts that leftover on one new node. The capacity check therefore doesn't reject on $o_d(S)>0$ alone; it hands the overflow to the cost check below, which decides whether buying that extra capacity is actually cheaper than what's removed.
+$$\text{DELETE fits} \iff o_d(S) = 0 \ \text{ for every dimension } d \quad\Longleftrightarrow\quad \sum_{p\,\in\,\text{displaced}} \text{req}_d(p) \;\le\; \sum_{n\,\in\,\text{remaining}} \text{avail}_d(n)\ \ \forall d$$
 
 **Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not. (For pure capacity this is *provably equivalent* to a max-flow — see [Alternatives Considered](#alternative-max-flow-prefilter).)
 
 #### 2. Cost — REPLACE worthwhileness · O(#instance types)
 
-A REPLACE re-homes the displaced pods onto the remaining nodes **plus one** new node (Karpenter allows at most one replacement — the *m→1* rule). Only the overflow $o_d(S)$ must go to that new node. `REJECT the replace` if **no permitted instance type $I$ satisfies both $\text{price}(I) < \text{price}(S)$ and $\text{alloc}_d(I) \ge o_d(S)\ \forall d$** — no cheaper node can even hold the leftover, so no replace can both fit and save money. This mirrors Karpenter's own `RemoveInstanceTypeOptionsByPriceAndMinValues`.
+*If the pods don't fit as-is ($o_d(S) > 0$), the only option is one new node to hold the leftover — is that worth buying?* Karpenter adds at most one replacement (the *m→1* rule), and by conservation it must hold at least the overflow. So a worthwhile REPLACE needs an instance type that is both **big enough** and **cheaper** than what we removed. `REJECT the replace` if **no permitted instance type $I$ satisfies both conditions**:
+
+$$\underbrace{\text{alloc}_d(I) \ge o_d(S)\ \ \forall d}_{\text{big enough to hold the leftover}} \qquad\text{and}\qquad \underbrace{\text{price}(I) < \text{price}(S)}_{\text{cheaper than what we removed}}$$
+
+If no node is both, the replace can't fit or can't save — a no-op. This mirrors Karpenter's own `RemoveInstanceTypeOptionsByPriceAndMinValues`.
 
 **Why this is a separate check — the replacement sinkhole.** A capacity check with a *generous* replacement is a sinkhole on the replace path: a big new node absorbs almost any small replace, so a feasibility check prunes nothing there. Only *cost* distinguishes a worthwhile replace from a no-op.
 
