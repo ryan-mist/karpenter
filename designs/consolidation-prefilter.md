@@ -18,7 +18,7 @@ This RFC proposes a **prefilter**: a sound, cheap gate that runs *before* `Simul
 ### Use Cases
 
 1. **Infeasible candidate sets today.** Binary search evaluates prefixes that remove too many nodes at once, and every infeasible one costs a full `Solve` — whether it fails on capacity, cost, or topology spread.
-   - *For example*, on the reproduced [#2434](https://github.com/kubernetes-sigs/karpenter/issues/2434) shape, the capacity check alone proves **25%** of enumerated sets doomed (measured against the real scheduler — see [Validation](#validation)).
+   - *For example*, on the reproduced [#2434](https://github.com/kubernetes-sigs/karpenter/issues/2434) shape, the capacity check alone proves ~25% of enumerated sets doomed (measured against the real scheduler — see [Preliminary Simulations](#preliminary-simulations)).
 2. **Large / tight clusters ([#2972](https://github.com/kubernetes-sigs/karpenter/issues/2972)).** As clusters grow, `SimulateScheduling` cost rises super-linearly while the prefilter stays near-linear, so the savings grow with scale. On a tight 40-node population, **57%** of sampled sets are doomed and discardable in microseconds each.
 
 ### Non-Goals
@@ -49,56 +49,45 @@ flowchart LR
 
 ### The Three Checks
 
-Notation, per candidate set `S`:
+For a candidate set $S$, let the *displaced* pods be those on the removed nodes and the *remaining* nodes be the survivors. Per resource dimension $d\in\{\text{cpu},\text{mem},\dots\}$, the **overflow** is the part of displaced demand no surviving node can absorb:
 
-| symbol | meaning |
-|---|---|
-| `P` | displaced pods (on the removed nodes) |
-| `T` | remaining (target) nodes |
-| `d ∈ {cpu, mem, …}` | resource dimensions |
-| `demand_d` | Σ requests of displaced pods in dimension `d` |
-| `headroom_d` | Σ `Available()` over remaining nodes in `d` |
-| `overflow_d` | `max(0, demand_d − headroom_d)` — leftover a new node must absorb |
-| `price(S)` | Σ prices of the removed nodes |
+$$o_d(S) \;=\; \max\!\Big(0,\; \sum_{p\,\in\,\text{displaced}} \text{req}_d(p) \;-\; \sum_{n\,\in\,\text{remaining}} \text{avail}_d(n)\Big)$$
+
+and $\text{price}(S)$ is the summed price of the removed nodes. The checks cost $O(P{+}T)$ / $O(\#\text{instance types})$ / $O(Z{\cdot}m)$ respectively, where $P,T$ are displaced-pod and remaining-node counts, $Z$ the number of zones, $m$ the enumerated skew level.
 
 #### 1. Capacity — DELETE feasibility · O(P+T)
 
-A DELETE adds no new node, so every displaced pod must fit onto a node that remains. If, in any single dimension, the displaced pods' total request exceeds the remaining nodes' total free capacity — `demand_d > headroom_d` — they cannot all fit, and the DELETE is infeasible → `REJECT`. This is one sum per dimension; no packing, no graph.
+A DELETE adds no new node, so every displaced pod must fit onto a survivor. If in any dimension the displaced demand exceeds the surviving headroom — equivalently $o_d(S) > 0$ — the pods cannot all fit and the DELETE is infeasible → `REJECT`. One sum per dimension; no packing, no graph.
 
-**Soundness.** `demand_d > headroom_d` is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not.
+**Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not.
 
 **Validated.** 0 false negatives across 2,745 sets, and **provably equivalent to a max-flow** for pure capacity (see [Alternatives Considered](#alternative-max-flow-prefilter)).
 
 #### 2. Cost — REPLACE worthwhileness · O(#instance types)
 
-A REPLACE re-homes the displaced pods onto the remaining nodes **plus one** new node (Karpenter allows at most one replacement — the *m→1* rule). Only the `overflow` must go to that new node. `REJECT the replace` if **no instance type — priced from the offerings the candidate's own nodepool permits — is cheaper than `price(S)` while having allocatable ≥ `overflow_d` for every `d`**: no cheaper node can even hold the leftover, so no replace can both fit and save money. This mirrors Karpenter's own `RemoveInstanceTypeOptionsByPriceAndMinValues`.
+A REPLACE re-homes the displaced pods onto the remaining nodes **plus one** new node (Karpenter allows at most one replacement — the *m→1* rule). Only the overflow $o_d(S)$ must go to that new node. `REJECT the replace` if **no permitted instance type $I$ satisfies both $\text{price}(I) < \text{price}(S)$ and $\text{alloc}_d(I) \ge o_d(S)\ \forall d$** — no cheaper node can even hold the leftover, so no replace can both fit and save money. This mirrors Karpenter's own `RemoveInstanceTypeOptionsByPriceAndMinValues`.
 
 **Why this is a separate check — the replacement sinkhole.** A capacity check with a *generous* replacement is a sinkhole on the replace path: a big new node absorbs almost any small replace, so a feasibility check prunes nothing there. Only *cost* distinguishes a worthwhile replace from a no-op.
 
-**Soundness.** By conservation, in any replace the remaining nodes hold ≤ `headroom_d`, so the single new node must hold ≥ `demand_d − headroom_d = overflow_d` in every dimension — a viable replacement's capacity ≥ `overflow_d` is *necessary*. If no permitted type both meets that and is cheaper than `price(S)`, the oracle can only no-op. The check is generous in every uncertain direction (largest capacity for "does it fit", cheapest permitted offering for "is it cheaper", ignoring the pods' own scheduling constraints), so it only ever errs toward `PASS`. The price basis **must** come from the candidate's real nodepool (e.g. spot, if the pool allows it) — pricing against a narrower set could wrongly reject a cheaper replace.
+**Soundness.** By conservation, in any replace the remaining nodes hold at most their headroom, so the single new node must hold $\ge o_d(S)$ in every dimension — a viable replacement's allocatable $\ge o_d(S)$ is *necessary*. If no permitted type both meets that and is cheaper than $\text{price}(S)$, the oracle can only no-op. The check is generous in every uncertain direction (largest capacity for "does it fit", cheapest permitted offering for "is it cheaper", ignoring the pods' own scheduling constraints), so it only ever errs toward `PASS`. The price basis **must** come from the candidate's real nodepool (e.g. spot, if the pool allows it) — pricing against a narrower set could wrongly reject a cheaper replace.
 
 **Validated.** 0 false negatives across 1,764 sets; **+23–61% marginal prune over the capacity check** in the cost-dominated regime the capacity sinkhole is blind to.
 
 #### 3. Skew — TSC feasibility · O(Z·m)
 
-For a cleanly-identified **homogeneous** group `D` (identical request `r`) governed by a single zonal `DoNotSchedule` TopologySpread constraint (`maxSkew=k`) over domains (zones) `z`:
+For a cleanly-identified **homogeneous** group $D$ (identical request $r$) governed by a single zonal `DoNotSchedule` TopologySpread constraint ($\text{maxSkew}=k$) over zones $z$: let $e_z$ be the $D$-pods that *stay* in zone $z$ (fixed), $c_z = \sum_{n\,\in\,z} \lfloor \text{avail}(n)/r \rfloor$ the extra $D$-pods each surviving zone can hold, and place $p_z$ of the $P_D$ displaced pods per zone. Feasible iff
 
-```
-existing_z = D-pods that STAY in zone z (on nodes not in S)          # fixed
-cap_z      = additional D-pods zone z's remaining nodes can hold      # Σ floor(avail/r)
-final_z    = existing_z + placed_z,  0 ≤ placed_z ≤ cap_z,  Σ placed_z = P_D
-feasible ⇔ ∃ assignment with max_z final_z − min_z final_z ≤ k
-```
+$$\exists\ \text{assignment with}\quad 0 \le p_z \le c_z,\quad \textstyle\sum_z p_z = P_D,\quad \max_z (e_z{+}p_z) - \min_z (e_z{+}p_z) \le k.$$
 
-`maxSkew` is encoded by **enumerating the target minimum level `m`**: feasible-for-`m` ⇔ every zone's `placed_z` fits `[L_z(m), U_z(m)]` and `ΣL_z(m) ≤ P_D ≤ ΣU_z(m)`, where `L_z(m) = max(0, m − existing_z)` and `U_z(m) = min(cap_z, m+k − existing_z)`. With no zone-pinning this is a pure O(Z·m) count check (a max-flow is needed only when volume topology pins pods to zones). The **m→1 replacement** adds capacity in one zone: enumerate `z*` (plus the no-replacement/delete case) and boost `cap_{z*}`. `REJECT S` iff **no `(z*, m)` is feasible**. A skew-doomed group dooms the whole set.
+$\text{maxSkew}$ is encoded by **enumerating the minimum level $m$**: feasible-for-$m$ ⇔ $\sum_z L_z(m) \le P_D \le \sum_z U_z(m)$ with $L_z(m)=\max(0,\,m-e_z)$ and $U_z(m)=\min(c_z,\,m{+}k-e_z)$. With no zone-pinning this is a pure $O(Z{\cdot}m)$ count check (a max-flow is needed only when volume topology pins pods to zones). The **m→1 replacement** adds one node in some zone $z^\*$: enumerate $z^\*$ (plus the no-replacement/delete case) and boost $c_{z^\*}$. `REJECT S` iff **no $(z^\*, m)$ is feasible**. A skew-doomed group dooms the whole set.
 
-**Domains are the LIVE zones only** — a zone with no remaining node is not a spread domain and must not be modeled as a 0-count domain (doing so inflates skew and is unsound); the replacement's zone is added as a domain when it lands in an empty zone.
+**Domains are the LIVE zones only** (zones with a surviving node), plus $z^\*$ when the replacement lands in an empty one. This is sound because **dropping a domain is monotonically more permissive** (fewer bands to satisfy) — *not* because it matches Kubernetes semantics: real Karpenter counts empty pool-permitted zones as 0-count domains and can provision into them, so our domain set is a strict subset of reality's, which can only ease feasibility. (Modeling an empty zone as a stuck 0-count domain inflates skew and false-rejects — it caused 14 FN before this fix.)
 
-**Eligibility is fail-closed.** A group qualifies only if it is a single zonal `DoNotSchedule` TSC with exact request homogeneity and no other coupling. Any ambiguity — multiple TSCs, TSC + (anti)affinity, `ScheduleAnyway`, non-zone `topologyKey`, heterogeneous requests, mixed owners, volume pinning — excludes the group, which falls through to the scheduler. Groups are keyed by **owner-reference UID / workload label**, *not* by reusing Karpenter's `TopologyGroup`s (see [Alternatives Considered](#alternative-topologygroup-reuse)).
+**Eligibility is fail-closed — and the exclusions are load-bearing.** An adversarial audit against the real scheduler produced concrete false negatives when the gate was too loose, so a group qualifies **only** as a single zonal `DoNotSchedule` TSC with exact request homogeneity, grouped by **(namespace, workload/`app` label)**, that additionally has: **no `matchLabelKeys`** (it spreads each revision independently — app-level grouping would conflate revisions into one stricter band: *8 demonstrated FN*); **no `nodeSelector` or required `nodeAffinity`** (pinning shrinks the pod's reachable domain set under the default `nodeAffinityPolicy=Honor`: *2 demonstrated FN*); **no `minDomains`** (safe to ignore since reality is stricter, but excluded conservatively); and no other coupling (multiple TSCs, (anti)affinity, `ScheduleAnyway`, non-zone `topologyKey`, heterogeneous requests, volume pinning). Additionally the replacement zone $z^\*$ must range over the **full pool zone universe** (including zones with no current node — the scheduler can launch there to rescue a single-zone shortage), **terminal/terminating** pods are skipped when counting $e_z$, and demand must be sized by the scheduler's `Ceiling`. Groups are keyed by workload label, *not* by reusing Karpenter's `TopologyGroup`s (see [Alternatives Considered](#alternative-topologygroup-reuse)).
 
-**Soundness.** `cap_z` is exact-or-over (identical items ⇒ Σ per-node floors is exact; ignoring within-zone anti-affinity only over-counts); the `m`-equivalence for `max−min ≤ k` is exact; the replacement is modeled as the largest instance in whichever single zone helps most (most permissive); unmodeled constraints (`minDomains`, competition for the same room, soft terms) only make reality stricter or the model more permissive. So a set infeasible for all `(z*, m)` is truly infeasible.
+**Soundness.** $c_z$ is exact-or-over (identical items ⇒ $\sum$ per-node floors is exact; ignoring within-zone anti-affinity only over-counts); the $m$-equivalence for $\max-\min \le k$ is exact; the replacement is modeled as the largest instance in whichever single zone helps most (most permissive); unmodeled constraints only make reality stricter or the model more permissive. So a group infeasible for all $(z^\*, m)$ is truly infeasible — *given* the eligibility gate above, whose omissions are the only false-negative source and are all closed.
 
-**Validated.** 0 false negatives across 590 sets; **77% prune where the capacity check gets 0%** — the aggregate check is *blind to skew*, so this prune is entirely marginal.
+**Validated.** 0 false negatives across 590 sets plus targeted adversarial probes; the check earns real prune only in the **tight, low-`maxSkew`, multi-zone-shortage** regime a single replacement can't rescue (up to **77–97%**, where the capacity check gets **0%** — the aggregate check is blind to skew) and adds **+42% marginal even beyond the combined capacity+cost gate**; the core count runs in **5–42 ns**. See [Preliminary Simulations](#preliminary-simulations).
 
 ### Combine Rule
 
@@ -122,11 +111,11 @@ The prefilter runs entirely on in-memory cluster state and instance-type metadat
 
 - `karpenter_consolidation_prefilter_total{decision}` — `reject` vs `pass`; the prune rate.
 - `karpenter_consolidation_prefilter_reject_reason{reason}` — `capacity_cost` vs `skew`; attributes the prune.
-- **Missed-prune signal** — count `PASS`ed sets that `SimulateScheduling` then returns as **no-op**. This bounds the prune left on the table: a high count means either doom types the prefilter does not yet model (candidates for a new check) or plain cost no-ops. It also pairs with the dry-run mode below to verify the hard invariant — a rejected set that the scheduler *would* have consolidated is a false negative and must never occur.
+- `karpenter_consolidation_prefilter_missed_total` — **missed-prune signal**: `PASS`ed sets that `SimulateScheduling` then returns as **no-op**. This is trivially available (we already run the scheduler on every `PASS`), and it bounds the prune left on the table: a high count means either doom types the prefilter does not yet model (candidates for a new check) or plain cost no-ops. It pairs with the dry-run mode below to verify the hard invariant — a rejected set that the scheduler *would* have consolidated is a false negative and must never occur.
 
-## Validation
+## Preliminary Simulations
 
-All three checks were validated in a research harness (test code that drives the **real** `SimulateScheduling` as a ground-truth oracle on an in-memory fake client — **not** the shipping implementation). For each scenario the harness enumerates removal sets, runs both the cheap check and the real oracle, and asserts the hard invariant **`false negatives == 0`** (the test fails if any check rejects a set the oracle consolidates).
+**Methodology.** All results below come from a research harness that drives the **real** `SimulateScheduling` as a ground-truth oracle on an in-memory fake client — it is *not* the shipping implementation, but it exercises the exact scheduler the prefilter gates. For each scenario the harness enumerates candidate removal sets, runs both the cheap check and the real oracle, and asserts the hard invariant **`false negatives == 0`** (the test fails if any check rejects a set the oracle consolidates). Scenarios span underutilized, capacity-tight, cost-losing, and topology-skewed clusters, plus adversarial probes purpose-built to try to break soundness. The harness (test-only Go) lives on the fork branch [`experiment/consolidation-prefilter-sims`](https://github.com/ryan-mist/karpenter/tree/experiment/consolidation-prefilter-sims) so these tables are reproducible.
 
 **Capacity (aggregate check) vs oracle** — 0 FN / 2,745 sets, marginal-over-flow = 0 everywhere:
 
@@ -154,6 +143,8 @@ All three checks were validated in a research harness (test code that drives the
 | zonal-skew-tight | 57 | 77.2 | 0.0 | +77.2% | 0 |
 | zonal-skew-loose | 57 | 0.0 | 0.0 | 0 | 0 |
 | mix-zonalTSC / mix-mixed | 238 ea | 0.0 | 0.0 | 0 | 0 |
+
+Prune concentrates in the tight, low-`maxSkew`, multi-zone-shortage regime (k1 tight reaches 77–97%; it collapses as `maxSkew` widens and vanishes on roomy clusters) and stays flat in cost (5–42 ns core, $O(Z{\cdot}m)$). An **adversarial + semantics audit** then hardened the eligibility gate: it produced concrete false negatives from `matchLabelKeys` (8) and `nodeAffinity`/`nodeSelector` pinning (2) when those exclusions were missing; with the gate above, those probes drop to 0 rejects / 0 FN while genuine skew doom is still caught. This is why the eligibility conditions in check 3 are stated as *hard requirements*, not nice-to-haves.
 
 **Combined `prefilter(S)` (end-to-end) vs oracle** — the three checks behind one gate, run over an over-generating proposer (all-subsets enumeration = worst-case stress, not yet the real generator) across an 8-scenario sweep — **0 FN / 2,002 sets**:
 
