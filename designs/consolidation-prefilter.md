@@ -53,6 +53,8 @@ For a candidate set $S$, the **displaced** pods are those on the removed nodes a
 
 $$o_d(S) \;=\; \max\!\Big(0,\; \sum_{p\,\in\,\text{displaced}} \text{req}_d(p) \;-\; \sum_{n\,\in\,\text{remaining}} \text{avail}_d(n)\Big)$$
 
+In words: the total dimension-$d$ request of the displaced pods, minus the total free room on the surviving nodes, floored at zero — the leftover that a new node would have to supply.
+
 | symbol | meaning |
 |---|---|
 | $\text{displaced}(S)$, $\text{remaining}(S)$ | pods on removed nodes (to re-home); the surviving nodes |
@@ -66,6 +68,8 @@ Costs are `O(P+T)` (capacity), `O(#instance types)` (cost), and `O(Z·m)` (skew)
 #### 1. Capacity — DELETE feasibility · O(P+T)
 
 A DELETE adds no new node, so every displaced pod must fit onto a survivor. If in any dimension the displaced demand exceeds the surviving headroom — equivalently $o_d(S) > 0$ — the pods cannot all fit and the DELETE is infeasible → `REJECT`. One sum per dimension; no packing, no graph.
+
+**The overflow is the bridge to cost.** $o_d(S)$ is exactly the demand that *won't* fit on the survivors — i.e. the **extra capacity a new node would have to supply**. So $o_d(S)=0$ means a DELETE fits and needs no new node, while $o_d(S)>0$ means the only remaining option is a REPLACE that puts that leftover on one new node. The capacity check therefore doesn't reject on $o_d(S)>0$ alone; it hands the overflow to the cost check below, which decides whether buying that extra capacity is actually cheaper than what's removed.
 
 **Soundness.** $\sum_p \text{req}_d(p) > \sum_n \text{avail}_d(n)$ is a necessary condition for infeasibility — a splittable, per-dimension relaxation of the real integral, multi-dimensional packing. If even the relaxed problem has no room, the real one certainly does not. (For pure capacity this is *provably equivalent* to a max-flow — see [Alternatives Considered](#alternative-max-flow-prefilter).)
 
