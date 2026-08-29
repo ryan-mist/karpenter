@@ -841,20 +841,39 @@ func (s *Scheduler) updateRemainingResources(node *state.StateNode) {
 	}
 }
 
+// existingNodeSortKey caches the fields used to order existing nodes so that
+// Initialized() and Name() are each evaluated exactly once per node rather than
+// O(log N) times within the sort comparator.
+type existingNodeSortKey struct {
+	node        *ExistingNode
+	initialized bool
+	name        string
+}
+
 // sortExistingNodes sorts existing nodes with initialized nodes first
 func (s *Scheduler) sortExistingNodes() {
 	// Order the existing nodes for scheduling with initialized nodes first
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
-	// before we attempt to schedule uninitialized ones
-	sort.SliceStable(s.existingNodes, func(i, j int) bool {
-		if s.existingNodes[i].Initialized() && !s.existingNodes[j].Initialized() {
+	// before we attempt to schedule uninitialized ones.
+	// The sort keys (Initialized/Name) are precomputed in a single O(N) pass because Initialized() performs a
+	// Managed()-check plus map lookup, and evaluating it (and Name()) inside the comparator would otherwise cost
+	// O(N log N) calls and dominate NewScheduler at large node counts.
+	keys := make([]existingNodeSortKey, len(s.existingNodes))
+	for i, n := range s.existingNodes {
+		keys[i] = existingNodeSortKey{node: n, initialized: n.Initialized(), name: n.Name()}
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		if keys[i].initialized && !keys[j].initialized {
 			return true
 		}
-		if !s.existingNodes[i].Initialized() && s.existingNodes[j].Initialized() {
+		if !keys[i].initialized && keys[j].initialized {
 			return false
 		}
-		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
+		return keys[i].name < keys[j].name
 	})
+	for i, k := range keys {
+		s.existingNodes[i] = k.node
+	}
 }
 
 // computeEffectiveZoneFromPod calculates the effective zone constraint by intersecting
