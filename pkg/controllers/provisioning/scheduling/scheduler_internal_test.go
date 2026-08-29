@@ -98,20 +98,50 @@ func TestSortExistingNodes(t *testing.T) {
 	}
 }
 
-// TestSortExistingNodesStable verifies that equal keys (same initialized status and same name)
-// preserve their input order, matching sort.SliceStable semantics.
+// TestSortExistingNodesStable verifies that nodes sharing an equal sort key (same initialized
+// status and same name) preserve their input order, matching sort.SliceStable semantics.
+//
+// The fixture must be chosen carefully: Go's sort.Slice (pdqsort) runs insertion sort for n <= 12
+// and short-circuits all-equal inputs, so neither a tiny fixture nor an all-identical-key fixture
+// distinguishes stable from unstable (both stay coincidentally stable). Interleaving several
+// duplicate keys across a larger slice (here 40 nodes over 8 repeated names) forces pdqsort's
+// partitioning to reorder equal elements, so a SliceStable -> Slice regression is actually caught
+// here rather than silently accepted. (Empirically verified: sort.Slice reorders this shape while
+// sort.SliceStable does not.)
 func TestSortExistingNodesStable(t *testing.T) {
-	// Two distinct node objects sharing the same name and status must keep input order.
-	first := newTestExistingNode("dup", true)
-	second := newTestExistingNode("dup", true)
-	other := newTestExistingNode("zzz", true)
+	const (
+		n      = 40
+		groups = 8
+	)
+	// Names repeat every `groups` entries and are interleaved, so each name-group's members are
+	// spread across the input. inputSeq records each node's original index within its name group.
+	input := make([]*ExistingNode, n)
+	inputSeq := make(map[*ExistingNode]int, n)
+	seqByName := map[string]int{}
+	for i := range input {
+		name := "node-" + string(rune('a'+i%groups))
+		node := newTestExistingNode(name, true)
+		input[i] = node
+		inputSeq[node] = seqByName[name]
+		seqByName[name]++
+	}
 
-	s := &Scheduler{existingNodes: []*ExistingNode{other, first, second}}
+	s := &Scheduler{existingNodes: input}
 	s.sortExistingNodes()
 	got := s.existingNodes
 
-	if got[0] != first || got[1] != second || got[2] != other {
-		t.Fatalf("stability not preserved: got order [%p %p %p], want [first=%p second=%p other=%p]",
-			got[0], got[1], got[2], first, second, other)
+	if len(got) != n {
+		t.Fatalf("length mismatch: got %d want %d", len(got), n)
+	}
+	// Within each equal-key (same name) group, the original input order must be preserved: as we
+	// walk the sorted output, each node's input sequence number within its name must be ascending.
+	lastSeq := map[string]int{}
+	for i, node := range got {
+		name := node.Name()
+		if prev, seen := lastSeq[name]; seen && inputSeq[node] < prev {
+			t.Fatalf("stability not preserved: at output index %d, node %q (input seq %d) came after input seq %d",
+				i, name, inputSeq[node], prev)
+		}
+		lastSeq[name] = inputSeq[node]
 	}
 }
