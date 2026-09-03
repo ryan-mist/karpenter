@@ -313,6 +313,22 @@ func (p *Provisioner) NewScheduler(
 		instanceTypes[np.Name] = its
 	}
 
+	// Terminate-first detection simulation (RFC #3203): when enabled, drop reserved offerings that can't back
+	// a launch (full or unhealthy) so we don't optimistically place a replacement onto an unlaunchable
+	// reservation, and inject the synthetic freed-slot NodePool + its instance types. This must happen BEFORE
+	// topology and the reservation manager are built (both derive from nodePools/instanceTypes) so the
+	// synthetic pool is accounted for and no full/unhealthy reservation ID leaks into the reservation manager.
+	if enabled, syntheticPool, syntheticInstanceTypes := scheduler.ResolveTerminateFirstSimulation(opts...); enabled {
+		instanceTypes = scheduler.FilterUnlaunchableReservedOfferings(instanceTypes)
+		if syntheticPool != nil {
+			nodePools = append(nodePools, syntheticPool)
+			instanceTypes[syntheticPool.Name] = syntheticInstanceTypes
+			// Keep templates weight-ordered; the synthetic pool is lowest weight so it is only chosen when no
+			// real NodePool can stage the replacement.
+			nodepoolutils.OrderByWeight(nodePools)
+		}
+	}
+
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
 	// Pods that fail volume topology lookup are excluded from scheduling.

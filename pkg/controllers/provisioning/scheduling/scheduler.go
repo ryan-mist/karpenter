@@ -96,9 +96,72 @@ type options struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	enforceConsolidateAfter bool
+
+	// terminateFirstSim, when true, marks this scheduling run as a terminate-first detection simulation.
+	// In this mode the caller (Provisioner.NewScheduler) drops reserved offerings that cannot back a launch
+	// (see FilterUnlaunchableReservedOfferings) and optionally injects a synthetic freed-slot NodePool. This
+	// only takes effect on this simulation and never changes normal provisioning/consolidation behavior.
+	terminateFirstSim bool
+	// syntheticNodePool is an in-memory, lowest-weight NodePool injected only during the terminate-first
+	// detection simulation to represent the slot that would be freed by deleting the drifted candidate.
+	syntheticNodePool *v1.NodePool
+	// syntheticInstanceTypes are the hand-built instance types backing syntheticNodePool.
+	syntheticInstanceTypes []*cloudprovider.InstanceType
 }
 
 type Options = option.Function[options]
+
+// TerminateFirstSimulation marks a scheduling run as a terminate-first detection simulation. When set, the
+// scheduler drops reserved offerings that can't back a launch (full or unhealthy) so the sim doesn't
+// optimistically place a replacement onto an unlaunchable reservation. When syntheticPool is non-nil, it
+// (and its instance types) are injected as a lowest-weight NodePool representing the freed slot; a pod that
+// lands there signals that deleting the candidate would let reactive provisioning refill the slot.
+func TerminateFirstSimulation(syntheticPool *v1.NodePool, syntheticInstanceTypes []*cloudprovider.InstanceType) Options {
+	return func(opts *options) {
+		opts.terminateFirstSim = true
+		opts.syntheticNodePool = syntheticPool
+		opts.syntheticInstanceTypes = syntheticInstanceTypes
+	}
+}
+
+// ResolveTerminateFirstSimulation resolves the terminate-first simulation options so that
+// Provisioner.NewScheduler can adjust the NodePool/instance-type inputs before building topology and the
+// reservation manager.
+func ResolveTerminateFirstSimulation(opts ...Options) (enabled bool, syntheticPool *v1.NodePool, syntheticInstanceTypes []*cloudprovider.InstanceType) {
+	resolved := option.Resolve(opts...)
+	return resolved.terminateFirstSim, resolved.syntheticNodePool, resolved.syntheticInstanceTypes
+}
+
+// FilterUnlaunchableReservedOfferings returns a copy of the per-NodePool instance-type map with reserved
+// offerings that cannot back a launch removed. An offering is launchable when it is healthy (Available) and,
+// for reserved capacity, still has remaining ReservationCapacity. This is the sim-scoped "don't schedule onto
+// full reservations" filter used only during the terminate-first detection simulation.
+//
+// NOTE (provider dependency, RFC #3203): this treats Offering.Available as HEALTH and ReservationCapacity as
+// the remaining count, so a full-but-healthy reservation is (Available=true, ReservationCapacity=0). The
+// in-tree AWS cloud provider currently couples these (it flips Available=false when a reservation empties), so
+// this convention is exercised via the fake cloud provider test fixtures; adopting terminate-first in a real
+// provider requires the provider to decouple health from remaining capacity.
+func FilterUnlaunchableReservedOfferings(instanceTypes map[string][]*cloudprovider.InstanceType) map[string][]*cloudprovider.InstanceType {
+	filtered := make(map[string][]*cloudprovider.InstanceType, len(instanceTypes))
+	for npName, its := range instanceTypes {
+		newITs := make([]*cloudprovider.InstanceType, 0, len(its))
+		for _, it := range its {
+			clone := it.DeepCopy()
+			clone.Offerings = lo.Filter(clone.Offerings, func(o *cloudprovider.Offering, _ int) bool {
+				return offeringLaunchableInSimulation(o)
+			})
+			newITs = append(newITs, clone)
+		}
+		filtered[npName] = newITs
+	}
+	return filtered
+}
+
+// offeringLaunchableInSimulation is the inline launchable check applied during the terminate-first sim.
+func offeringLaunchableInSimulation(o *cloudprovider.Offering) bool {
+	return o.Available && (o.CapacityType() != v1.CapacityTypeReserved || o.ReservationCapacity > 0)
+}
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict

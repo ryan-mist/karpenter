@@ -92,6 +92,14 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		})
 		candidatePods = append(candidatePods, currentlyReschedulablePods...)
 	}
+	// Terminate-first detection sim only: the synthetic freed-slot NodePool has a DIFFERENT name than the
+	// candidate's real NodePool, so a reschedulable pod that requires karpenter.sh/nodepool In [<realPool>]
+	// could never land on it. Widen (never drop) that requirement on the sim's copy of the reschedulable pods
+	// to also allow the synthetic name. We deep-copy inside widenNodePoolRequirementsForSim so the real
+	// cluster pods are never mutated.
+	if enabled, syntheticPool, _ := scheduling.ResolveTerminateFirstSimulation(schedulerOpts...); enabled && syntheticPool != nil {
+		candidatePods = widenNodePoolRequirementsForSim(candidatePods, syntheticPool.Name)
+	}
 	pods = append(pods, candidatePods...)
 
 	// We get the pods that are on nodes that are deleting
@@ -310,6 +318,74 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 		}
 	}
 	return disruptionBudgetMapping, nil
+}
+
+// widenNodePoolRequirementsForSim returns deep copies of the given pods with any REQUIRED
+// karpenter.sh/nodepool constraint that targets the synthetic pool's real NodePool widened to also allow
+// the synthetic freed-slot NodePool name. It handles both the nodeAffinity form and the nodeSelector form.
+// Only the returned deep copies are mutated; the cluster pods are never touched. This runs only inside the
+// terminate-first detection simulation.
+func widenNodePoolRequirementsForSim(pods []*corev1.Pod, syntheticName string) []*corev1.Pod {
+	realName := strings.TrimSuffix(syntheticName, syntheticFreedSlotSuffix)
+	out := make([]*corev1.Pod, 0, len(pods))
+	for _, p := range pods {
+		pc := p.DeepCopy()
+		widenPodNodePoolRequirement(pc, realName, syntheticName)
+		out = append(out, pc)
+	}
+	return out
+}
+
+// widenPodNodePoolRequirement mutates a (deep-copied) pod so a required karpenter.sh/nodepool constraint
+// pinning it to realName also allows syntheticName. We only widen when realName is already an allowed value,
+// so a pod pinned to some OTHER NodePool is never granted access to the synthetic freed-slot pool.
+func widenPodNodePoolRequirement(pod *corev1.Pod, realName, syntheticName string) {
+	// Form 2: spec.nodeSelector is an exact-match AND map and cannot express OR, so if it pins nodepool to
+	// realName we remove that entry and promote it to a required nodeAffinity In [realName, syntheticName].
+	if v, ok := pod.Spec.NodeSelector[v1.NodePoolLabelKey]; ok && v == realName {
+		delete(pod.Spec.NodeSelector, v1.NodePoolLabelKey)
+		addRequiredNodePoolAffinityIn(pod, realName, syntheticName)
+	}
+	// Form 1: required nodeAffinity matchExpressions with key nodepool, operator In, containing realName.
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil ||
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return
+	}
+	terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	for i := range terms {
+		for j := range terms[i].MatchExpressions {
+			me := &terms[i].MatchExpressions[j]
+			if me.Key == v1.NodePoolLabelKey && me.Operator == corev1.NodeSelectorOpIn &&
+				lo.Contains(me.Values, realName) && !lo.Contains(me.Values, syntheticName) {
+				me.Values = append(me.Values, syntheticName)
+			}
+		}
+	}
+}
+
+// addRequiredNodePoolAffinityIn adds a required "karpenter.sh/nodepool In names" node affinity. When required
+// terms already exist, the requirement is ANDed into each existing term (matchExpressions within a term are
+// ANDed) rather than added as a new ORed term.
+func addRequiredNodePoolAffinityIn(pod *corev1.Pod, names ...string) {
+	req := corev1.NodeSelectorRequirement{Key: v1.NodePoolLabelKey, Operator: corev1.NodeSelectorOpIn, Values: names}
+	if pod.Spec.Affinity == nil {
+		pod.Spec.Affinity = &corev1.Affinity{}
+	}
+	if pod.Spec.Affinity.NodeAffinity == nil {
+		pod.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	na := pod.Spec.Affinity.NodeAffinity
+	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil ||
+		len(na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{req}}},
+		}
+		return
+	}
+	for i := range na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[i].MatchExpressions =
+			append(na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[i].MatchExpressions, req)
+	}
 }
 
 // mapCandidates maps the list of proposed candidates with the current state

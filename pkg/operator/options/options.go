@@ -66,6 +66,11 @@ type FeatureGates struct {
 	NodeOverlay             bool
 	StaticCapacity          bool
 	CapacityBuffer          bool
+	// TerminateFirst enables terminate-first disruption: when drift wants to replace a node on a
+	// capacity-constrained reserved offering that cannot stage a replacement (the reservation is full but
+	// healthy), Karpenter issues a delete-only command and lets reactive provisioning refill the freed slot.
+	// See RFC kubernetes-sigs/karpenter#3203.
+	TerminateFirst bool
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -187,6 +192,7 @@ func DefaultFeatureGates() FeatureGates {
 		NodeOverlay:             false,
 		StaticCapacity:          false,
 		CapacityBuffer:          false,
+		TerminateFirst:          false,
 	}
 }
 
@@ -216,6 +222,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap["CapacityBuffer"]; ok {
 		gates.CapacityBuffer = val
+	}
+	if val, ok := gateMap["TerminateFirst"]; ok {
+		gates.TerminateFirst = val
 	}
 
 	return gates, nil
