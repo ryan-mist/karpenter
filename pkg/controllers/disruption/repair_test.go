@@ -21,6 +21,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -90,6 +91,28 @@ var _ = Describe("Repair", func() {
 	initNode := func(nc *v1.NodeClaim, n *corev1.Node) {
 		ExpectApplied(ctx, env.Client, nc, n)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{n}, []*v1.NodeClaim{nc})
+	}
+
+	// registerNode applies a node/nodeclaim that has registered but never initialized because its Ready condition never
+	// became True, then syncs cluster state. The Ready=False condition transitions at the current fake-clock time.
+	registerNode := func(nc *v1.NodeClaim, n *corev1.Node) {
+		// Cluster state only tracks an uninitialized managed node once its instance type label has propagated.
+		instanceType := cloudProvider.InstanceTypes[0].Name
+		nc.Labels = lo.Assign(nc.Labels, map[string]string{corev1.LabelInstanceTypeStable: instanceType})
+		n.Labels = lo.Assign(n.Labels, map[string]string{corev1.LabelInstanceTypeStable: instanceType})
+		n.Spec.Taints = lo.Reject(n.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.UnregisteredNoExecuteTaint) })
+		n.Labels = lo.Assign(n.Labels, map[string]string{v1.NodeRegisteredLabelKey: "true"})
+		ExpectApplied(ctx, env.Client, nc, n)
+		if env.Clock.Now().Before(n.CreationTimestamp.Time) {
+			env.Clock.SetTime(n.CreationTimestamp.Time)
+		}
+		ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, n)
+		nc = ExpectExists(ctx, env.Client, nc)
+		nc.StatusConditions(status.WithClock(env.Clock)).SetTrue(v1.ConditionTypeLaunched)
+		nc.StatusConditions(status.WithClock(env.Clock)).SetTrue(v1.ConditionTypeRegistered)
+		ExpectApplied(ctx, env.Client, nc)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+		ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 	}
 
 	// bindReschedulablePod places a ReplicaSet-owned (reschedulable) pod on the node so pre-spin sizing has workload
@@ -214,6 +237,87 @@ var _ = Describe("Repair", func() {
 		ExpectSingletonReconciled(ctx, repairController)
 
 		Expect(queue.GetCommands()).To(HaveLen(0))
+	})
+
+	Context("Uninitialized Nodes", func() {
+		BeforeEach(func() {
+			cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+				{ConditionType: corev1.NodeReady, ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+			}
+			newRepairController()
+		})
+		It("should repair a registered node that never initialized once the toleration elapses", func() {
+			registerNode(nodeClaim, node)
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(nodeClaim.Name))
+		})
+		It("should pre-spin a replacement for a registered node that never initialized and has workload", func() {
+			registerNode(nodeClaim, node)
+			bindReschedulablePod(node)
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+		})
+		It("should not repair a registered node that never initialized before the toleration elapses", func() {
+			registerNode(nodeClaim, node)
+			env.Clock.Step(10 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+		})
+		It("should repair a registered node that never initialized while it is nominated for pending pods", func() {
+			registerNode(nodeClaim, node)
+			env.Clock.Step(31 * time.Minute)
+			cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+
+			ExpectSingletonReconciled(ctx, repairController)
+
+			Expect(queue.GetCommands()).To(HaveLen(1))
+		})
+		It("should not repair a node that has not registered", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+		})
+		It("should count an in-flight repair of a node that never initialized against the disruption budget", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			// Two of ten nodes never initialize, which stays within the unhealthy circuit-breaker threshold.
+			healthyClaims, healthyNodes := test.NodeClaimsAndNodes(8, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range healthyNodes {
+				initNode(healthyClaims[i], healthyNodes[i])
+			}
+			nodeClaims, nodes := test.NodeClaimsAndNodes(2, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+			for i := range nodes {
+				registerNode(nodeClaims[i], nodes[i])
+			}
+			env.Clock.Step(31 * time.Minute)
+
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(HaveLen(1))
+
+			// The first command's candidate is marked for deletion, so the budget of one is consumed.
+			ExpectSingletonReconciled(ctx, repairController)
+			Expect(queue.GetCommands()).To(HaveLen(1))
+		})
 	})
 
 	It("should use a matching reason-specific policy instead of the fallback", func() {
