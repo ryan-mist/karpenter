@@ -160,9 +160,10 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 
 	err := node.ValidateNodeDisruptable(clk)
 	if err != nil {
-		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node.
+		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node, and a
+		// registered node that is unhealthy from first boot never initializes.
 		if disruptionClass == RepairDisruptionClass {
-			err = state.IgnoreNodeDoNotDisruptError(err)
+			err = state.IgnoreNodeNotInitializedError(state.IgnoreNodeDoNotDisruptError(err))
 		}
 		if err != nil {
 			// Only emit an event for Karpenter-managed nodes.

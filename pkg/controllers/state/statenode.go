@@ -100,6 +100,32 @@ func IgnoreNodeDoNotDisruptError(err error) error {
 	return err
 }
 
+// NodeNotInitializedError is returned by ValidateNodeDisruptable when a registered node has not initialized. It is a
+// distinct type so the repair path can selectively ignore it: a node that is unhealthy from first boot never
+// initializes, and repair must still be able to replace it.
+type NodeNotInitializedError struct {
+	error
+}
+
+func NewNodeNotInitializedError(err error) *NodeNotInitializedError {
+	return &NodeNotInitializedError{error: err}
+}
+
+func IsNodeNotInitializedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nodeNotInitializedError *NodeNotInitializedError
+	return stderrors.As(err, &nodeNotInitializedError)
+}
+
+func IgnoreNodeNotInitializedError(err error) error {
+	if IsNodeNotInitializedError(err) {
+		return nil
+	}
+	return err
+}
+
 //go:generate go tool -modfile=../../../go.tools.mod controller-gen object:headerFile="../../../hack/boilerplate.go.txt" paths="."
 
 // StateNodes is a typed version of a list of *Node
@@ -243,9 +269,6 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 	if in.Node == nil {
 		return fmt.Errorf("nodeclaim does not have an associated node")
 	}
-	if !in.Initialized() {
-		return fmt.Errorf("node isn't initialized")
-	}
 	// A rebooting node must not be picked up by other disruption methods. This covers the drain window
 	// too, where the node is still Initialized but a reboot is already committed.
 	if in.RebootInProgress() {
@@ -253,6 +276,15 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 	}
 	if in.MarkedForDeletion() {
 		return fmt.Errorf("node is deleting or marked for deletion")
+	}
+	// Only a registered node yields the ignorable error, so callers that ignore it still act on a real Node. This is
+	// checked before nomination because an uninitialized node is in-flight capacity that the provisioner keeps
+	// nominating for pending pods, which would otherwise block repair of a node that never becomes healthy.
+	if !in.Initialized() {
+		if !in.Registered() {
+			return fmt.Errorf("node isn't initialized")
+		}
+		return NewNodeNotInitializedError(fmt.Errorf("node isn't initialized"))
 	}
 	// skip the node if it is nominated by a recent provisioning pass to be the target of a pending pod.
 	if in.Nominated(clk) {

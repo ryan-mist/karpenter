@@ -361,7 +361,11 @@ func NodePoolStatsFromNodes(nodes []*state.StateNode, reason v1.DisruptionReason
 		// aren't initialized could be counted towards the total, resulting in more disruptions
 		// to active nodes than desired, where Karpenter should wait for these nodes to be
 		// healthy before continuing.
-		if !node.Managed() || !node.Initialized() {
+		// Repair is the exception: it can act on registered nodes that never initialized, so the Unhealthy budget
+		// counts them. Otherwise a NodePool whose nodes all fail to initialize would have no repair budget, and
+		// in-flight repairs of such nodes would never consume it.
+		countable := node.Initialized() || (reason == v1.DisruptionReasonUnhealthy && node.Registered())
+		if !node.Managed() || !countable {
 			continue
 		}
 
