@@ -636,7 +636,28 @@ var _ = Describe("Balanced Scoring", func() {
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
 			sorted := c.sortCandidates(ctx, []*Candidate{balY, defQ, balX, defP})
-			Expect(sorted).To(Equal([]*Candidate{defP, defQ, balX, balY}))
+			// Each group is in its own key order; equal-sized groups alternate.
+			Expect(sorted).To(Equal([]*Candidate{defP, balX, defQ, balY}))
+		})
+
+		It("should merge policy groups in proportion to their size", func() {
+			balancedNP := makeNodePool("balanced", v1.ConsolidationPolicyBalanced)
+			defaultNP := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
+
+			bal := makeCandidate("bal", balancedNP, makeInstanceType("bal", 1.0), []*corev1.Pod{makePod("b", "")})
+			defs := make([]*Candidate, 9)
+			for i := range defs {
+				defs[i] = makeCandidate(fmt.Sprintf("def-%d", i), defaultNP, makeInstanceType(fmt.Sprintf("def-%d", i), 1.0), []*corev1.Pod{makePod(fmt.Sprintf("d%d", i), "")})
+				defs[i].DisruptionCost = float64(i)
+			}
+
+			c := consolidation{}
+			ctx := options.ToContext(context.Background(), &options.Options{})
+			sorted := c.sortCandidates(ctx, append([]*Candidate{bal}, defs...))
+
+			// The single Balanced candidate has rank 1/2, so it lands mid-list
+			// after the non-Balanced candidate with rank 5/10.
+			Expect(sorted).To(Equal(append(append(append([]*Candidate{}, defs[:5]...), bal), defs[5:]...)))
 		})
 	})
 

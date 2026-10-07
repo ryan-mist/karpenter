@@ -135,13 +135,15 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
-// sortCandidates sorts each consolidation policy by its own key and returns
-// non-Balanced candidates followed by Balanced candidates, since the keys are
-// not comparable:
+// sortCandidates sorts each consolidation policy by its own key:
 //   - non-Balanced: disruption cost ascending, finding batches that are easy to
 //     pack (low-disruption nodes fit together).
 //   - Balanced: price/disruption ratio descending, finding batches worth packing
 //     (high savings per unit disruption).
+//
+// The keys are not comparable, so the groups are merged by fractional rank
+// within their group. Each policy's share of any prefix (e.g. a multi-node
+// batch) matches its share of all candidates.
 func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidate) []*Candidate {
 	balanced, other := lo.FilterReject(candidates, func(cn *Candidate, _ int) bool {
 		return cn.NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
@@ -152,7 +154,20 @@ func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidat
 	sort.Slice(balanced, func(i, j int) bool {
 		return balanced[i].SavingsRatio() > balanced[j].SavingsRatio()
 	})
-	return append(other, balanced...)
+	result := make([]*Candidate, 0, len(candidates))
+	i, j := 0, 0
+	for i < len(other) || j < len(balanced) {
+		// Compare ranks (i+1)/(len(other)+1) and (j+1)/(len(balanced)+1) without
+		// floats; ties go to non-Balanced.
+		if j == len(balanced) || (i < len(other) && (i+1)*(len(balanced)+1) <= (j+1)*(len(other)+1)) {
+			result = append(result, other[i])
+			i++
+		} else {
+			result = append(result, balanced[j])
+			j++
+		}
+	}
+	return result
 }
 
 // computeConsolidation computes a consolidation action to take
