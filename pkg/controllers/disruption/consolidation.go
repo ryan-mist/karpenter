@@ -135,22 +135,39 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
-// sortCandidates sorts candidates by price/disruption ratio descending.
-// The binary search in multi-node consolidation tries the first N candidates
-// as a batch. Ratio sort means the batch contains the highest-value nodes,
-// so budget-limited cycles execute the most impactful moves first.
+// sortCandidates sorts each consolidation policy by its own key:
+//   - non-Balanced: disruption cost ascending, finding batches that are easy to
+//     pack (low-disruption nodes fit together).
+//   - Balanced: price/disruption ratio descending, finding batches worth packing
+//     (high savings per unit disruption).
 //
-// This changes multi-node behavior for WhenEmptyOrUnderutilized, which
-// previously sorted by disruption cost ascending. The old sort found batches
-// that were easy to pack (low-disruption nodes fit together). The new sort
-// finds batches worth packing (high savings per unit disruption). The binary
-// search still converges because it shrinks the window until scheduling
-// succeeds.
+// The keys are not comparable, so the groups are merged by fractional rank
+// within their group. Each policy's share of any prefix (e.g. a multi-node
+// batch) matches its share of all candidates.
 func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidate) []*Candidate {
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].SavingsRatio() > candidates[j].SavingsRatio()
+	balanced, other := lo.FilterReject(candidates, func(cn *Candidate, _ int) bool {
+		return cn.NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
 	})
-	return candidates
+	sort.Slice(other, func(i, j int) bool {
+		return other[i].DisruptionCost < other[j].DisruptionCost
+	})
+	sort.Slice(balanced, func(i, j int) bool {
+		return balanced[i].SavingsRatio() > balanced[j].SavingsRatio()
+	})
+	result := make([]*Candidate, 0, len(candidates))
+	i, j := 0, 0
+	for i < len(other) || j < len(balanced) {
+		// Compare ranks (i+1)/(len(other)+1) and (j+1)/(len(balanced)+1) without
+		// floats; ties go to non-Balanced.
+		if j == len(balanced) || (i < len(other) && (i+1)*(len(balanced)+1) <= (j+1)*(len(other)+1)) {
+			result = append(result, other[i])
+			i++
+		} else {
+			result = append(result, balanced[j])
+			j++
+		}
+	}
+	return result
 }
 
 // computeConsolidation computes a consolidation action to take

@@ -598,46 +598,66 @@ var _ = Describe("Balanced Scoring", func() {
 			Expect(sorted[2]).To(Equal(candB), "expected third candidate to be B (lowest ratio)")
 		})
 
-		It("should sort non-Balanced candidates by savings ratio descending", func() {
+		It("should sort non-Balanced candidates by disruption cost ascending", func() {
 			np := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
 
-			// All same price, different disruption costs -> ratio = price/disruption
-			itA := makeInstanceType("type-a", 4.84)
-			itB := makeInstanceType("type-b", 4.84)
-			itC := makeInstanceType("type-c", 4.84)
-
-			candA := makeCandidate("node-a", np, itA, []*corev1.Pod{makePod("pa", "")})
-			candA.RescheduleDisruptionCost = 10.0 // ratio = 4.84/10 = 0.484
-			candB := makeCandidate("node-b", np, itB, nil)
-			// no pods: RescheduleDisruptionCost = 1.0 (base), ratio = 4.84/1 = 4.84
-			candC := makeCandidate("node-c", np, itC, []*corev1.Pod{makePod("pc", "")})
-			candC.RescheduleDisruptionCost = 5.0 // ratio = 4.84/5 = 0.968
+			// Ratio order would be B > C > A; disruption cost order is A < C < B.
+			candA := makeCandidate("node-a", np, makeInstanceType("type-a", 1.0), []*corev1.Pod{makePod("pa", "")})
+			candA.DisruptionCost = 1.0
+			candA.RescheduleDisruptionCost = 10.0
+			candB := makeCandidate("node-b", np, makeInstanceType("type-b", 10.0), nil)
+			candB.DisruptionCost = 3.0
+			candC := makeCandidate("node-c", np, makeInstanceType("type-c", 5.0), []*corev1.Pod{makePod("pc", "")})
+			candC.DisruptionCost = 2.0
+			candC.RescheduleDisruptionCost = 5.0
 
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candA, candB, candC})
+			sorted := c.sortCandidates(ctx, []*Candidate{candB, candC, candA})
 
-			// Expected order by ratio descending: B (4.84) > C (0.968) > A (0.484)
-			Expect(sorted[0]).To(Equal(candB))
-			Expect(sorted[1]).To(Equal(candC))
-			Expect(sorted[2]).To(Equal(candA))
+			Expect(sorted).To(Equal([]*Candidate{candA, candC, candB}))
 		})
 
-		It("should sort all candidates by savings ratio when any uses Balanced", func() {
+		It("should sort each policy by its own key without comparing across policies", func() {
 			balancedNP := makeNodePool("balanced", v1.ConsolidationPolicyBalanced)
 			defaultNP := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
 
-			itExpensive := makeInstanceType("expensive", 10.0)
-			itCheap := makeInstanceType("cheap", 1.0)
-
-			candBalanced := makeCandidate("node-balanced", balancedNP, itExpensive, []*corev1.Pod{makePod("p1", "")})
-			candDefault := makeCandidate("node-default", defaultNP, itCheap, []*corev1.Pod{makePod("p2", "")})
+			// Balanced: ratio 10/2 = 5.0 for X, 1/2 = 0.5 for Y
+			balX := makeCandidate("bal-x", balancedNP, makeInstanceType("bal-x", 10.0), []*corev1.Pod{makePod("bx", "")})
+			balX.DisruptionCost = 100.0
+			balY := makeCandidate("bal-y", balancedNP, makeInstanceType("bal-y", 1.0), []*corev1.Pod{makePod("by", "")})
+			balY.DisruptionCost = 0.1
+			// non-Balanced: disruption cost P < Q, ratio Q > P
+			defP := makeCandidate("def-p", defaultNP, makeInstanceType("def-p", 1.0), []*corev1.Pod{makePod("dp", "")})
+			defP.DisruptionCost = 1.0
+			defQ := makeCandidate("def-q", defaultNP, makeInstanceType("def-q", 10.0), []*corev1.Pod{makePod("dq", "")})
+			defQ.DisruptionCost = 2.0
 
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candDefault, candBalanced})
+			sorted := c.sortCandidates(ctx, []*Candidate{balY, defQ, balX, defP})
+			// Each group is in its own key order; equal-sized groups alternate.
+			Expect(sorted).To(Equal([]*Candidate{defP, balX, defQ, balY}))
+		})
 
-			Expect(sorted[0]).To(Equal(candBalanced), "expected balanced candidate first (higher ratio)")
+		It("should merge policy groups in proportion to their size", func() {
+			balancedNP := makeNodePool("balanced", v1.ConsolidationPolicyBalanced)
+			defaultNP := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
+
+			bal := makeCandidate("bal", balancedNP, makeInstanceType("bal", 1.0), []*corev1.Pod{makePod("b", "")})
+			defs := make([]*Candidate, 9)
+			for i := range defs {
+				defs[i] = makeCandidate(fmt.Sprintf("def-%d", i), defaultNP, makeInstanceType(fmt.Sprintf("def-%d", i), 1.0), []*corev1.Pod{makePod(fmt.Sprintf("d%d", i), "")})
+				defs[i].DisruptionCost = float64(i)
+			}
+
+			c := consolidation{}
+			ctx := options.ToContext(context.Background(), &options.Options{})
+			sorted := c.sortCandidates(ctx, append([]*Candidate{bal}, defs...))
+
+			// The single Balanced candidate has rank 1/2, so it lands mid-list
+			// after the non-Balanced candidate with rank 5/10.
+			Expect(sorted).To(Equal(append(append(append([]*Candidate{}, defs[:5]...), bal), defs[5:]...)))
 		})
 	})
 
