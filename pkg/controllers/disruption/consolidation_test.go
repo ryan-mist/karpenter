@@ -4426,7 +4426,7 @@ var _ = Describe("Consolidation", func() {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			}
 		})
-		It("should consolidate the node with best savings ratio first", func() {
+		It("should consider node lifetime remaining when calculating disruption cost", func() {
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -4461,16 +4461,16 @@ var _ = Describe("Consolidation", func() {
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Process the item so that the nodes can be deleted.
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[1])
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
 
 			// Cascade any deletion of the nodeclaim to the node
-			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
-			// Node 1 has fewer pods (lower RescheduleDisruptionCost) so better
-			// savings ratio (price/disruption). It sorts first and consolidates.
+			// the first node has more pods, so it would normally not be picked for consolidation, except it has very little
+			// lifetime remaining, so it should be deleted
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
-			ExpectNotFound(ctx, env.Client, nodeClaims[1], nodes[1])
+			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodes[0])
 		})
 	})
 	Context("Topology Consideration", func() {
