@@ -131,7 +131,7 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 		return reconcile.Result{}, nil
 	}
 	now := c.clock.Now()
-	result := c.matcher.Evaluate(node, now)
+	result := c.matcher.EvaluateSince(node, now, rebootFinishedAt(nodeClaim))
 	if result.Action == "" {
 		if !result.NextEligibleAt.IsZero() {
 			return reconcile.Result{RequeueAfter: result.NextEligibleAt.Sub(now)}, nil
@@ -172,6 +172,20 @@ func owns(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 		!conditions.Get(v1.ConditionTypeInitialized).IsTrue() &&
 		node.Labels[v1.NodeInitializedLabelKey] != "true" &&
 		!conditions.Get(v1.ConditionTypeRebooting).IsTrue()
+}
+
+// rebootFinishedAt returns when the NodeClaim's most recent reboot reached a terminal outcome, or zero if it was never
+// rebooted. The reboot controller's terminal write flips Rebooting from True to False, which stamps its transition time;
+// owns excludes NodeClaims that are still rebooting, so any Rebooting condition seen here is terminal.
+// Unhealthy time is only counted from then: a condition reported before or during the reboot (e.g. by an agent that
+// hasn't re-reported since the node came back) says nothing about the rebooted node, so the node gets a full
+// toleration to re-initialize, and return to the repair disruption method's reboot escalation, or clear the condition.
+func rebootFinishedAt(nodeClaim *v1.NodeClaim) time.Time {
+	rebooting := nodeClaim.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeRebooting)
+	if rebooting == nil {
+		return time.Time{}
+	}
+	return rebooting.LastTransitionTime.Time
 }
 
 // delete requests NodeClaim deletion, preconditioned on the evaluated ResourceVersion so a NodeClaim that initialized
@@ -263,10 +277,12 @@ func nodePredicates(cloudProvider cloudprovider.CloudProvider) []predicate.Predi
 	}
 }
 
-// nodeClaimPredicates admit NodeClaim updates that can change eligibility without a Node event: the Registered,
-// Initialized, or Rebooting condition changing status, and do-not-repair changes. Node events cover creation, so
-// NodeClaim creation, deletion, and generic events are dropped. Conditions are read with WithObservedOnly because
-// predicates receive the shared cached object.
+// nodeClaimPredicates admit NodeClaim updates that can change eligibility without a Node event: the Registered
+// condition changing status (registration labels the Node before it marks the NodeClaim Registered), the Rebooting
+// condition changing status (a reboot reaches its terminal outcome on the NodeClaim alone), and do-not-repair changes.
+// Initialized needs no trigger: it only returns to Unknown when a reboot is issued, which also strips the Node's
+// initialized label. Node events cover creation, so NodeClaim creation, deletion, and generic events are dropped.
+// Conditions are read with WithObservedOnly because predicates receive the shared cached object.
 func nodeClaimPredicates(cloudProvider cloudprovider.CloudProvider) []predicate.Predicate {
 	return []predicate.Predicate{
 		nodeclaimutils.IsManagedPredicateFuncs(cloudProvider),
@@ -278,7 +294,7 @@ func nodeClaimPredicates(cloudProvider cloudprovider.CloudProvider) []predicate.
 				oldNodeClaim, newNodeClaim := e.ObjectOld.(*v1.NodeClaim), e.ObjectNew.(*v1.NodeClaim)
 				oldConditions := oldNodeClaim.StatusConditions(status.WithObservedOnly())
 				newConditions := newNodeClaim.StatusConditions(status.WithObservedOnly())
-				return lo.SomeBy([]string{v1.ConditionTypeRegistered, v1.ConditionTypeInitialized, v1.ConditionTypeRebooting}, func(t string) bool {
+				return lo.SomeBy([]string{v1.ConditionTypeRegistered, v1.ConditionTypeRebooting}, func(t string) bool {
 					return conditionStatus(oldConditions.Get(t)) != conditionStatus(newConditions.Get(t))
 				}) || oldNodeClaim.Annotations[v1.DoNotRepairAnnotationKey] != newNodeClaim.Annotations[v1.DoNotRepairAnnotationKey]
 			},

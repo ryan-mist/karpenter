@@ -216,13 +216,22 @@ func validConditionStatus(status corev1.ConditionStatus) bool {
 // Evaluate returns the merged repair policy decision for one Node. Provider policies are immutable after construction,
 // so returned duration pointers must be treated as read-only.
 func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairResult {
+	return p.EvaluateSince(node, now, time.Time{})
+}
+
+// EvaluateSince is Evaluate with every condition's toleration measured from no earlier than notBefore, so time a
+// condition held before notBefore (e.g. while the node was rebooting) doesn't count toward its toleration.
+func (p *RepairPolicyMatcher) EvaluateSince(node *corev1.Node, now, notBefore time.Time) RepairResult {
 	result := RepairResult{}
+	// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
+	if notBefore.Before(node.CreationTimestamp.Time) {
+		notBefore = node.CreationTimestamp.Time
+	}
 	for i := range node.Status.Conditions {
 		condition := node.Status.Conditions[i]
-		// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
 		transitionTime := condition.LastTransitionTime.Time
-		if transitionTime.Before(node.CreationTimestamp.Time) {
-			transitionTime = node.CreationTimestamp.Time
+		if transitionTime.Before(notBefore) {
+			transitionTime = notBefore
 		}
 		specificPolicies, ok := p.groups[policyKey{conditionType: condition.Type, conditionStatus: condition.Status}]
 		if !ok {

@@ -65,6 +65,10 @@ var _ = Describe("Uninitialized Node Repair", func() {
 		nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
 		nc.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
 		ExpectApplied(ctx, env.Client, nc, n)
+		// The API server stamps creation with real time; a condition can't predate it, so keep the fake clock at or past it.
+		if env.Clock.Now().Before(n.CreationTimestamp.Time) {
+			env.Clock.SetTime(n.CreationTimestamp.Time)
+		}
 		ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, n)
 	}
 	// initialize makes a NodeClaim/Node pair initialized and healthy.
@@ -196,12 +200,30 @@ var _ = Describe("Uninitialized Node Repair", func() {
 		expectNotDeleted(nodeClaim)
 	})
 	It("should delete a node that goes unhealthy after a reboot completes but before it re-initializes", func() {
-		nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+		nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
 		register(nodeClaim, node)
 		env.Clock.Step(31 * time.Minute)
 
 		ExpectObjectReconciled(ctx, env.Client, controller, node)
 
+		expectDeleted(nodeClaim)
+	})
+	It("should only count unhealthy time after a reboot completes", func() {
+		// The condition predates the reboot, e.g. an agent hasn't re-reported it since the node came back.
+		register(nodeClaim, node)
+		env.Clock.Step(31 * time.Minute)
+		stored := ExpectExists(ctx, env.Client, nodeClaim)
+		stored.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+		ExpectApplied(ctx, env.Client, stored)
+		env.Clock.Step(10 * time.Minute)
+
+		result := ExpectObjectReconciled(ctx, env.Client, controller, node)
+
+		expectNotDeleted(nodeClaim)
+		Expect(result.RequeueAfter).To(Equal(20 * time.Minute))
+
+		env.Clock.Step(20 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, controller, node)
 		expectDeleted(nodeClaim)
 	})
 	DescribeTable("should not delete a node annotated do-not-repair",
@@ -311,10 +333,15 @@ var _ = Describe("Uninitialized Node Repair", func() {
 			// The reboot controller writes only the NodeClaim; the Node's conditions don't change.
 			stored := ExpectExists(ctx, env.Client, nodeClaim)
 			updated := stored.DeepCopy()
-			updated.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+			updated.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
 			Expect(passes(nodeClaimPredicates(cloudProvider), stored, updated)).To(BeTrue())
 			ExpectApplied(ctx, env.Client, updated)
 
+			// The node gets a full toleration after the reboot before it is replaced.
+			result := ExpectObjectReconciled(ctx, env.Client, controller, node)
+			expectNotDeleted(nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(30 * time.Minute))
+			env.Clock.Step(30 * time.Minute)
 			ExpectObjectReconciled(ctx, env.Client, controller, node)
 			expectDeleted(nodeClaim)
 		})
@@ -370,7 +397,7 @@ var _ = Describe("Uninitialized Node Repair", func() {
 			register(nodeClaim, node)
 			stored := ExpectExists(ctx, env.Client, nodeClaim)
 			for name, mutate := range map[string]func(nc *v1.NodeClaim){
-				"initialized": func(nc *v1.NodeClaim) { nc.StatusConditions().SetTrue(v1.ConditionTypeInitialized) },
+				"registered": func(nc *v1.NodeClaim) { nc.StatusConditions().SetUnknown(v1.ConditionTypeRegistered) },
 				"rebooting": func(nc *v1.NodeClaim) {
 					nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "")
 				},
@@ -385,6 +412,10 @@ var _ = Describe("Uninitialized Node Repair", func() {
 			unrelated := stored.DeepCopy()
 			unrelated.Status.LastPodEventTime = metav1.NewTime(env.Clock.Now())
 			Expect(passes(nodeClaimPredicates(cloudProvider), stored, unrelated)).To(BeFalse())
+			// Initialized only returns to Unknown when a reboot is issued, which also changes the Node.
+			initialized := stored.DeepCopy()
+			initialized.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+			Expect(passes(nodeClaimPredicates(cloudProvider), stored, initialized)).To(BeFalse())
 		})
 		It("should not mutate the cached NodeClaim when filtering", func() {
 			register(nodeClaim, node)
@@ -521,6 +552,23 @@ var _ = Describe("RepairResult NextEligibleAt", func() {
 		// DiskPressure is already eligible; the reason-specific Ready policy (not the 30m fallback) is next.
 		Expect(result.Action).To(Equal(cloudprovider.ReplaceNode))
 		Expect(result.NextEligibleAt).To(Equal(now.Add(2 * time.Minute)))
+	})
+	It("should measure toleration from no earlier than notBefore", func() {
+		matcher, err := NewRepairPolicyMatcher([]cloudprovider.RepairPolicy{
+			{ConditionType: corev1.NodeReady, ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
+		}, supportedRepairActions)
+		Expect(err).ToNot(HaveOccurred())
+		now := time.Now().Truncate(time.Second)
+		node := &corev1.Node{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(now.Add(-time.Hour))},
+		}}}
+
+		Expect(matcher.Evaluate(node, now).Action).To(Equal(cloudprovider.ReplaceNode))
+		result := matcher.EvaluateSince(node, now, now.Add(-10*time.Minute))
+		Expect(result.Action).To(BeEmpty())
+		Expect(result.NextEligibleAt).To(Equal(now.Add(20 * time.Minute)))
+		// A notBefore that predates the condition changes nothing.
+		Expect(matcher.EvaluateSince(node, now, now.Add(-2*time.Hour)).Action).To(Equal(cloudprovider.ReplaceNode))
 	})
 	It("should return false when every matching policy is already eligible", func() {
 		matcher, err := NewRepairPolicyMatcher([]cloudprovider.RepairPolicy{
