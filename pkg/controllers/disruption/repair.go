@@ -28,7 +28,6 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -56,17 +55,9 @@ type Repair struct {
 // NewRepair validates and compiles the provider's complete repair policy set before constructing the method. It panics
 // when the provider defines no policies or the complete set is invalid.
 func NewRepair(c consolidation) *Repair {
-	policies := c.cloudProvider.RepairPolicies()
-	if len(policies) == 0 {
-		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
-	}
-	policyMatcher, err := health.NewRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode))
-	if err != nil {
-		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
-	}
 	return &Repair{
 		consolidation:      c,
-		policyMatcher:      policyMatcher,
+		policyMatcher:      health.MustNewRepairPolicyMatcher(c.cloudProvider),
 		rebootHistory:      newRebootHistory(c.clock),
 		decisionLogMonitor: pretty.NewChangeMonitor(),
 	}

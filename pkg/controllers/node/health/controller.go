@@ -23,11 +23,12 @@ import (
 
 	"github.com/awslabs/operatorpkg/reasonable"
 	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -72,25 +73,17 @@ type Controller struct {
 	matcher       *RepairPolicyMatcher
 }
 
-// NewController validates and compiles the provider's repair policy set the same way the repair disruption method
-// does. It panics when the provider defines no policies or the set is invalid.
+// NewController compiles the provider's repair policy set with MustNewRepairPolicyMatcher, so it accepts exactly the
+// policy sets the repair disruption method does. Whatever action a matching policy selects, this controller terminates:
+// the reboot controller bounds recovery from the Initialized condition's transition to Unknown, which never happens on a
+// node that never initialized, so a reboot here would immediately time out and escalate to replacement anyway.
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder) *Controller {
-	policies := cloudProvider.RepairPolicies()
-	if len(policies) == 0 {
-		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
-	}
-	// Accept the same actions as the repair disruption method so both paths validate the provider set identically. Any
-	// selected action replaces here: rebooting a node that never initialized can't restore a healthy prior state.
-	matcher, err := NewRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode))
-	if err != nil {
-		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
-	}
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
-		matcher:       matcher,
+		matcher:       MustNewRepairPolicyMatcher(cloudProvider),
 	}
 }
 
@@ -98,22 +91,15 @@ func (c *Controller) Name() string {
 	return "node.health"
 }
 
+// Register watches Nodes and the NodeClaims that own them. Eligibility depends on state from both objects, and several
+// transitions change only one of them: registration labels the Node before it marks the NodeClaim Registered, and a
+// reboot reaches its terminal outcome on the NodeClaim alone. Each watch fires on every input to eligibility that can
+// change without the other firing; toleration and the circuit breaker are covered by requeues.
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("node.health").
-		For(&corev1.Node{}, builder.WithPredicates(
-			nodeutils.IsManagedPredicateFuncs(c.cloudProvider),
-			predicate.NewPredicateFuncs(func(o client.Object) bool {
-				// Initialized nodes belong to the repair disruption method.
-				return o.GetLabels()[v1.NodeInitializedLabelKey] != "true"
-			}),
-			predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
-				oldNode, newNode := e.ObjectOld.(*corev1.Node), e.ObjectNew.(*corev1.Node)
-				return oldNode.Labels[v1.NodeRegisteredLabelKey] != newNode.Labels[v1.NodeRegisteredLabelKey] ||
-					oldNode.Labels[v1.NodeInitializedLabelKey] != newNode.Labels[v1.NodeInitializedLabelKey] ||
-					conditionsChanged(oldNode, newNode)
-			}},
-		)).
+		For(&corev1.Node{}, builder.WithPredicates(nodePredicates(c.cloudProvider)...)).
+		Watches(&v1.NodeClaim{}, nodeutils.NodeClaimEventHandler(c.kubeClient), builder.WithPredicates(nodeClaimPredicates(c.cloudProvider)...)).
 		WithOptions(controller.Options{
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 100),
@@ -132,7 +118,7 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 		return reconcile.Result{}, nodeutils.IgnoreDuplicateNodeClaimError(nodeutils.IgnoreNodeClaimNotFoundError(err))
 	}
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)))
-	if !c.owns(node, nodeClaim) {
+	if !owns(node, nodeClaim) {
 		return reconcile.Result{}, nil
 	}
 	// do-not-repair is the operator's escape hatch; do-not-disrupt is deliberately ignored, as in the disruption method.
@@ -147,8 +133,8 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	now := c.clock.Now()
 	result := c.matcher.Evaluate(node, now)
 	if result.Action == "" {
-		if next, ok := c.matcher.NextEligibleAt(node, now); ok {
-			return reconcile.Result{RequeueAfter: next.Sub(now)}, nil
+		if !result.NextEligibleAt.IsZero() {
+			return reconcile.Result{RequeueAfter: result.NextEligibleAt.Sub(now)}, nil
 		}
 		return reconcile.Result{}, nil
 	}
@@ -165,6 +151,12 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 			fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", UnhealthyThreshold, nodePoolName))...)
 		return reconcile.Result{RequeueAfter: breakerRequeue}, nil
 	}
+	// A deleting NodeClaim that is still eligible only needs its termination deadline. This retries a stamp that failed
+	// after this controller's delete succeeded and, like v1.14 node repair, also forces an eligible node that something
+	// else is deleting.
+	if !nodeClaim.DeletionTimestamp.IsZero() {
+		return reconcile.Result{}, c.stampTerminationDeadline(ctx, nodeClaim)
+	}
 	return c.delete(ctx, node, nodeClaim, result)
 }
 
@@ -172,19 +164,22 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 // when either the NodeClaim condition or the Node label says so: the initialization controller writes the label before
 // the condition, and the repair disruption method keys off the label, so requiring both to be unset keeps the two repair
 // paths disjoint. Rebooting nodes are left to the reboot controller, whose recovery deadline escalates to replacement;
-// once the reboot is terminal, a node that goes unhealthy before re-initializing is repaired here.
-func (c *Controller) owns(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
-	return nodeClaim.DeletionTimestamp.IsZero() &&
-		nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue() &&
-		!nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() &&
+// once the reboot is terminal, a node that goes unhealthy before re-initializing is repaired here. Conditions are read
+// with WithObservedOnly so a cached NodeClaim is never mutated.
+func owns(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
+	conditions := nodeClaim.StatusConditions(status.WithObservedOnly())
+	return conditions.Get(v1.ConditionTypeRegistered).IsTrue() &&
+		!conditions.Get(v1.ConditionTypeInitialized).IsTrue() &&
 		node.Labels[v1.NodeInitializedLabelKey] != "true" &&
-		!nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue()
+		!conditions.Get(v1.ConditionTypeRebooting).IsTrue()
 }
 
 // delete requests NodeClaim deletion, preconditioned on the evaluated ResourceVersion so a NodeClaim that initialized
-// or started rebooting since it was read is re-evaluated instead of deleted. The node never served workload and its
-// unhealthy kubelet can't complete a graceful drain, so termination is forceful. The deadline is stamped only after the
-// delete succeeds so a NodeClaim that escapes repair never carries a stale deadline into a later disruption.
+// or started rebooting since it was read is re-evaluated instead of deleted. Termination is forceful, matching v1.14
+// node repair: drainable pods are force-deleted with a minimal grace period, bypassing PDBs and do-not-disrupt. That
+// includes workload pods, which can land on a node that is Ready but never initializes (e.g. a requested extended
+// resource never registers). The deadline is stamped only after the delete succeeds: stamping first would bump the
+// ResourceVersion the delete is preconditioned on, and would leave a stale deadline on a NodeClaim that escapes repair.
 func (c *Controller) delete(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim, result RepairResult) (reconcile.Result, error) {
 	if err := c.kubeClient.Delete(ctx, nodeClaim, client.Preconditions{ResourceVersion: lo.ToPtr(nodeClaim.ResourceVersion)}); err != nil {
 		if errors.IsConflict(err) {
@@ -248,14 +243,65 @@ func (c *Controller) stampTerminationDeadline(ctx context.Context, nodeClaim *v1
 	})
 }
 
-// conditionsChanged reports whether any Node condition was added, removed, or changed status or transition time.
+// nodePredicates admit Node events that can change eligibility: creation, becoming managed, registration, losing the
+// initialized label (a reboot strips it), any condition change, and do-not-repair changes. Initialized nodes belong
+// to the repair disruption method and are filtered out.
+func nodePredicates(cloudProvider cloudprovider.CloudProvider) []predicate.Predicate {
+	return []predicate.Predicate{
+		nodeutils.IsManagedPredicateFuncs(cloudProvider),
+		predicate.NewPredicateFuncs(func(o client.Object) bool {
+			return o.GetLabels()[v1.NodeInitializedLabelKey] != "true"
+		}),
+		predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, newNode := e.ObjectOld.(*corev1.Node), e.ObjectNew.(*corev1.Node)
+			return !nodeutils.IsManaged(oldNode, cloudProvider) ||
+				oldNode.Labels[v1.NodeRegisteredLabelKey] != newNode.Labels[v1.NodeRegisteredLabelKey] ||
+				oldNode.Labels[v1.NodeInitializedLabelKey] != newNode.Labels[v1.NodeInitializedLabelKey] ||
+				oldNode.Annotations[v1.DoNotRepairAnnotationKey] != newNode.Annotations[v1.DoNotRepairAnnotationKey] ||
+				conditionsChanged(oldNode, newNode)
+		}},
+	}
+}
+
+// nodeClaimPredicates admit NodeClaim updates that can change eligibility without a Node event: the Registered,
+// Initialized, or Rebooting condition changing status, and do-not-repair changes. Node events cover creation, so
+// NodeClaim creation, deletion, and generic events are dropped. Conditions are read with WithObservedOnly because
+// predicates receive the shared cached object.
+func nodeClaimPredicates(cloudProvider cloudprovider.CloudProvider) []predicate.Predicate {
+	return []predicate.Predicate{
+		nodeclaimutils.IsManagedPredicateFuncs(cloudProvider),
+		predicate.Funcs{
+			CreateFunc:  func(event.CreateEvent) bool { return false },
+			DeleteFunc:  func(event.DeleteEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				oldNodeClaim, newNodeClaim := e.ObjectOld.(*v1.NodeClaim), e.ObjectNew.(*v1.NodeClaim)
+				oldConditions := oldNodeClaim.StatusConditions(status.WithObservedOnly())
+				newConditions := newNodeClaim.StatusConditions(status.WithObservedOnly())
+				return lo.SomeBy([]string{v1.ConditionTypeRegistered, v1.ConditionTypeInitialized, v1.ConditionTypeRebooting}, func(t string) bool {
+					return conditionStatus(oldConditions.Get(t)) != conditionStatus(newConditions.Get(t))
+				}) || oldNodeClaim.Annotations[v1.DoNotRepairAnnotationKey] != newNodeClaim.Annotations[v1.DoNotRepairAnnotationKey]
+			},
+		},
+	}
+}
+
+func conditionStatus(condition *status.Condition) metav1.ConditionStatus {
+	if condition == nil {
+		return ""
+	}
+	return condition.Status
+}
+
+// conditionsChanged reports whether any Node condition was added, removed, or changed status, reason, or transition
+// time. Reason matters because repair policies can match on it, and it can change without a transition.
 func conditionsChanged(oldNode, newNode *corev1.Node) bool {
 	if len(oldNode.Status.Conditions) != len(newNode.Status.Conditions) {
 		return true
 	}
 	for _, oldCond := range oldNode.Status.Conditions {
 		newCond := nodeutils.GetCondition(newNode, oldCond.Type)
-		if newCond.Type == "" || oldCond.LastTransitionTime != newCond.LastTransitionTime || oldCond.Status != newCond.Status {
+		if newCond.Type == "" || oldCond.LastTransitionTime != newCond.LastTransitionTime || oldCond.Status != newCond.Status || oldCond.Reason != newCond.Reason {
 			return true
 		}
 	}

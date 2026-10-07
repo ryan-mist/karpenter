@@ -177,8 +177,9 @@ func NewControllers(
 	}
 
 	// Register the reboot controller and the uninitialized-node repair controller alongside node repair. The repair
-	// disruption method itself, which handles initialized nodes, is registered in the disruption controller.
-	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair {
+	// disruption method itself, which handles initialized nodes, is registered in the disruption controller. Both repair
+	// paths validate the provider's policies with health.MustNewRepairPolicyMatcher, which panics if there are none.
+	if options.FromContext(ctx).FeatureGates.NodeRepair {
 		controllers = append(controllers,
 			nodeclaimreboot.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder),
 			nodehealth.NewController(clock, kubeClient, cloudProvider, recorder),

@@ -58,7 +58,8 @@ type RepairPolicyMatcher struct {
 
 // RepairResult merges all eligible policies for one Node. Condition, ConditionStatus, Reason, ReasonRegex, Fallback,
 // and SelectedEligibleAt identify the deterministic source of the selected Action, while TerminationGracePeriod is
-// the shortest bound and TerminationGracePeriodCondition identifies the condition that supplied it.
+// the shortest bound and TerminationGracePeriodCondition identifies the condition that supplied it. NextEligibleAt is
+// the earliest time a matching policy that is still within its toleration becomes eligible, or zero if none is.
 type RepairResult struct {
 	Score                            float64
 	Action                           cloudprovider.RepairAction
@@ -70,8 +71,27 @@ type RepairResult struct {
 	SelectedEligibleAt               time.Time
 	TerminationGracePeriod           *time.Duration
 	TerminationGracePeriodCondition  corev1.NodeConditionType
+	NextEligibleAt                   time.Time
 	selectedPriority                 int
 	terminationGracePeriodEligibleAt time.Time
+}
+
+// supportedRepairActions are the repair actions node repair accepts in a provider's policy set.
+var supportedRepairActions = sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode)
+
+// MustNewRepairPolicyMatcher validates and compiles the provider's complete repair policy set for node repair. Every
+// repair path builds its matcher here so they all accept the same provider policy sets. It panics when the provider
+// defines no policies or the complete set is invalid.
+func MustNewRepairPolicyMatcher(cloudProvider cloudprovider.CloudProvider) *RepairPolicyMatcher {
+	policies := cloudProvider.RepairPolicies()
+	if len(policies) == 0 {
+		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
+	}
+	matcher, err := NewRepairPolicyMatcher(policies, supportedRepairActions)
+	if err != nil {
+		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
+	}
+	return matcher
 }
 
 // NewRepairPolicyMatcher validates and compiles a complete provider repair policy set.
@@ -197,27 +217,6 @@ func validConditionStatus(status corev1.ConditionStatus) bool {
 // so returned duration pointers must be treated as read-only.
 func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairResult {
 	result := RepairResult{}
-	p.forEachPolicy(node, func(policy compiledPolicy, transitionTime time.Time) {
-		result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
-	})
-	return result
-}
-
-// NextEligibleAt returns the earliest time after now at which a policy matching one of the Node's current conditions
-// passes its toleration. It returns false when no matching policy is still waiting.
-func (p *RepairPolicyMatcher) NextEligibleAt(node *corev1.Node, now time.Time) (time.Time, bool) {
-	var next time.Time
-	p.forEachPolicy(node, func(policy compiledPolicy, transitionTime time.Time) {
-		if eligibleAt := transitionTime.Add(policy.TolerationDuration); eligibleAt.After(now) && (next.IsZero() || eligibleAt.Before(next)) {
-			next = eligibleAt
-		}
-	})
-	return next, !next.IsZero()
-}
-
-// forEachPolicy calls fn with every policy that applies to one of the Node's current conditions: each matching
-// reason-specific policy, or the fallback when none match. The policy's Condition is set to the matched condition.
-func (p *RepairPolicyMatcher) forEachPolicy(node *corev1.Node, fn func(policy compiledPolicy, transitionTime time.Time)) {
 	for i := range node.Status.Conditions {
 		condition := node.Status.Conditions[i]
 		// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
@@ -235,15 +234,16 @@ func (p *RepairPolicyMatcher) forEachPolicy(node *corev1.Node, fn func(policy co
 			if policy.reasonRegex.MatchString(condition.Reason) {
 				matched = true
 				policy.Condition = condition
-				fn(policy, transitionTime)
+				result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
 			}
 		}
 		if !matched {
 			policy := p.fallbackPolicy
 			policy.Condition = condition
-			fn(policy, transitionTime)
+			result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
 		}
 	}
+	return result
 }
 
 // Matches returns true when the condition is covered by the provider policy set, regardless of toleration.
@@ -256,6 +256,9 @@ func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, transitionTi
 	condition := policy.Condition
 	eligibleAt := transitionTime.Add(policy.TolerationDuration)
 	if eligibleAt.After(now) {
+		if r.NextEligibleAt.IsZero() || eligibleAt.Before(r.NextEligibleAt) {
+			r.NextEligibleAt = eligibleAt
+		}
 		return
 	}
 	age := now.Sub(eligibleAt)
