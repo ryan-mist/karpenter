@@ -58,7 +58,8 @@ type RepairPolicyMatcher struct {
 
 // RepairResult merges all eligible policies for one Node. Condition, ConditionStatus, Reason, ReasonRegex, Fallback,
 // and SelectedEligibleAt identify the deterministic source of the selected Action, while TerminationGracePeriod is
-// the shortest bound and TerminationGracePeriodCondition identifies the condition that supplied it.
+// the shortest bound and TerminationGracePeriodCondition identifies the condition that supplied it. NextEligibleAt is
+// the earliest time a matching policy that is still within its toleration becomes eligible, or zero if none is.
 type RepairResult struct {
 	Score                            float64
 	Action                           cloudprovider.RepairAction
@@ -70,8 +71,27 @@ type RepairResult struct {
 	SelectedEligibleAt               time.Time
 	TerminationGracePeriod           *time.Duration
 	TerminationGracePeriodCondition  corev1.NodeConditionType
+	NextEligibleAt                   time.Time
 	selectedPriority                 int
 	terminationGracePeriodEligibleAt time.Time
+}
+
+// supportedRepairActions are the repair actions node repair accepts in a provider's policy set.
+var supportedRepairActions = sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode)
+
+// MustNewRepairPolicyMatcher validates and compiles the provider's complete repair policy set for node repair. Every
+// repair path builds its matcher here so they all accept the same provider policy sets. It panics when the provider
+// defines no policies or the complete set is invalid.
+func MustNewRepairPolicyMatcher(cloudProvider cloudprovider.CloudProvider) *RepairPolicyMatcher {
+	policies := cloudProvider.RepairPolicies()
+	if len(policies) == 0 {
+		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
+	}
+	matcher, err := NewRepairPolicyMatcher(policies, supportedRepairActions)
+	if err != nil {
+		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
+	}
+	return matcher
 }
 
 // NewRepairPolicyMatcher validates and compiles a complete provider repair policy set.
@@ -196,13 +216,22 @@ func validConditionStatus(status corev1.ConditionStatus) bool {
 // Evaluate returns the merged repair policy decision for one Node. Provider policies are immutable after construction,
 // so returned duration pointers must be treated as read-only.
 func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairResult {
+	return p.EvaluateSince(node, now, time.Time{})
+}
+
+// EvaluateSince is Evaluate with every condition's toleration measured from no earlier than notBefore, so time a
+// condition held before notBefore (e.g. while the node was rebooting) doesn't count toward its toleration.
+func (p *RepairPolicyMatcher) EvaluateSince(node *corev1.Node, now, notBefore time.Time) RepairResult {
 	result := RepairResult{}
+	// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
+	if notBefore.Before(node.CreationTimestamp.Time) {
+		notBefore = node.CreationTimestamp.Time
+	}
 	for i := range node.Status.Conditions {
 		condition := node.Status.Conditions[i]
-		// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
 		transitionTime := condition.LastTransitionTime.Time
-		if transitionTime.Before(node.CreationTimestamp.Time) {
-			transitionTime = node.CreationTimestamp.Time
+		if transitionTime.Before(notBefore) {
+			transitionTime = notBefore
 		}
 		specificPolicies, ok := p.groups[policyKey{conditionType: condition.Type, conditionStatus: condition.Status}]
 		if !ok {
@@ -236,6 +265,9 @@ func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, transitionTi
 	condition := policy.Condition
 	eligibleAt := transitionTime.Add(policy.TolerationDuration)
 	if eligibleAt.After(now) {
+		if r.NextEligibleAt.IsZero() || eligibleAt.Before(r.NextEligibleAt) {
+			r.NextEligibleAt = eligibleAt
+		}
 		return
 	}
 	age := now.Sub(eligibleAt)
