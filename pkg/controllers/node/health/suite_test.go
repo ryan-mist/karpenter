@@ -17,13 +17,45 @@ limitations under the License.
 package health
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
+
+	"sigs.k8s.io/karpenter/pkg/apis"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	. "sigs.k8s.io/karpenter/pkg/utils/testing"
+)
+
+var (
+	ctx           context.Context
+	env           *test.Environment
+	cloudProvider *fake.CloudProvider
+	recorder      *test.EventRecorder
 )
 
 func TestHealth(t *testing.T) {
+	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Node Health Policy")
+	RunSpecs(t, "Node Health")
 }
+
+var _ = BeforeSuite(func() {
+	env = test.NewEnvironment(
+		test.WithCRDs(apis.CRDs...),
+		test.WithCRDs(v1alpha1.CRDs...),
+		test.WithFieldIndexers(test.NodeClaimProviderIDFieldIndexer(ctx), test.NodeProviderIDFieldIndexer(ctx)),
+	)
+	ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}}))
+	cloudProvider = fake.NewCloudProvider()
+	recorder = test.NewEventRecorder()
+})
+
+var _ = AfterSuite(func() {
+	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")
+})

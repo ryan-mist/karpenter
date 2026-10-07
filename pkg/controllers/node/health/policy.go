@@ -197,6 +197,27 @@ func validConditionStatus(status corev1.ConditionStatus) bool {
 // so returned duration pointers must be treated as read-only.
 func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairResult {
 	result := RepairResult{}
+	p.forEachPolicy(node, func(policy compiledPolicy, transitionTime time.Time) {
+		result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
+	})
+	return result
+}
+
+// NextEligibleAt returns the earliest time after now at which a policy matching one of the Node's current conditions
+// passes its toleration. It returns false when no matching policy is still waiting.
+func (p *RepairPolicyMatcher) NextEligibleAt(node *corev1.Node, now time.Time) (time.Time, bool) {
+	var next time.Time
+	p.forEachPolicy(node, func(policy compiledPolicy, transitionTime time.Time) {
+		if eligibleAt := transitionTime.Add(policy.TolerationDuration); eligibleAt.After(now) && (next.IsZero() || eligibleAt.Before(next)) {
+			next = eligibleAt
+		}
+	})
+	return next, !next.IsZero()
+}
+
+// forEachPolicy calls fn with every policy that applies to one of the Node's current conditions: each matching
+// reason-specific policy, or the fallback when none match. The policy's Condition is set to the matched condition.
+func (p *RepairPolicyMatcher) forEachPolicy(node *corev1.Node, fn func(policy compiledPolicy, transitionTime time.Time)) {
 	for i := range node.Status.Conditions {
 		condition := node.Status.Conditions[i]
 		// A condition cannot predate its Node; clamping also gives an omitted transition time a durable lower bound.
@@ -214,16 +235,15 @@ func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairR
 			if policy.reasonRegex.MatchString(condition.Reason) {
 				matched = true
 				policy.Condition = condition
-				result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
+				fn(policy, transitionTime)
 			}
 		}
 		if !matched {
 			policy := p.fallbackPolicy
 			policy.Condition = condition
-			result.mergePolicy(policy, p.ranks[policy.Priority], transitionTime, now)
+			fn(policy, transitionTime)
 		}
 	}
-	return result
 }
 
 // Matches returns true when the condition is covered by the provider policy set, regardless of toleration.
