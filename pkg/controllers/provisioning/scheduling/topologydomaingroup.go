@@ -48,6 +48,12 @@ func (t TopologyDomainGroup) Insert(domain string, taints ...v1.Taint) {
 		// be eligible for NodeClaims with this domain (based on taints), so there is no need to track additional taints.
 		return
 	}
+	// Callers insert the same NodePool's taint slice once per instance type, so skip a slice that is identical (same
+	// backing array and length) to the one inserted last. A repeated taint set never changes which pods tolerate the
+	// domain, and without this the list grows with the number of instance types. Both slices are non-empty here.
+	if last := t[domain][len(t[domain])-1]; len(last) == len(taints) && &last[0] == &taints[0] {
+		return
+	}
 	t[domain] = append(t[domain], taints)
 }
 
