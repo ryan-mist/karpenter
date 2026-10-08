@@ -45,6 +45,11 @@ type ExistingNode struct {
 }
 
 func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
+	return newExistingNode(n, topology, taints, scheduling.NewLabelRequirements(n.Labels()), daemonResources, instanceType, isUnderConsolidateAfter)
+}
+
+// newExistingNode takes ownership of requirements, which must be built from n.Labels() and not shared.
+func newExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, requirements scheduling.Requirements, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
 	// The state node passed in here must be a deep copy from cluster state as we modify it
 	if instanceType != nil {
 		for driver, limit := range instanceType.VolumeAttachmentLimits {
@@ -69,7 +74,7 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		cachedTaints:            taints,
 		topology:                topology,
 		remainingResources:      resources.Subtract(available, daemonResources),
-		requirements:            scheduling.NewLabelRequirements(n.Labels()),
+		requirements:            requirements,
 		isUnderConsolidateAfter: isUnderConsolidateAfter,
 		instanceType:            instanceType,
 	}
