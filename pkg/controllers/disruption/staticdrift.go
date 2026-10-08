@@ -96,7 +96,10 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		// drain still honors PDBs and is bounded by TGP. When the pool has room under its limit, fall through to the
 		// normal replace-first path below. No replacement is reserved for terminate-first, so the reservation above is a
 		// no-op in that case (it reserved nothing).
-		if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && maxAllowedDrifts == 0 {
+		// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand the
+		// workload with no replacement; Block instead (mirrors static repair).
+		refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
+		if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && maxAllowedDrifts == 0 && refillable {
 			for _, c := range npCandidates[:maxDrifts] {
 				cmds = append(cmds, Command{
 					Candidates:          []*Candidate{c},
@@ -109,8 +112,12 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 
 		// We will not get a negative value here
 		if maxAllowedDrifts == 0 {
+			msg := "static NodePool is at its node limit and cannot stage a replacement"
+			if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && !refillable {
+				msg = "static NodePool is at its node limit and is not ready to provision a replacement"
+			}
 			for _, c := range npCandidates[:maxDrifts] {
-				d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, "static NodePool is at its node limit and cannot stage a replacement")...)
+				d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, msg)...)
 			}
 			continue
 		}

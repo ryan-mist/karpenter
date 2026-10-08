@@ -123,6 +123,34 @@ var _ = Describe("TerminateFirstDrift", func() {
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 		})
 
+		It("does not terminate-first a static NodePool at its node limit when the NodePool is NotReady", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true)}}))
+			// Static provisioning refuses NotReady NodePools, so terminating first would strand the workload.
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
+			nodePool.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, "NotReady", "NotReady")
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			ExpectSingletonReconciled(ctx, staticDriftController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+		})
+
+		It("does not terminate-first a static NodePool at its node limit when the NodePool is deleting", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true)}}))
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
+			nodePool.Finalizers = []string{"karpenter.sh/test-finalizer"}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			Expect(env.Client.Delete(ctx, nodePool)).To(Succeed()) // finalizer keeps it around with a DeletionTimestamp
+
+			ExpectSingletonReconciled(ctx, staticDriftController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+		})
+
 		It("replaces-first for a static NodePool below its node limit even when TerminateFirstDrift is enabled", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true)}}))
 			// Below the node limit (limit 2 > replicas 1): the pool can stage a replacement without bursting over the
