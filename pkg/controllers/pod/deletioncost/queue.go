@@ -22,12 +22,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -79,21 +80,29 @@ func (q *Queue) Name() string {
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 	maxConcurrentReconciles := utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)
 	qps, bucketSize := utilscontroller.GetTypedBucketConfigs(100, minReconciles, maxConcurrentReconciles)
-	return controllerruntime.NewControllerManagedBy(m).
+	logger := m.GetLogger().WithValues("controller", q.Name())
+	// Requests are keyed by QueueKey (name and UID) so a reconcile can drop the exact entry whose pod is gone.
+	return builder.TypedControllerManagedBy[terminator.QueueKey](m).
 		Named(q.Name()).
-		WatchesRawSource(source.Channel(q.source, handler.TypedFuncs[*corev1.Pod, reconcile.Request]{
-			GenericFunc: func(_ context.Context, e event.TypedGenericEvent[*corev1.Pod], queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-				queue.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+		WatchesRawSource(source.TypedChannel(q.source, handler.TypedFuncs[*corev1.Pod, terminator.QueueKey]{
+			GenericFunc: func(_ context.Context, e event.TypedGenericEvent[*corev1.Pod], queue workqueue.TypedRateLimitingInterface[terminator.QueueKey]) {
+				queue.Add(terminator.NewQueueKey(e.Object))
 			},
 		})).
-		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
-				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](queueBaseDelay, queueMaxDelay),
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(qps), bucketSize)},
+		WithOptions(controller.TypedOptions[terminator.QueueKey]{
+			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[terminator.QueueKey](
+				workqueue.NewTypedItemExponentialFailureRateLimiter[terminator.QueueKey](queueBaseDelay, queueMaxDelay),
+				&workqueue.TypedBucketRateLimiter[terminator.QueueKey]{Limiter: rate.NewLimiter(rate.Limit(qps), bucketSize)},
 			),
 			MaxConcurrentReconciles: maxConcurrentReconciles,
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), q))
+		WithLogConstructor(func(key *terminator.QueueKey) logr.Logger {
+			if key == nil {
+				return logger
+			}
+			return logger.WithValues("namespace", key.Namespace, "name", key.Name)
+		}).
+		Complete(reconcile.TypedFunc[terminator.QueueKey](q.reconcileKey))
 }
 
 // Add is last-writer-wins on the desired state, and pushes to the channel only
@@ -121,6 +130,31 @@ func (q *Queue) complete(qk terminator.QueueKey) {
 	q.Lock()
 	defer q.Unlock()
 	delete(q.items, qk)
+}
+
+// reconcileKey resolves a queue entry to the pod it was enqueued for. If that pod no longer exists, or its name now
+// belongs to a different pod, nothing will enqueue the entry again, so it is dropped here. Only the exact key being
+// reconciled is removed, so a same-name replacement that is itself queued is never affected.
+func (q *Queue) reconcileKey(ctx context.Context, key terminator.QueueKey) (reconcile.Result, error) {
+	pod := &corev1.Pod{}
+	if err := q.kubeClient.Get(ctx, key.NamespacedName, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			q.skipNotFound(ctx, key)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
+	}
+	if pod.UID != key.UID {
+		q.skipNotFound(ctx, key)
+		return reconcile.Result{}, nil
+	}
+	return q.Reconcile(ctx, pod)
+}
+
+func (q *Queue) skipNotFound(ctx context.Context, qk terminator.QueueKey) {
+	log.FromContext(ctx).V(1).WithValues("pod", klog.KRef(qk.Namespace, qk.Name)).Info("skipping pod annotation update, target not found")
+	podAnnotationWritesTotal.Inc(map[string]string{resultLabel: ResultSkippedNotFound.Name})
+	q.complete(qk)
 }
 
 func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
@@ -153,9 +187,7 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 		return reconcile.Result{}, nil
 	}
 	if apierrors.IsNotFound(err) {
-		log.FromContext(ctx).V(1).WithValues("pod", klog.KObj(pod)).Info("skipping pod annotation update, target not found")
-		podAnnotationWritesTotal.Inc(map[string]string{resultLabel: ResultSkippedNotFound.Name})
-		q.complete(qk)
+		q.skipNotFound(ctx, qk)
 		return reconcile.Result{}, nil
 	}
 	if apierrors.IsConflict(err) {

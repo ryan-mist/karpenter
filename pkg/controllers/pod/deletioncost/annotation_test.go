@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -556,4 +557,46 @@ var _ = Describe("Annotation", func() {
 			Expect(updated.Annotations).ToNot(HaveKey(corev1.PodDeletionCost))
 		})
 	})
+	Context("Queue Entry Cleanup", func() {
+		It("should drop the entry for a queued pod that is deleted before it is reconciled", func() {
+			pod := rsOwnedPod()
+			ExpectApplied(ctx, env.Client, pod)
+			queue.Add(pod, -5, false)
+			ExpectDeleted(ctx, env.Client, pod)
+
+			before := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultSkippedNotFound.Name})
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(pod))
+			Expect(queue.Has(pod)).To(BeFalse())
+			after := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultSkippedNotFound.Name})
+			Expect(after - before).To(Equal(1.0))
+		})
+		It("should drop the entry for a queued pod whose name now belongs to a different pod", func() {
+			oldPod := rsOwnedPod()
+			ExpectApplied(ctx, env.Client, oldPod)
+			queue.Add(oldPod, -5, false)
+			ExpectDeleted(ctx, env.Client, oldPod)
+
+			newPod := rsOwnedPod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Name: oldPod.Name, Namespace: oldPod.Namespace}})
+			ExpectApplied(ctx, env.Client, newPod)
+			Expect(newPod.UID).ToNot(Equal(oldPod.UID))
+			queue.Add(newPod, -7, false)
+
+			// Reconciling the old entry drops it without writing the old pod's rank onto the replacement.
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(oldPod))
+			Expect(queue.Has(oldPod)).To(BeFalse())
+			Expect(queue.Has(newPod)).To(BeTrue())
+			Expect(ExpectExists(ctx, env.Client, newPod).Annotations).ToNot(HaveKey(corev1.PodDeletionCost))
+
+			// The replacement is still annotated through its own entry.
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(newPod))
+			Expect(queue.Has(newPod)).To(BeFalse())
+			Expect(ExpectExists(ctx, env.Client, newPod).Annotations).To(HaveKeyWithValue(corev1.PodDeletionCost, "-7"))
+		})
+	})
 })
+
+func ExpectReconcileKeySucceeded(ctx context.Context, q *deletioncost.Queue, key terminator.QueueKey) {
+	GinkgoHelper()
+	_, err := q.ReconcileKey(ctx, key)
+	Expect(err).ToNot(HaveOccurred())
+}
