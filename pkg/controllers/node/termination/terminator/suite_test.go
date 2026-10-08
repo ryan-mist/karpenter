@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -364,4 +365,87 @@ var _ = Describe("Eviction/Queue", func() {
 			Expect(pod.DeletionTimestamp).ToNot(BeNil())
 		})
 	})
+	Context("Queue Entry Cleanup", func() {
+		It("should drop the entry for a queued pod that is deleted before its eviction succeeds", func() {
+			ExpectApplied(ctx, env.Client, pdb, pod, node)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			queue.Add(nil, pod)
+			key := terminator.NewQueueKey(pod)
+
+			// The PDB blocks the eviction, so the pod stays queued.
+			result := ExpectReconcileKeySucceeded(ctx, queue, key)
+			//nolint:staticcheck
+			Expect(result.Requeue).To(BeTrue())
+			Expect(queue.Has(pod)).To(BeTrue())
+
+			// The pod is deleted out-of-band (e.g. its owner scales down) before the next reconcile.
+			ExpectDeleted(ctx, env.Client, pod)
+			ExpectReconcileKeySucceeded(ctx, queue, key)
+			Expect(queue.Has(pod)).To(BeFalse())
+			ExpectMetricCounterValue(terminator.PodsEvictionRequestsTotal, 1, map[string]string{terminator.CodeLabel: "429"})
+		})
+		It("should drop the entry for a queued pod whose name now belongs to a different pod", func() {
+			ExpectApplied(ctx, env.Client, pod, node)
+			queue.Add(nil, pod)
+			oldPod := pod.DeepCopy()
+			ExpectDeleted(ctx, env.Client, pod)
+
+			// A replacement with the same name (e.g. a StatefulSet pod) is created and queued before the old entry is
+			// reconciled.
+			newPod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Name: oldPod.Name, Namespace: oldPod.Namespace, Labels: testLabels}})
+			ExpectApplied(ctx, env.Client, newPod)
+			Expect(newPod.UID).ToNot(Equal(oldPod.UID))
+			queue.Add(nil, newPod)
+
+			// Reconciling the old entry drops it without touching the replacement.
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(oldPod))
+			Expect(queue.Has(oldPod)).To(BeFalse())
+			Expect(queue.Has(newPod)).To(BeTrue())
+			Expect(recorder.Calls(events.Evicted)).To(Equal(0))
+			Expect(ExpectExists(ctx, env.Client, newPod).DeletionTimestamp.IsZero()).To(BeTrue())
+
+			// The replacement is still evicted through its own entry.
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(newPod))
+			Expect(queue.Has(newPod)).To(BeFalse())
+			Expect(recorder.Calls(events.Evicted)).To(Equal(1))
+		})
+		It("should not drop a same-name replacement queued after the old pod's entry was dropped", func() {
+			ExpectApplied(ctx, env.Client, pod, node)
+			queue.Add(nil, pod)
+			oldKey := terminator.NewQueueKey(pod)
+			ExpectDeleted(ctx, env.Client, pod)
+			ExpectReconcileKeySucceeded(ctx, queue, oldKey)
+			Expect(queue.Has(pod)).To(BeFalse())
+
+			newPod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, Labels: testLabels}})
+			ExpectApplied(ctx, env.Client, pdb, newPod)
+			ExpectManualBinding(ctx, env.Client, newPod, node)
+			queue.Add(nil, newPod)
+
+			// A late or duplicate request for the old pod resolves to its own key only: the replacement is neither
+			// dropped nor acted on.
+			ExpectReconcileKeySucceeded(ctx, queue, oldKey)
+			Expect(queue.Has(newPod)).To(BeTrue())
+			Expect(recorder.Calls(events.FailedDraining)).To(Equal(0))
+			Expect(recorder.Calls(events.Evicted)).To(Equal(0))
+		})
+		It("should drop the entry when a PDB blocks the eviction and the pod's node no longer exists", func() {
+			ExpectApplied(ctx, env.Client, pdb, pod, node)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectDeleted(ctx, env.Client, node)
+			queue.Add(nil, pod)
+
+			ExpectReconcileKeySucceeded(ctx, queue, terminator.NewQueueKey(pod))
+			ExpectMetricCounterValue(terminator.PodsEvictionRequestsTotal, 1, map[string]string{terminator.CodeLabel: "429"})
+			Expect(queue.Has(pod)).To(BeFalse())
+			Expect(recorder.Calls(events.FailedDraining)).To(Equal(0))
+		})
+	})
 })
+
+func ExpectReconcileKeySucceeded(ctx context.Context, q *terminator.Queue, key terminator.QueueKey) reconcile.Result {
+	GinkgoHelper()
+	result, err := q.ReconcileKey(ctx, key)
+	Expect(err).ToNot(HaveOccurred())
+	return result
+}

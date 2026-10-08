@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
@@ -34,7 +35,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
-	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -122,24 +123,31 @@ func (q *Queue) Name() string {
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 	maxConcurrentReconciles := utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)
 	qps, bucketSize := utilscontroller.GetTypedBucketConfigs(100, minReconciles, maxConcurrentReconciles)
-	return controllerruntime.NewControllerManagedBy(m).
+	logger := m.GetLogger().WithValues("controller", q.Name())
+	// Requests are keyed by QueueKey (name and UID) rather than by name alone, so each reconcile resolves exactly one
+	// queue entry and can drop it when that pod is gone, without touching a same-name replacement.
+	return builder.TypedControllerManagedBy[QueueKey](m).
 		Named(q.Name()).
-		WatchesRawSource(source.Channel(q.source, handler.TypedFuncs[*corev1.Pod, reconcile.Request]{
-			GenericFunc: func(_ context.Context, e event.TypedGenericEvent[*corev1.Pod], queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-				queue.Add(reconcile.Request{
-					NamespacedName: client.ObjectKeyFromObject(e.Object),
-				})
+		WatchesRawSource(source.TypedChannel(q.source, handler.TypedFuncs[*corev1.Pod, QueueKey]{
+			GenericFunc: func(_ context.Context, e event.TypedGenericEvent[*corev1.Pod], queue workqueue.TypedRateLimitingInterface[QueueKey]) {
+				queue.Add(NewQueueKey(e.Object))
 			},
 		})).
-		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
-				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](evictionQueueBaseDelay, evictionQueueMaxDelay),
+		WithOptions(controller.TypedOptions[QueueKey]{
+			RateLimiter: workqueue.NewTypedMaxOfRateLimiter[QueueKey](
+				workqueue.NewTypedItemExponentialFailureRateLimiter[QueueKey](evictionQueueBaseDelay, evictionQueueMaxDelay),
 				// qps scales linearly with concurrentReconciles, bucket size is 10 * qps
-				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(qps), bucketSize)},
+				&workqueue.TypedBucketRateLimiter[QueueKey]{Limiter: rate.NewLimiter(rate.Limit(qps), bucketSize)},
 			),
 			MaxConcurrentReconciles: maxConcurrentReconciles,
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), q))
+		WithLogConstructor(func(key *QueueKey) logr.Logger {
+			if key == nil {
+				return logger
+			}
+			return logger.WithValues("namespace", key.Namespace, "name", key.Name)
+		}).
+		Complete(reconcile.TypedFunc[QueueKey](q.reconcileKey))
 }
 
 // Add enqueues pods for drain. The queue decides per reconcile whether to
@@ -210,6 +218,25 @@ func (q *Queue) Has(pod *corev1.Pod) bool {
 
 	_, ok := q.items[NewQueueKey(pod)]
 	return ok
+}
+
+// reconcileKey resolves a queue entry to the pod it was enqueued for. If that pod no longer exists, or its name now
+// belongs to a different pod, the entry can never be evicted and nothing will enqueue it again, so it is dropped here.
+// Only the exact key being reconciled is removed, so a same-name replacement that is itself queued is never affected.
+func (q *Queue) reconcileKey(ctx context.Context, key QueueKey) (reconcile.Result, error) {
+	pod := &corev1.Pod{}
+	if err := q.kubeClient.Get(ctx, key.NamespacedName, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			q.completeKey(key)
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
+	}
+	if pod.UID != key.UID {
+		q.completeKey(key)
+		return reconcile.Result{}, nil
+	}
+	return q.Reconcile(ctx, pod)
 }
 
 func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
@@ -303,8 +330,10 @@ func (q *Queue) evict(ctx context.Context, pod *corev1.Pod) (reconcile.Result, e
 		if apierrors.IsTooManyRequests(err) || message == multiplePodDisruptionBudgetsError {
 			node, err2 := podutils.NodeForPod(ctx, q.kubeClient, pod)
 			if err2 != nil {
-				// If the pod has no node, we should exit without evicting
+				// If the pod has no node, we should exit without evicting. Drop the entry since nothing requeues it; if the
+				// node is still draining, its next Drain re-adds the pod.
 				if apierrors.IsNotFound(err2) {
+					q.complete(pod)
 					return reconcile.Result{}, nil
 				}
 				return reconcile.Result{}, err2
@@ -360,9 +389,13 @@ func (q *Queue) forceDelete(ctx context.Context, pod *corev1.Pod, nodeTerminatio
 
 // complete removes the pod from the queue.
 func (q *Queue) complete(pod *corev1.Pod) {
+	q.completeKey(NewQueueKey(pod))
+}
+
+func (q *Queue) completeKey(key QueueKey) {
 	q.Lock()
 	defer q.Unlock()
-	delete(q.items, NewQueueKey(pod))
+	delete(q.items, key)
 }
 
 func evictionReason(ctx context.Context, pod *corev1.Pod, kubeClient client.Client) string {
