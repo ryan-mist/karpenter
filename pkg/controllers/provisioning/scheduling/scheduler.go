@@ -819,45 +819,49 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 }
 
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
+	// Daemon pod requirements don't depend on the node, so build them once instead of once per (node, daemon) pair.
+	daemons := make([]*corev1.Pod, 0, len(daemonSetPods))
+	daemonReqs := make([]scheduling.Requirements, 0, len(daemonSetPods))
+	for _, p := range daemonSetPods {
+		if s.shouldSkipDaemonPod(ctx, p) {
+			continue
+		}
+		daemons = append(daemons, p)
+		daemonReqs = append(daemonReqs, scheduling.NewStrictPodRequirements(p))
+	}
 	// create our existing nodes
 	for _, node := range stateNodes {
 		taints := node.Taints()
-		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
+		// Node label requirements are built once per node and shared by the daemon compatibility check and the
+		// ExistingNode (which takes ownership and adds the hostname requirement afterwards).
+		nodeReqs := scheduling.NewLabelRequirements(node.Labels())
+		compatible := s.getCompatibleDaemonPods(daemons, daemonReqs, taints, nodeReqs)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
+		s.existingNodes = append(s.existingNodes, newExistingNode(node, s.topology, taints, nodeReqs, resources.RequestsForPods(compatible...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
 }
 
-// getCompatibleDaemonPods filters daemon pods that can schedule to the given node
-func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
-	var daemons []*corev1.Pod
-	for _, p := range daemonSetPods {
-		if s.shouldSkipDaemonPod(ctx, p) {
+// getCompatibleDaemonPods filters daemon pods that can schedule to a node with the given taints and label requirements.
+// daemons and daemonReqs are parallel slices.
+func (s *Scheduler) getCompatibleDaemonPods(daemons []*corev1.Pod, daemonReqs []scheduling.Requirements, taints []corev1.Taint, nodeReqs scheduling.Requirements) []*corev1.Pod {
+	var compatible []*corev1.Pod
+	for i, p := range daemons {
+		if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
 			continue
 		}
-		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
-			daemons = append(daemons, p)
+		if err := nodeReqs.Compatible(daemonReqs[i]); err != nil {
+			continue
 		}
+		compatible = append(compatible, p)
 	}
-	return daemons
+	return compatible
 }
 
 // shouldSkipDaemonPod checks if a daemon pod should be skipped due to DRA requirements
 func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
 	return pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests
-}
-
-// isDaemonPodCompatibleWithNode checks if a daemon pod is compatible with the node
-func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1.Taint, nodeLabels map[string]string) bool {
-	if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
-		return false
-	}
-	if err := scheduling.NewLabelRequirements(nodeLabels).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
-		return false
-	}
-	return true
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
