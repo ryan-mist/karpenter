@@ -105,6 +105,15 @@ func (lc *LaunchCapacity) CanRefill() bool {
 	return lc.CanLaunch() || lc.reservations.Len() > 0
 }
 
+// Launchable returns how many of n launches can be attempted right now: all of them when capacity is unbounded,
+// otherwise at most the remaining reserved capacity.
+func (lc *LaunchCapacity) Launchable(n int64) int64 {
+	if lc.unbounded {
+		return n
+	}
+	return min(n, int64(lc.reservedSlots))
+}
+
 // Consume accounts for n launches that are already owed to the NodePool (e.g. nodes that are terminating and will be
 // refilled) against the finite reserved capacity. It has no effect when capacity is unbounded.
 func (lc *LaunchCapacity) Consume(n int) {

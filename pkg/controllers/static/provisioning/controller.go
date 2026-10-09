@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -50,6 +51,9 @@ import (
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
+
+// launchCapacityPollPeriod is how often a static NodePool whose template has no launchable offering is re-checked.
+const launchCapacityPollPeriod = 30 * time.Second
 
 type Controller struct {
 	kubeClient    client.Client
@@ -95,9 +99,23 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
 
+	// Only create NodeClaims the template can launch right now. A launch with no launchable offering fails before it
+	// reaches the cloud provider's capacity APIs and the NodeClaim is deleted, and every static NodeClaim deletion
+	// re-triggers this controller, so without this check an unlaunchable template (e.g. a reserved-only pool whose
+	// reservation is gone or full) creates and loses NodeClaims in a tight loop. Poll until capacity returns instead.
+	instanceTypes, err := c.cloudProvider.GetInstanceTypes(ctx, np)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("getting instance types, %w", err)
+	}
+	launchable := scheduling.NewLaunchCapacity(np, slices.Values(instanceTypes)).Launchable(desiredReplicas - int64(runningNodeClaims))
+	if launchable == 0 {
+		log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas).Info("waiting for launchable capacity, nodepool template has no launchable offering")
+		return reconcile.Result{RequeueAfter: launchCapacityPollPeriod}, nil
+	}
+
 	limit, ok := np.Spec.Limits[resources.Node]
 	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-	countNodeClaimsToProvision := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, desiredReplicas-int64(runningNodeClaims))
+	countNodeClaimsToProvision := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, launchable)
 
 	if countNodeClaimsToProvision <= 0 {
 		log.FromContext(ctx).Info("nodepool node limit reached")
@@ -115,7 +133,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		})
 	}
 
-	_, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason))
+	_, err = c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason))
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
 	}
