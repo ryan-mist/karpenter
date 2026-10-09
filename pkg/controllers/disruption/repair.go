@@ -158,6 +158,8 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 	if err != nil {
 		return []Command{}, err
 	}
+	// refills memoizes each static NodePool's refill capacity for this pass (see staticRefill).
+	refills := map[string]*staticRefill{}
 	for _, candidate := range candidates {
 		if trippedPools[candidate.NodePool.Name] {
 			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
@@ -208,6 +210,16 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
 				if !terminateFirstEnabled || !refillable {
 					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool is at its node limit and cannot stage a replacement")...)
+					continue
+				}
+				// Only terminate first if the NodePool can refill the freed slot; evaluated once per NodePool per pass.
+				refill, ok := refills[np.Name]
+				if !ok {
+					refill = newStaticRefill(np, candidate.nodePoolInstanceTypes, int(lo.FromPtr(np.Spec.Replicas))-active-pendingDisruption)
+					refills[np.Name] = refill
+				}
+				if !refill.claim(candidate) {
+					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, staticNoRefillMessage)...)
 					continue
 				}
 				return []Command{{
