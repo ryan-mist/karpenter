@@ -19,6 +19,7 @@ package scheduling
 import (
 	"github.com/awslabs/operatorpkg/option"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -94,4 +95,65 @@ func (t TopologyNodeFilter) matchesRequirements(requirements scheduling.Requirem
 		}
 	}
 	return false
+}
+
+// topologyNodeFilterMemo memoizes TopologyNodeFilter.Matches across many nodes. Matches only reads a node's requirements
+// for the keys that appear in the filter's requirements (Requirements.Compatible), and only reads the key, value and
+// effect of the node's taints (Taints.Tolerates), so nodes that agree on those produce the same result. A filter that
+// references a per-node label like hostname is still exact, it just doesn't collapse any nodes.
+type topologyNodeFilterMemo struct {
+	filter     TopologyNodeFilter
+	matchesAll bool
+	keys       []string
+	results    map[string]bool
+	buf        []byte
+}
+
+func newTopologyNodeFilterMemo(filter TopologyNodeFilter) *topologyNodeFilterMemo {
+	m := &topologyNodeFilterMemo{
+		filter:     filter,
+		matchesAll: (filter.AffinityPolicy != corev1.NodeInclusionPolicyHonor || len(filter.Requirements) == 0) && filter.TaintPolicy != corev1.NodeInclusionPolicyHonor,
+		results:    map[string]bool{},
+	}
+	if filter.AffinityPolicy == corev1.NodeInclusionPolicyHonor {
+		keys := sets.New[string]()
+		for _, reqs := range filter.Requirements {
+			keys.Insert(reqs.Keys().UnsortedList()...)
+		}
+		m.keys = keys.UnsortedList()
+	}
+	return m
+}
+
+// Matches returns the same result as filter.Matches(taints, scheduling.NewLabelRequirements(labels)), only building the
+// requirements if the result for a node with the same relevant labels and taints hasn't been computed yet.
+func (m *topologyNodeFilterMemo) Matches(labels map[string]string, taints []corev1.Taint) bool {
+	if m.matchesAll {
+		return true
+	}
+	// label keys, values and taint fields can't contain these bytes, so the signature is unambiguous
+	m.buf = m.buf[:0]
+	for _, key := range m.keys {
+		if value, ok := labels[key]; ok {
+			m.buf = append(m.buf, 1)
+			m.buf = append(m.buf, value...)
+		}
+		m.buf = append(m.buf, 0)
+	}
+	if m.filter.TaintPolicy == corev1.NodeInclusionPolicyHonor {
+		for i := range taints {
+			m.buf = append(m.buf, taints[i].Key...)
+			m.buf = append(m.buf, 0)
+			m.buf = append(m.buf, taints[i].Value...)
+			m.buf = append(m.buf, 0)
+			m.buf = append(m.buf, taints[i].Effect...)
+			m.buf = append(m.buf, 0)
+		}
+	}
+	if result, ok := m.results[string(m.buf)]; ok {
+		return result
+	}
+	result := m.filter.Matches(taints, scheduling.NewLabelRequirements(labels))
+	m.results[string(m.buf)] = result
+	return result
 }
