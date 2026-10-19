@@ -236,7 +236,7 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 	validDomains := sets.New[string]()
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
-	if t.Key == corev1.LabelHostname && len(nodeDomains.Values()) == 1 {
+	if t.Key == corev1.LabelHostname && nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1 {
 		hostName := nodeDomains.Values()[0]
 		count := t.domains[hostName] // t.domains[hostName] produces a 0 value for new NodeClaims
 		if selfSelecting {
@@ -325,7 +325,7 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
-	if t.Key == corev1.LabelHostname && len(nodeDomains.Values()) == 1 {
+	if t.Key == corev1.LabelHostname && nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1 {
 		hostName := nodeDomains.Values()[0]
 		if !podDomains.Has(hostName) {
 			return options
@@ -410,7 +410,7 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 	// fully scan it each iteration.
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
-	if t.Key == corev1.LabelHostname && len(nodeDomains.Values()) == 1 {
+	if t.Key == corev1.LabelHostname && nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1 {
 		hostName := nodeDomains.Values()[0]
 		if t.domains[hostName] == 0 { // t.domains[hostName] produces a 0 value for new NodeClaims
 			options.Insert(hostName)

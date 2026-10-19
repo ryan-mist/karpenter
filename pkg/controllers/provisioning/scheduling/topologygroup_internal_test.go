@@ -1,0 +1,95 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package scheduling
+
+import (
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	"sigs.k8s.io/karpenter/pkg/scheduling"
+)
+
+var _ = Describe("TopologyGroup Hostname Fast Path", func() {
+	// newHostnameGroup builds a hostname topology group with the given per-host counts. Pods in the "default" namespace
+	// are selected by the group.
+	newHostnameGroup := func(topologyType TopologyType, counts map[string]int32) *TopologyGroup {
+		tg := &TopologyGroup{
+			Type:         topologyType,
+			Key:          corev1.LabelHostname,
+			namespaces:   sets.New("default"),
+			selector:     labels.Everything(),
+			maxSkew:      1,
+			domains:      map[string]int32{},
+			emptyDomains: sets.New[string](),
+			owners:       map[types.UID]struct{}{},
+		}
+		for domain, count := range counts {
+			tg.domains[domain] = count
+			if count == 0 {
+				tg.emptyDomains.Insert(domain)
+			}
+		}
+		return tg
+	}
+	exists := scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpExists)
+	selectedPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
+	unselectedPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "other"}}
+
+	Context("NotIn with a single value", func() {
+		It("should not select the excluded host for topology spread", func() {
+			tg := newHostnameGroup(TopologyTypeSpread, map[string]int32{"a": 5, "b": 0})
+			req, valid := tg.Get(selectedPod, exists, scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpNotIn, "a"))
+			Expect(req.Operator()).To(Equal(corev1.NodeSelectorOpIn))
+			Expect(req.Values()).To(ConsistOf("b"))
+			Expect(sets.List(valid)).To(ConsistOf("b"))
+		})
+		It("should not select the excluded host for pod affinity", func() {
+			tg := newHostnameGroup(TopologyTypePodAffinity, map[string]int32{"a": 1, "b": 0})
+			req, _ := tg.Get(unselectedPod, exists, scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpNotIn, "a"))
+			Expect(req.Len()).To(Equal(0))
+		})
+		It("should not select the excluded host for pod anti-affinity", func() {
+			tg := newHostnameGroup(TopologyTypePodAntiAffinity, map[string]int32{"a": 1, "b": 0})
+			req, _ := tg.Get(selectedPod, exists, scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpNotIn, "b"))
+			Expect(req.Len()).To(Equal(0))
+		})
+		It("should select an empty registered host for pod anti-affinity", func() {
+			tg := newHostnameGroup(TopologyTypePodAntiAffinity, map[string]int32{"a": 1, "b": 0})
+			req, _ := tg.Get(selectedPod, exists, scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpNotIn, "c"))
+			Expect(req.Values()).To(ConsistOf("b"))
+		})
+	})
+	Context("In with a single value", func() {
+		It("should use the fast path for an unregistered host", func() {
+			nodeDomains := scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpIn, "new")
+			for _, topologyType := range []TopologyType{TopologyTypeSpread, TopologyTypePodAffinity, TopologyTypePodAntiAffinity} {
+				tg := newHostnameGroup(topologyType, map[string]int32{"a": 1})
+				if topologyType == TopologyTypePodAffinity {
+					// affinity can only bootstrap onto a new host when no compatible domain has a matching pod
+					tg = newHostnameGroup(topologyType, map[string]int32{"a": 0})
+				}
+				req, _ := tg.Get(selectedPod, exists, nodeDomains)
+				Expect(req.Values()).To(ConsistOf("new"), topologyType.String())
+			}
+		})
+	})
+})
