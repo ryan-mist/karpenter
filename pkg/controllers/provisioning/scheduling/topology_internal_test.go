@@ -36,7 +36,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
-var _ = Describe("buildDomainGroups", func() {
+var _ = Describe("Topology domain groups", func() {
 	taint := func(key string) corev1.Taint {
 		return corev1.Taint{Key: key, Value: "true", Effect: corev1.TaintEffectNoSchedule}
 	}
@@ -64,9 +64,25 @@ var _ = Describe("buildDomainGroups", func() {
 		})
 	}
 
+	// domainGroups reads each topology key's domains through a Topology's lazily built domain groups.
+	domainGroups := func(nodePools []*v1.NodePool, its map[string][]*cloudprovider.InstanceType, keys ...string) map[string]TopologyDomainGroup {
+		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources(nodePools, its)}
+		return lo.SliceToMap(keys, func(key string) (string, TopologyDomainGroup) { return key, t.domainGroup(key) })
+	}
+
+	It("should only build the domains of the topology keys that are read", func() {
+		np := nodePool("tainted", []corev1.Taint{taint("a")})
+		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(10)})}
+		zones := t.domainGroup(corev1.LabelTopologyZone)
+		Expect(sets.KeySet(zones)).To(Equal(sets.New("z1", "z2", "z3")))
+		Expect(sets.KeySet(t.domainGroups)).To(Equal(sets.New(corev1.LabelTopologyZone)))
+		zones["z4"] = nil
+		Expect(t.domainGroup(corev1.LabelTopologyZone)).To(HaveKey("z4"), "domain groups should be built once per key")
+		Expect(t.domainGroup(corev1.LabelHostname)).To(BeEmpty())
+	})
 	It("should record each NodePool's taints once per domain, not once per instance type", func() {
 		np := nodePool("tainted", []corev1.Taint{taint("a")})
-		groups := buildDomainGroups([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(100)})
+		groups := domainGroups([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(100)}, corev1.LabelTopologyZone)
 		for _, zone := range []string{"z1", "z2", "z3"} {
 			Expect(groups[corev1.LabelTopologyZone][zone]).To(Equal([][]corev1.Taint{{taint("a")}}))
 		}
@@ -82,7 +98,7 @@ var _ = Describe("buildDomainGroups", func() {
 		for _, np := range nodePools {
 			its[np.Name] = instanceTypes(20)
 		}
-		// Reference: insert the NodePool's taints for every instance type, as buildDomainGroups did before.
+		// Reference: insert the NodePool's taints for every instance type, as the domain groups did before.
 		reference := map[string]map[string][][]corev1.Taint{}
 		for _, np := range nodePools {
 			for _, it := range its[np.Name] {
@@ -104,8 +120,7 @@ var _ = Describe("buildDomainGroups", func() {
 			}
 		}
 
-		groups := buildDomainGroups(nodePools, its)
-		Expect(sets.KeySet(groups)).To(Equal(sets.KeySet(reference)))
+		groups := domainGroups(nodePools, its, lo.Keys(reference)...)
 		for _, tolerated := range [][]string{nil, {"a"}, {"b"}, {"a", "b"}} {
 			pod := &corev1.Pod{Spec: corev1.PodSpec{Tolerations: lo.Map(tolerated, func(k string, _ int) corev1.Toleration {
 				return corev1.Toleration{Key: k, Operator: corev1.TolerationOpExists}
@@ -212,7 +227,8 @@ var _ = Describe("buildDomainGroups", func() {
 			}
 
 			expected := buildDomainGroupsReference(nodePools, its)
-			actual := buildDomainGroups(nodePools, its)
+			// Also read keys that no NodePool or instance type defines, which have no domains
+			actual := domainGroups(nodePools, its, lo.Uniq(append(append(lo.Keys(expected), keys...), corev1.LabelHostname))...)
 			Expect(canonical(actual)).To(Equal(canonical(expected)), "seed %d", seed)
 			for key := range expected {
 				for _, pod := range pods {
@@ -226,8 +242,8 @@ var _ = Describe("buildDomainGroups", func() {
 	})
 })
 
-// buildDomainGroupsReference is the previous implementation of buildDomainGroups, which intersects the NodePool's
-// requirements with each instance type's requirements.
+// buildDomainGroupsReference is the previous implementation of the domain groups, which builds every topology key
+// and intersects the NodePool's requirements with each instance type's requirements.
 func buildDomainGroupsReference(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) map[string]TopologyDomainGroup {
 	nodePoolIndex := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
 		return np.Name, np

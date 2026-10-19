@@ -56,8 +56,10 @@ type Topology struct {
 	// topologies of pods with anti-affinity terms, so we can prevent scheduling the pods they have anti-affinity to
 	// in some cases.
 	inverseTopologyGroups map[uint64]*TopologyGroup
-	// The universe of domains by topology key
-	domainGroups map[string]TopologyDomainGroup
+	// The universe of domains by topology key. Only the keys of topology spread constraints and pod (anti-)affinity
+	// terms are ever read, so each key's domains are built from the domainSources the first time it is read.
+	domainGroups  map[string]TopologyDomainGroup
+	domainSources []domainSource
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
@@ -80,7 +82,8 @@ func NewTopology(
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
-		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
+		domainGroups:          map[string]TopologyDomainGroup{},
+		domainSources:         newDomainSources(nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
@@ -102,17 +105,18 @@ func NewTopology(
 	return t, nil
 }
 
-func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) map[string]TopologyDomainGroup {
-	domainGroups := map[string]TopologyDomainGroup{}
-	for _, source := range newDomainSources(nodePools, instanceTypes) {
-		for topologyKey := range source.topologyKeys() {
-			if _, ok := domainGroups[topologyKey]; !ok {
-				domainGroups[topologyKey] = NewTopologyDomainGroup()
-			}
-			source.insertDomains(domainGroups[topologyKey], topologyKey)
-		}
+// domainGroup returns the universe of domains for the topology key, building it on first use. Like the rest of the
+// Topology's state, this isn't safe for concurrent use; it's only reached from NewTopology and Update.
+func (t *Topology) domainGroup(topologyKey string) TopologyDomainGroup {
+	if domainGroup, ok := t.domainGroups[topologyKey]; ok {
+		return domainGroup
 	}
-	return domainGroups
+	domainGroup := NewTopologyDomainGroup()
+	for _, source := range t.domainSources {
+		source.insertDomains(domainGroup, topologyKey)
+	}
+	t.domainGroups[topologyKey] = domainGroup
+	return domainGroup
 }
 
 // domainSource is a NodePool's contribution to the universe of domains: the domains its instance types can launch
@@ -136,17 +140,6 @@ func newDomainSources(nodePools []*v1.NodePool, instanceTypes map[string][]*clou
 		sources = append(sources, domainSource{requirements: requirements, instanceTypes: its, taints: np.Spec.Template.Spec.Taints})
 	}
 	return sources
-}
-
-// topologyKeys returns the keys defined by the NodePool or any of its instance types.
-func (s domainSource) topologyKeys() sets.Set[string] {
-	keys := s.requirements.Keys()
-	for _, it := range s.instanceTypes {
-		for key := range it.Requirements {
-			keys.Insert(key)
-		}
-	}
-	return keys
 }
 
 // insertDomains inserts the NodePool's domains for the topology key into the domain group. For each instance type, the
@@ -385,7 +378,7 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 			return err
 		}
 
-		tg := NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey])
+		tg := NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroup(term.TopologyKey))
 
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
@@ -530,7 +523,7 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 			tsc.MinDomains,
 			tsc.NodeTaintsPolicy,
 			tsc.NodeAffinityPolicy,
-			t.domainGroups[tsc.TopologyKey],
+			t.domainGroup(tsc.TopologyKey),
 		))
 	}
 	return topologyGroups
@@ -572,7 +565,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 			if err != nil {
 				return nil, err
 			}
-			topologyGroups = append(topologyGroups, NewTopologyGroup(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey]))
+			topologyGroups = append(topologyGroups, NewTopologyGroup(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroup(term.TopologyKey)))
 		}
 	}
 	return topologyGroups, nil
