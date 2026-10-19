@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
@@ -63,6 +62,19 @@ type Topology struct {
 	excludedPods sets.Set[string]
 	cluster      *state.Cluster
 	stateNodes   []*state.StateNode
+	// stateNodeLabels and nodes memoize the per-node work that countDomains would otherwise repeat for every topology
+	// group. stateNodeLabels is parallel to stateNodes and holds StateNode.Labels(), populated on first use. nodes holds
+	// the nodes that existing pods are bound to, keyed by node name, with a nil entry for nodes that were not found. They
+	// are only accessed from countDomains, which runs from Update and is never called concurrently.
+	stateNodeLabels []map[string]string
+	nodes           map[string]*topologyNode
+}
+
+// topologyNode is the part of a node that countDomains reads
+type topologyNode struct {
+	name   string
+	labels map[string]string
+	taints []corev1.Taint
 }
 
 func NewTopology(
@@ -84,6 +96,7 @@ func NewTopology(
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
+		nodes:                 map[string]*topologyNode{},
 	}
 
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
@@ -375,16 +388,25 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	// scheduled to them already
 	// Note: long term we should handle this when constructing the domain groups, but that would require domain groups
 	// to handle affinity in addition to taints / tolerations.
-	for _, n := range t.stateNodes {
+	if t.stateNodeLabels == nil {
+		t.stateNodeLabels = make([]map[string]string, len(t.stateNodes))
+		for i, n := range t.stateNodes {
+			if n.Node != nil {
+				t.stateNodeLabels[i] = n.Labels()
+			}
+		}
+	}
+	nodeFilter := newTopologyNodeFilterMemo(tg.nodeFilter)
+	for i, n := range t.stateNodes {
 		// ignore state nodes which are tracking in-flight NodeClaims
 		if n.Node == nil {
 			continue
 		}
 		// ignore the node if it doesn't match the topology group
-		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, scheduling.NewLabelRequirements(n.Node.Labels)) {
+		if !nodeFilter.Matches(n.Node.Labels, n.Node.Spec.Taints) {
 			continue
 		}
-		domain, exists := n.Labels()[tg.Key]
+		domain, exists := t.stateNodeLabels[i][tg.Key]
 		if !exists {
 			continue
 		}
@@ -394,13 +416,6 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 		}
 	}
 
-	// sort our pods by the node they are scheduled to
-	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].Spec.NodeName < pods[j].Spec.NodeName
-	})
-	var previousNode *corev1.Node
-	var previousNodeRequirements scheduling.Requirements
-
 	for i, p := range pods {
 		if IgnoredForTopology(&pods[i]) {
 			continue
@@ -409,39 +424,25 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 		if t.excludedPods.Has(string(p.UID)) {
 			continue
 		}
-		var node *corev1.Node
-		var nodeRequirements scheduling.Requirements
-		if previousNode != nil && previousNode.Name == p.Spec.NodeName {
-			// no need to look up the node since we already have it
-			node = previousNode
-			nodeRequirements = previousNodeRequirements
-		} else {
-			node = &corev1.Node{}
-			if err := t.kubeClient.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
-				// Pods that cannot be evicted can be leaked in the API Server after
-				// a Node is removed. Since pod bindings are immutable, these pods
-				// cannot be recovered, and will be deleted by the pod lifecycle
-				// garbage collector. These pods are not running, and should not
-				// impact future topology calculations.
-				if errors.IsNotFound(err) {
-					continue
-				}
-				return serrors.Wrap(fmt.Errorf("getting node, %w", err), "Node", klog.KRef("", p.Spec.NodeName))
-			}
-			nodeRequirements = scheduling.NewLabelRequirements(node.Labels)
-
-			// assign back to previous node so we can hopefully re-use these in the next iteration
-			previousNode = node
-			previousNodeRequirements = nodeRequirements
+		n, err := t.getNode(ctx, p.Spec.NodeName)
+		if err != nil {
+			return err
 		}
-
-		domain, ok := node.Labels[tg.Key]
+		// Pods that cannot be evicted can be leaked in the API Server after
+		// a Node is removed. Since pod bindings are immutable, these pods
+		// cannot be recovered, and will be deleted by the pod lifecycle
+		// garbage collector. These pods are not running, and should not
+		// impact future topology calculations.
+		if n == nil {
+			continue
+		}
+		domain, ok := n.labels[tg.Key]
 		// Kubelet sets the hostname label, but the node may not be ready yet so there is no label.  We fall back and just
 		// treat the node name as the label.  It probably is in most cases, but even if not we at least count the existence
 		// of the pods in some domain, even if not in the correct one.  This is needed to handle the case of pods with
 		// self-affinity only fulfilling that affinity if all domains are empty.
 		if !ok && tg.Key == corev1.LabelHostname {
-			domain = node.Name
+			domain = n.name
 			ok = true
 		}
 		if !ok {
@@ -450,12 +451,31 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 
 		// nodes may or may not be considered for counting purposes for topology spread constraints depending on if they
 		// are selected by the pod's node selectors and required node affinities.  If these are unset, the node always counts.
-		if !tg.nodeFilter.Matches(node.Spec.Taints, nodeRequirements) {
+		if !nodeFilter.Matches(n.labels, n.taints) {
 			continue
 		}
 		tg.Record(domain)
 	}
 	return nil
+}
+
+// getNode returns the named node, or nil if the node doesn't exist. Results are memoized for the lifetime of the Topology
+// so that each node is fetched at most once across all topology groups.
+func (t *Topology) getNode(ctx context.Context, name string) (*topologyNode, error) {
+	if n, ok := t.nodes[name]; ok {
+		return n, nil
+	}
+	node := &corev1.Node{}
+	if err := t.kubeClient.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
+		if errors.IsNotFound(err) {
+			t.nodes[name] = nil
+			return nil, nil
+		}
+		return nil, serrors.Wrap(fmt.Errorf("getting node, %w", err), "Node", klog.KRef("", name))
+	}
+	n := &topologyNode{name: node.Name, labels: node.Labels, taints: node.Spec.Taints}
+	t.nodes[name] = n
+	return n, nil
 }
 
 func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
