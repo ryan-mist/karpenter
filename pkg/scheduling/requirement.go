@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"fmt"
+	"iter"
 	"math"
 	"math/rand"
 	"strconv"
@@ -295,6 +296,71 @@ func (r *Requirement) Has(value string) bool {
 
 func (r *Requirement) Values() []string {
 	return r.values.UnsortedList()
+}
+
+// ValuesSeq returns an iterator over the same values as Values, without allocating a slice.
+func (r *Requirement) ValuesSeq() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for v := range r.values {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+// IntersectionValuesSeq returns an iterator over the same values as r.Intersection(requirement).Values(), without
+// constructing the intersection.
+// nolint:gocyclo
+func (r *Requirement) IntersectionValuesSeq(requirement *Requirement) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		gte := maxIntPtr(r.gte, requirement.gte)
+		lte := minIntPtr(r.lte, requirement.lte)
+		if gte != nil && lte != nil && *gte > *lte {
+			return
+		}
+		// Both requirements have a complement, so the values are the union of both sets
+		if r.complement && requirement.complement {
+			for v := range r.values {
+				if withinBounds(v, gte, lte) && !yield(v) {
+					return
+				}
+			}
+			for v := range requirement.values {
+				if !r.values.Has(v) && withinBounds(v, gte, lte) && !yield(v) {
+					return
+				}
+			}
+			return
+		}
+		// Only one requirement has a complement, so the values are the difference
+		if r.complement && !requirement.complement {
+			for v := range requirement.values {
+				if !r.values.Has(v) && withinBounds(v, gte, lte) && !yield(v) {
+					return
+				}
+			}
+			return
+		}
+		if !r.complement && requirement.complement {
+			for v := range r.values {
+				if !requirement.values.Has(v) && withinBounds(v, gte, lte) && !yield(v) {
+					return
+				}
+			}
+			return
+		}
+		// Both requirements are non-complement requirements
+		smallest, largest := r.values, requirement.values
+		if len(smallest) > len(largest) {
+			smallest, largest = largest, smallest
+		}
+		for v := range smallest {
+			if largest.Has(v) && withinBounds(v, gte, lte) && !yield(v) {
+				return
+			}
+		}
+	}
 }
 
 func (r *Requirement) Insert(items ...string) {

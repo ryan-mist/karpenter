@@ -103,51 +103,90 @@ func NewTopology(
 }
 
 func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) map[string]TopologyDomainGroup {
-	nodePoolIndex := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
-		return np.Name, np
-	})
 	domainGroups := map[string]TopologyDomainGroup{}
-	for npName, its := range instanceTypes {
-		np := nodePoolIndex[npName]
-		// Collect the NodePool's domains across all of its instance types first, so its taints are recorded once per
-		// domain rather than once per instance type.
-		domains := map[string]sets.Set[string]{}
-		addDomains := func(topologyKey string, values ...string) {
-			if _, ok := domains[topologyKey]; !ok {
-				domains[topologyKey] = sets.New[string]()
-			}
-			domains[topologyKey].Insert(values...)
-		}
-		for _, it := range its {
-			// We need to intersect the instance type requirements with the current nodePool requirements.  This
-			// ensures that something like zones from an instance type don't expand the universe of valid domains.
-			requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-			requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-			requirements.Add(it.Requirements.Values()...)
-
-			for topologyKey, requirement := range requirements {
-				addDomains(topologyKey, requirement.Values()...)
-			}
-		}
-
-		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-		for key, requirement := range requirements {
-			if requirement.Operator() == corev1.NodeSelectorOpIn {
-				addDomains(key, requirement.Values()...)
-			}
-		}
-
-		for topologyKey, values := range domains {
+	for _, source := range newDomainSources(nodePools, instanceTypes) {
+		for topologyKey := range source.topologyKeys() {
 			if _, ok := domainGroups[topologyKey]; !ok {
 				domainGroups[topologyKey] = NewTopologyDomainGroup()
 			}
-			for domain := range values {
-				domainGroups[topologyKey].Insert(domain, np.Spec.Template.Spec.Taints...)
-			}
+			source.insertDomains(domainGroups[topologyKey], topologyKey)
 		}
 	}
 	return domainGroups
+}
+
+// domainSource is a NodePool's contribution to the universe of domains: the domains its instance types can launch
+// into, given the NodePool's requirements, along with the NodePool's taints.
+type domainSource struct {
+	// requirements are the NodePool's requirements and template labels
+	requirements  scheduling.Requirements
+	instanceTypes []*cloudprovider.InstanceType
+	taints        []corev1.Taint
+}
+
+func newDomainSources(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) []domainSource {
+	nodePoolIndex := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
+		return np.Name, np
+	})
+	sources := make([]domainSource, 0, len(instanceTypes))
+	for npName, its := range instanceTypes {
+		np := nodePoolIndex[npName]
+		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
+		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
+		sources = append(sources, domainSource{requirements: requirements, instanceTypes: its, taints: np.Spec.Template.Spec.Taints})
+	}
+	return sources
+}
+
+// topologyKeys returns the keys defined by the NodePool or any of its instance types.
+func (s domainSource) topologyKeys() sets.Set[string] {
+	keys := s.requirements.Keys()
+	for _, it := range s.instanceTypes {
+		for key := range it.Requirements {
+			keys.Insert(key)
+		}
+	}
+	return keys
+}
+
+// insertDomains inserts the NodePool's domains for the topology key into the domain group. For each instance type, the
+// domains are the values of the instance type's requirement intersected with the NodePool's, or the values of whichever
+// requirement exists if only one does. The values of a NodePool In requirement are always domains, even if the
+// NodePool has no instance types. Each domain is inserted once with the NodePool's taints.
+func (s domainSource) insertDomains(domainGroup TopologyDomainGroup, topologyKey string) {
+	requirement := s.requirements[topologyKey]
+	// If the NodePool's requirement is concrete, every instance type's domains are a subset of its values
+	if requirement != nil && (requirement.Operator() == corev1.NodeSelectorOpIn || requirement.Operator() == corev1.NodeSelectorOpDoesNotExist) {
+		for domain := range requirement.ValuesSeq() {
+			domainGroup.Insert(domain, s.taints...)
+		}
+		return
+	}
+	domains := sets.New[string]()
+	requirementOnly := false
+	for _, it := range s.instanceTypes {
+		itRequirement := it.Requirements[topologyKey]
+		switch {
+		case itRequirement == nil:
+			requirementOnly = requirement != nil
+		case requirement == nil:
+			for domain := range itRequirement.ValuesSeq() {
+				domains.Insert(domain)
+			}
+		default:
+			for domain := range itRequirement.IntersectionValuesSeq(requirement) {
+				domains.Insert(domain)
+			}
+		}
+	}
+	if requirementOnly {
+		for domain := range requirement.ValuesSeq() {
+			domains.Insert(domain)
+		}
+	}
+	for domain := range domains {
+		domainGroup.Insert(domain, s.taints...)
+	}
 }
 
 // topologyError allows lazily generating the error string in the topology error.  If a pod fails to schedule, most often
