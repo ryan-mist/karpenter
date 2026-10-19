@@ -179,8 +179,9 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 
 	for _, tg := range append(topologies, affinities...) {
 		hash := tg.Hash()
-		// Avoid recomputing topology counts if we've already seen this group
+		// Avoid populating and recomputing topology counts if we've already seen this group
 		if existing, ok := t.topologyGroups[hash]; !ok {
+			tg.populate(p, t.domainGroups[tg.Key])
 			if err := t.countDomains(ctx, tg); err != nil {
 				return err
 			}
@@ -338,10 +339,11 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 			return err
 		}
 
-		tg := NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey])
+		tg := newTopologyGroupIdentity(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil)
 
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
+			tg.populate(pod, t.domainGroups[tg.Key])
 			t.inverseTopologyGroups[hash] = tg
 		} else {
 			tg = existing
@@ -458,6 +460,8 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	return nil
 }
 
+// newForTopologies returns the identities of the topology groups for the input pod's topology spread constraints. They
+// must be populated before use.
 func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 	var topologyGroups []*TopologyGroup
 	for _, tsc := range p.Spec.TopologySpreadConstraints {
@@ -473,7 +477,7 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 				})
 			}
 		}
-		topologyGroups = append(topologyGroups, NewTopologyGroup(
+		topologyGroups = append(topologyGroups, newTopologyGroupIdentity(
 			TopologyTypeSpread,
 			tsc.TopologyKey,
 			p,
@@ -483,13 +487,13 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 			tsc.MinDomains,
 			tsc.NodeTaintsPolicy,
 			tsc.NodeAffinityPolicy,
-			t.domainGroups[tsc.TopologyKey],
 		))
 	}
 	return topologyGroups
 }
 
-// newForAffinities returns a list of topology groups that have been constructed based on the input pod and required/preferred affinity terms
+// newForAffinities returns the identities of the topology groups for the input pod's required/preferred affinity terms.
+// They must be populated before use.
 func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*TopologyGroup, error) {
 	var topologyGroups []*TopologyGroup
 	// No affinity defined
@@ -525,7 +529,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 			if err != nil {
 				return nil, err
 			}
-			topologyGroups = append(topologyGroups, NewTopologyGroup(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey]))
+			topologyGroups = append(topologyGroups, newTopologyGroupIdentity(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil))
 		}
 	}
 	return topologyGroups, nil
