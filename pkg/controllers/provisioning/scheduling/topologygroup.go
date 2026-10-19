@@ -84,6 +84,25 @@ func NewTopologyGroup(
 	affinityPolicy *corev1.NodeInclusionPolicy,
 	domainGroup TopologyDomainGroup,
 ) *TopologyGroup {
+	tg := newTopologyGroupIdentity(topologyType, topologyKey, pod, namespaces, labelSelector, maxSkew, minDomains, taintPolicy, affinityPolicy)
+	tg.populate(pod, domainGroup)
+	return tg
+}
+
+// newTopologyGroupIdentity returns a TopologyGroup with only the fields that identify it set, which is enough to call
+// Hash(). The expensive parts (parsing the selector and seeding domains from the domain group) are deferred to
+// populate, so callers can dedupe by Hash() and only populate groups they haven't seen before.
+func newTopologyGroupIdentity(
+	topologyType TopologyType,
+	topologyKey string,
+	pod *corev1.Pod,
+	namespaces sets.Set[string],
+	labelSelector *metav1.LabelSelector,
+	maxSkew int32,
+	minDomains *int32,
+	taintPolicy *corev1.NodeInclusionPolicy,
+	affinityPolicy *corev1.NodeInclusionPolicy,
+) *TopologyGroup {
 	// the nil *TopologyNodeFilter always passes which is what we need for affinity/anti-affinity
 	var nodeFilter TopologyNodeFilter
 	if topologyType == TopologyTypeSpread {
@@ -97,32 +116,36 @@ func NewTopologyGroup(
 		}
 		nodeFilter = MakeTopologyNodeFilter(pod, nodeTaintsPolicy, nodeAffinityPolicy)
 	}
+	return &TopologyGroup{
+		Type:        topologyType,
+		Key:         topologyKey,
+		namespaces:  namespaces,
+		rawSelector: labelSelector,
+		nodeFilter:  nodeFilter,
+		maxSkew:     maxSkew,
+		minDomains:  minDomains,
+	}
+}
 
-	selector, err := metav1.LabelSelectorAsSelector(labelSelector)
+// populate parses the selector and seeds the group's domains from the domain group, filtered by the pod's tolerations
+// if the group honors taints.
+func (t *TopologyGroup) populate(pod *corev1.Pod, domainGroup TopologyDomainGroup) {
+	selector, err := metav1.LabelSelectorAsSelector(t.rawSelector)
 	if err != nil {
 		selector = labels.Nothing()
 	}
 
 	domains := map[string]int32{}
 	emptyDomains := sets.New[string]()
-	domainGroup.ForEachDomain(pod, nodeFilter.TaintPolicy, func(domain string) {
+	domainGroup.ForEachDomain(pod, t.nodeFilter.TaintPolicy, func(domain string) {
 		domains[domain] = 0
 		emptyDomains.Insert(domain)
 	})
 
-	return &TopologyGroup{
-		Type:         topologyType,
-		Key:          topologyKey,
-		namespaces:   namespaces,
-		selector:     selector,
-		rawSelector:  labelSelector,
-		nodeFilter:   nodeFilter,
-		maxSkew:      maxSkew,
-		domains:      domains,
-		emptyDomains: emptyDomains,
-		owners:       map[types.UID]struct{}{},
-		minDomains:   minDomains,
-	}
+	t.selector = selector
+	t.domains = domains
+	t.emptyDomains = emptyDomains
+	t.owners = map[types.UID]struct{}{}
 }
 
 func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
