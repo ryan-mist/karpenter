@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
@@ -55,6 +56,10 @@ type Topology struct {
 	// topologies of pods with anti-affinity terms, so we can prevent scheduling the pods they have anti-affinity to
 	// in some cases.
 	inverseTopologyGroups map[uint64]*TopologyGroup
+	// topologyIndex and inverseTopologyIndex index the groups in topologyGroups and inverseTopologyGroups by owner and
+	// by selector, so per-pod lookups don't need to scan every group.
+	topologyIndex        *topologyGroupIndex
+	inverseTopologyIndex *topologyGroupIndex
 	// The universe of domains by topology key. Only the keys of topology spread constraints and pod (anti-)affinity
 	// terms are ever read, so each key's domains are built from the domainSources the first time it is read.
 	domainGroups  map[string]TopologyDomainGroup
@@ -98,6 +103,8 @@ func NewTopology(
 		domainSources:         newDomainSources(nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
+		topologyIndex:         newTopologyGroupIndex(),
+		inverseTopologyIndex:  newTopologyGroupIndex(),
 		excludedPods:          sets.New[string](),
 		nodes:                 map[string]*topologyNode{},
 	}
@@ -213,9 +220,7 @@ func (t topologyError) Error() string {
 // relaxation of a preference to properly break the topology <-> owner relationship so that the preferred topology will
 // no longer influence scheduling.
 func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
-	for _, topology := range t.topologyGroups {
-		topology.RemoveOwner(p.UID)
-	}
+	t.topologyIndex.removeOwner(p.UID)
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
 		(t.preferencePolicy == PreferencePolicyRespect && pod.HasPodAntiAffinity(p)) {
@@ -238,10 +243,11 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 				return err
 			}
 			t.topologyGroups[hash] = tg
+			t.topologyIndex.add(tg)
 		} else {
 			tg = existing
 		}
-		tg.AddOwner(p.UID)
+		t.topologyIndex.addOwner(tg, p.UID)
 	}
 	return nil
 }
@@ -249,7 +255,7 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 // Record records the topology changes given that pod p schedule on a node with the given requirements
 func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
 	// once we've committed to a domain, we record the usage in every topology that cares about it
-	for _, tg := range t.topologyGroups {
+	t.topologyIndex.forEachCandidate(p, func(tg *TopologyGroup) {
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
 			domains := requirements.Get(tg.Key)
 			if tg.Type == TopologyTypePodAntiAffinity {
@@ -262,13 +268,11 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 				}
 			}
 		}
-	}
+	})
 	// for anti-affinities, we record where the pods could be, even if
 	// requirements haven't collapsed to a single value.
-	for _, tg := range t.inverseTopologyGroups {
-		if tg.IsOwnedBy(p.UID) {
-			tg.Record(requirements.Get(tg.Key).Values()...)
-		}
+	for _, tg := range t.inverseTopologyIndex.ownedBy(p.UID) {
+		tg.Record(requirements.Get(tg.Key).Values()...)
 	}
 }
 
@@ -305,8 +309,8 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 func (t *Topology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool) {
 	var result sets.Set[string]
 
-	for _, topology := range t.topologyGroups {
-		if !topology.IsOwnedBy(p.UID) || topology.Key != corev1.LabelTopologyZone {
+	for _, topology := range t.topologyIndex.ownedBy(p.UID) {
+		if topology.Key != corev1.LabelTopologyZone {
 			continue
 		}
 
@@ -396,13 +400,14 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
 			t.inverseTopologyGroups[hash] = tg
+			t.inverseTopologyIndex.add(tg)
 		} else {
 			tg = existing
 		}
 		if domain, ok := domains[tg.Key]; ok {
 			tg.Record(domain)
 		}
-		tg.AddOwner(pod.UID)
+		t.inverseTopologyIndex.addOwner(tg, pod.UID)
 	}
 	return nil
 }
@@ -625,17 +630,13 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 // getMatchingTopologies returns a sorted list of topologies that either control the scheduling of pod p, or for which
 // the topology selects pod p and the scheduling of p affects the count per topology domain
 func (t *Topology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*TopologyGroup {
-	var matchingTopologies []*TopologyGroup
-	for _, tg := range t.topologyGroups {
-		if tg.IsOwnedBy(p.UID) {
-			matchingTopologies = append(matchingTopologies, tg)
-		}
-	}
-	for _, tg := range t.inverseTopologyGroups {
+	// clone so that appending can't write into the index's backing array, which is shared by concurrent callers
+	matchingTopologies := slices.Clone(t.topologyIndex.ownedBy(p.UID))
+	t.inverseTopologyIndex.forEachCandidate(p, func(tg *TopologyGroup) {
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
 			matchingTopologies = append(matchingTopologies, tg)
 		}
-	}
+	})
 	return matchingTopologies
 }
 
