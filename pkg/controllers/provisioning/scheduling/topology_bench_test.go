@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/utils/clock"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -115,4 +118,67 @@ func benchmarkForEachDomain(b *testing.B, domains, taintGroupsPerDomain int, tol
 		})
 		_ = count
 	}
+}
+
+// BenchmarkTopologyGroups measures the per-pod topology work done for each candidate (AddRequirements) and each
+// placement (Record) as the number of topology groups grows. Each Deployment has a zone spread and every 4th also has
+// hostname self anti-affinity, so the groups include owned, selecting and inverse anti-affinity groups.
+func BenchmarkTopologyGroups(b *testing.B) {
+	for _, deployments := range []int{10, 100, 500} {
+		topology, pods := benchTopologyGroups(b, deployments)
+		podRequirements := pscheduling.NewRequirements()
+		nodeRequirements := pscheduling.NewRequirements(
+			pscheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "test-zone-1"),
+			pscheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpIn, "bench-host"),
+		)
+		b.Run(fmt.Sprintf("op=AddRequirements/deployments=%d", deployments), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				if _, err := topology.AddRequirements(pods[i%len(pods)], nil, podRequirements, nodeRequirements); err != nil {
+					b.Fatalf("adding requirements: %s", err)
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("op=Record/deployments=%d", deployments), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				topology.Record(pods[i%len(pods)], nil, nodeRequirements)
+			}
+		})
+	}
+}
+
+func benchTopologyGroups(b *testing.B, deployments int) (*scheduling.Topology, []*corev1.Pod) {
+	ctx := benchCtx()
+	cp := fake.NewCloudProvider()
+	client := fakecr.NewFakeClient()
+	cl := state.NewCluster(&clock.RealClock{}, client, cp)
+	nodePools := benchNodePools(1)
+	itsByNP := map[string][]*cloudprovider.InstanceType{nodePools[0].Name: fake.InstanceTypes(10)}
+
+	var pods []*corev1.Pod
+	for d := 0; d < deployments; d++ {
+		labels := map[string]string{"app": fmt.Sprintf("deployment-%d", d)}
+		opts := test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels, UID: uuid.NewUUID()},
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+			}},
+		}
+		if d%4 == 0 {
+			opts.PodAntiRequirements = []corev1.PodAffinityTerm{{
+				TopologyKey:   corev1.LabelHostname,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+			}}
+		}
+		pods = append(pods, test.Pod(opts))
+	}
+	topology, err := scheduling.NewTopology(ctx, client, cl, nil, nodePools, itsByNP, pods)
+	if err != nil {
+		b.Fatalf("creating topology: %s", err)
+	}
+	return topology, pods
 }
