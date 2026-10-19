@@ -292,6 +292,7 @@ func benchTopologyGroups(b *testing.B, deployments int) (*scheduling.Topology, [
 	}
 	return topology, pods
 }
+
 // BenchmarkNewTopologySharedConstraints models pods that come from a handful of deployments, so pods in the same
 // deployment share their topology spread and pod (anti-)affinity terms and dedupe to the same topology groups.
 func BenchmarkNewTopologySharedConstraints(b *testing.B) {
@@ -356,4 +357,3 @@ func makeDeploymentPods(deployments, podsPerDeployment int) []*corev1.Pod {
 	}
 	return pods
 }
-
