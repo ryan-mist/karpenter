@@ -109,6 +109,15 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 	domainGroups := map[string]TopologyDomainGroup{}
 	for npName, its := range instanceTypes {
 		np := nodePoolIndex[npName]
+		// Collect the NodePool's domains across all of its instance types first, so its taints are recorded once per
+		// domain rather than once per instance type.
+		domains := map[string]sets.Set[string]{}
+		addDomains := func(topologyKey string, values ...string) {
+			if _, ok := domains[topologyKey]; !ok {
+				domains[topologyKey] = sets.New[string]()
+			}
+			domains[topologyKey].Insert(values...)
+		}
 		for _, it := range its {
 			// We need to intersect the instance type requirements with the current nodePool requirements.  This
 			// ensures that something like zones from an instance type don't expand the universe of valid domains.
@@ -117,12 +126,7 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 			requirements.Add(it.Requirements.Values()...)
 
 			for topologyKey, requirement := range requirements {
-				if _, ok := domainGroups[topologyKey]; !ok {
-					domainGroups[topologyKey] = NewTopologyDomainGroup()
-				}
-				for _, domain := range requirement.Values() {
-					domainGroups[topologyKey].Insert(domain, np.Spec.Template.Spec.Taints...)
-				}
+				addDomains(topologyKey, requirement.Values()...)
 			}
 		}
 
@@ -130,12 +134,16 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
 		for key, requirement := range requirements {
 			if requirement.Operator() == corev1.NodeSelectorOpIn {
-				if _, ok := domainGroups[key]; !ok {
-					domainGroups[key] = NewTopologyDomainGroup()
-				}
-				for _, value := range requirement.Values() {
-					domainGroups[key].Insert(value, np.Spec.Template.Spec.Taints...)
-				}
+				addDomains(key, requirement.Values()...)
+			}
+		}
+
+		for topologyKey, values := range domains {
+			if _, ok := domainGroups[topologyKey]; !ok {
+				domainGroups[topologyKey] = NewTopologyDomainGroup()
+			}
+			for domain := range values {
+				domainGroups[topologyKey].Insert(domain, np.Spec.Template.Spec.Taints...)
 			}
 		}
 	}
