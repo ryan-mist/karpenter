@@ -65,6 +65,9 @@ type TopologyGroup struct {
 	// NOTE: This is actually nillable since there's no API server validation to require it on affinity / TSC terms. A term without it is a no-op.
 	rawSelector *metav1.LabelSelector
 	nodeFilter  TopologyNodeFilter
+	// seedTolerations are the tolerations used to filter the domains the group is seeded with. These are only set for
+	// pod affinity groups, see NewTopologyGroup.
+	seedTolerations []corev1.Toleration
 
 	// Index
 	owners       map[types.UID]struct{} // Pods that have this topology as a scheduling rule
@@ -103,25 +106,42 @@ func NewTopologyGroup(
 		selector = labels.Nothing()
 	}
 
+	// Topology spread groups seed the domains allowed by their NodeTaintsPolicy. Pod (anti-)affinity isn't subject to
+	// taint filtering in kube-scheduler, so anti-affinity groups seed every domain: an empty domain the creating pod
+	// doesn't tolerate is still a valid domain for other pods sharing the group, or for pods selected by an inverse
+	// group. Pod affinity groups keep filtering by the creating pod's tolerations so that a self-selecting pod
+	// bootstrapping its affinity doesn't pick a domain it can't schedule to. Since those tolerations then determine
+	// the group's domains, they're included in the group's hash.
+	seedTaintPolicy := nodeFilter.TaintPolicy
+	var seedTolerations []corev1.Toleration
+	switch topologyType {
+	case TopologyTypePodAntiAffinity:
+		seedTaintPolicy = corev1.NodeInclusionPolicyIgnore
+	case TopologyTypePodAffinity:
+		seedTaintPolicy = corev1.NodeInclusionPolicyHonor
+		seedTolerations = pod.Spec.Tolerations
+	}
+
 	domains := map[string]int32{}
 	emptyDomains := sets.New[string]()
-	domainGroup.ForEachDomain(pod, nodeFilter.TaintPolicy, func(domain string) {
+	domainGroup.ForEachDomain(pod, seedTaintPolicy, func(domain string) {
 		domains[domain] = 0
 		emptyDomains.Insert(domain)
 	})
 
 	return &TopologyGroup{
-		Type:         topologyType,
-		Key:          topologyKey,
-		namespaces:   namespaces,
-		selector:     selector,
-		rawSelector:  labelSelector,
-		nodeFilter:   nodeFilter,
-		maxSkew:      maxSkew,
-		domains:      domains,
-		emptyDomains: emptyDomains,
-		owners:       map[types.UID]struct{}{},
-		minDomains:   minDomains,
+		Type:            topologyType,
+		Key:             topologyKey,
+		namespaces:      namespaces,
+		selector:        selector,
+		rawSelector:     labelSelector,
+		nodeFilter:      nodeFilter,
+		seedTolerations: seedTolerations,
+		maxSkew:         maxSkew,
+		domains:         domains,
+		emptyDomains:    emptyDomains,
+		owners:          map[types.UID]struct{}{},
+		minDomains:      minDomains,
 	}
 }
 
@@ -187,20 +207,24 @@ func (t *TopologyGroup) IsOwnedBy(key types.UID) bool {
 // with self anti-affinity, we track that as a single topology with 100 owners instead of 100x topologies.
 func (t *TopologyGroup) Hash() uint64 {
 	return lo.Must(hashstructure.Hash(struct {
-		TopologyKey  string
-		Type         TopologyType
-		Namespaces   sets.Set[string]
-		MaxSkew      int32
-		NodeFilter   TopologyNodeFilter
-		SelectorHash uint64
+		TopologyKey         string
+		Type                TopologyType
+		Namespaces          sets.Set[string]
+		MaxSkew             int32
+		MinDomains          *int32
+		NodeFilterHash      uint64
+		SeedTolerationsHash uint64
+		SelectorHash        uint64
 	}{
-		TopologyKey:  t.Key,
-		Type:         t.Type,
-		Namespaces:   t.namespaces,
-		MaxSkew:      t.maxSkew,
-		NodeFilter:   t.nodeFilter,
-		SelectorHash: hashSelector(t.rawSelector),
-	}, hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true}))
+		TopologyKey:         t.Key,
+		Type:                t.Type,
+		Namespaces:          t.namespaces,
+		MaxSkew:             t.maxSkew,
+		MinDomains:          t.minDomains,
+		NodeFilterHash:      t.nodeFilter.Hash(),
+		SeedTolerationsHash: hashTolerations(t.seedTolerations),
+		SelectorHash:        hashSelector(t.rawSelector),
+	}, hashstructure.FormatV2, nil))
 }
 
 // hashSelector is a specialized hash function for a metav1.LabelSelector. Due to https://github.com/mitchellh/hashstructure/issues/36
