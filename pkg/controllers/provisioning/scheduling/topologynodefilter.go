@@ -18,7 +18,10 @@ package scheduling
 
 import (
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/mitchellh/hashstructure/v2"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -62,6 +65,39 @@ func MakeTopologyNodeFilter(p *corev1.Pod, taintPolicy corev1.NodeInclusionPolic
 	}
 
 	return filter
+}
+
+// Hash returns a hash of the filter's contents. The filter can't be hashed with hashstructure directly since
+// scheduling.Requirement stores its values in unexported fields, which hashstructure skips. That would cause filters
+// which only differ by requirement values (e.g. zone=a vs zone=b) to hash equal.
+func (t TopologyNodeFilter) Hash() uint64 {
+	// The terms are OR'd together, so they're hashed as a set. Each term's NodeSelectorRequirements are canonical
+	// (keys are unique and values are sorted), but the slice order follows map iteration, so it's hashed as a set too.
+	termHashes := sets.New[uint64]()
+	for _, requirements := range t.Requirements {
+		termHashes.Insert(lo.Must(hashstructure.Hash(requirements.NodeSelectorRequirements(), hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})))
+	}
+	return lo.Must(hashstructure.Hash(struct {
+		Requirements   sets.Set[uint64]
+		TaintPolicy    corev1.NodeInclusionPolicy
+		AffinityPolicy corev1.NodeInclusionPolicy
+		Tolerations    uint64
+	}{
+		Requirements:   termHashes,
+		TaintPolicy:    t.TaintPolicy,
+		AffinityPolicy: t.AffinityPolicy,
+		Tolerations:    hashTolerations(t.Tolerations),
+	}, hashstructure.FormatV2, nil))
+}
+
+// hashTolerations hashes tolerations as a set. Like hashSelector, the individual hashes are stored in a set to avoid
+// https://github.com/mitchellh/hashstructure/issues/36 when a toleration is repeated.
+func hashTolerations(tolerations []corev1.Toleration) uint64 {
+	tolerationHashes := sets.New[uint64]()
+	for i := range tolerations {
+		tolerationHashes.Insert(lo.Must(hashstructure.Hash(tolerations[i], hashstructure.FormatV2, nil)))
+	}
+	return lo.Must(hashstructure.Hash(tolerationHashes, hashstructure.FormatV2, nil))
 }
 
 // Matches returns true if the TopologyNodeFilter doesn't prohibit node from the participating in the topology

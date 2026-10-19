@@ -3259,6 +3259,220 @@ var _ = Describe("Topology", func() {
 	})
 })
 
+var _ = Describe("Topology Group Identity", func() {
+	// Pods whose topology terms hash equal share a single TopologyGroup, so the hash has to capture everything that
+	// determines how the group counts and which domains it seeds. Pods are named to control the order in which they
+	// are listed, and therefore which pod creates the shared group.
+	labels := map[string]string{"test": "test"}
+	namedPods := func(prefix string, count int, opts test.PodOptions) []*corev1.Pod {
+		var pods []*corev1.Pod
+		for i := range count {
+			o := opts
+			o.ObjectMeta = metav1.ObjectMeta{Name: fmt.Sprintf("%s-%d", prefix, i), Labels: opts.Labels}
+			pods = append(pods, test.UnschedulablePod(o))
+		}
+		return pods
+	}
+	nodePoolWith := func(name string, zones []string, nodeLabels map[string]string, taints ...corev1.Taint) *v1.NodePool {
+		return test.NodePool(v1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: v1.NodePoolSpec{
+				Template: v1.NodeClaimTemplate{
+					ObjectMeta: v1.ObjectMeta{Labels: nodeLabels},
+					Spec: v1.NodeClaimTemplateSpec{
+						Requirements: []v1.NodeSelectorRequirementWithMinValues{
+							{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: zones},
+						},
+						Taints: taints,
+					},
+				},
+			},
+		})
+	}
+	allZones := []string{"test-zone-1", "test-zone-2", "test-zone-3"}
+	taint := corev1.Taint{Key: "dedicated", Value: "true", Effect: corev1.TaintEffectNoSchedule}
+	toleration := corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "true", Effect: corev1.TaintEffectNoSchedule}
+
+	DescribeTable("should not share a topology spread group between pods with different node selectors",
+		func(firstPool, secondPool string) {
+			ExpectApplied(ctx, env.Client,
+				nodePoolWith("pool-a", allZones, map[string]string{"pool": "a"}),
+				nodePoolWith("pool-b", allZones, map[string]string{"pool": "b"}),
+			)
+			tsc := []corev1.TopologySpreadConstraint{{
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+				MaxSkew:           1,
+			}}
+			pods := append(
+				namedPods("a-"+firstPool, 6, test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: labels}, NodeSelector: map[string]string{"pool": firstPool}, TopologySpreadConstraints: tsc}),
+				namedPods("b-"+secondPool, 6, test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: labels}, NodeSelector: map[string]string{"pool": secondPool}, TopologySpreadConstraints: tsc})...,
+			)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+			// Each constraint only counts nodes matching its own pod's node selector, so each pool is spread
+			// independently.
+			skew := map[string]map[string]int{}
+			for _, p := range pods {
+				node := ExpectScheduled(ctx, env.Client, p)
+				pool := node.Labels["pool"]
+				if skew[pool] == nil {
+					skew[pool] = map[string]int{}
+				}
+				skew[pool][node.Labels[corev1.LabelTopologyZone]]++
+			}
+			Expect(skew["a"]).To(ConsistOf(2, 2, 2))
+			Expect(skew["b"]).To(ConsistOf(2, 2, 2))
+		},
+		Entry("pool a listed first", "a", "b"),
+		Entry("pool b listed first", "b", "a"),
+	)
+	DescribeTable("should not share a topology spread group between constraints with different minDomains",
+		func(minDomainsFirst bool) {
+			if env.Version.Minor() < 24 {
+				Skip("MinDomains TopologySpreadConstraint is only available starting in K8s >= 1.24.x")
+			}
+			ExpectApplied(ctx, env.Client, nodePoolWith("default", []string{"test-zone-1", "test-zone-2"}, nil))
+			tsc := corev1.TopologySpreadConstraint{
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+				MaxSkew:           1,
+			}
+			withMinDomains := tsc
+			withMinDomains.MinDomains = lo.ToPtr[int32](3)
+			minDomainsPrefix, otherPrefix := "b-min-domains", "a-other"
+			if minDomainsFirst {
+				minDomainsPrefix, otherPrefix = "a-min-domains", "b-other"
+			}
+			// The other pod isn't selected by its own constraint, so it never contributes to the counts.
+			other := namedPods(otherPrefix, 1, test.PodOptions{
+				ObjectMeta:                metav1.ObjectMeta{Labels: map[string]string{"other": "other"}},
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{tsc},
+			})
+			pods := namedPods(minDomainsPrefix, 3, test.PodOptions{
+				ObjectMeta:                metav1.ObjectMeta{Labels: labels},
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{withMinDomains},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, append(pods, other...)...)
+			ExpectScheduled(ctx, env.Client, other[0])
+			// Only two of the three domains exist, so the global minimum is treated as zero and only one pod can
+			// schedule per zone.
+			ExpectSkew(ctx, env.Client, "default", &withMinDomains).To(ConsistOf(1, 1))
+		},
+		Entry("minDomains pod listed first", true),
+		Entry("minDomains pod listed last", false),
+	)
+	DescribeTable("should consider all domains for pod anti-affinity regardless of which pod created the group",
+		func(toleratingFirst bool) {
+			ExpectApplied(ctx, env.Client,
+				nodePoolWith("untainted", []string{"test-zone-1", "test-zone-2"}, nil),
+				nodePoolWith("tainted", []string{"test-zone-3"}, nil, taint),
+			)
+			antiAffinity := []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+				TopologyKey:   corev1.LabelTopologyZone,
+			}}
+			toleratingPrefix, otherPrefix := "b-tolerating", "a-other"
+			if toleratingFirst {
+				toleratingPrefix, otherPrefix = "a-tolerating", "b-other"
+			}
+			// Pin each pod to a zone, since Karpenter can't pick distinct zones for unpinned pods with zonal
+			// anti-affinity in a single round.
+			var pods []*corev1.Pod
+			for i, zone := range []string{"test-zone-1", "test-zone-2"} {
+				pods = append(pods, namedPods(fmt.Sprintf("%s-%d", otherPrefix, i), 1, test.PodOptions{
+					ObjectMeta:          metav1.ObjectMeta{Labels: labels},
+					PodAntiRequirements: antiAffinity,
+					NodeSelector:        map[string]string{corev1.LabelTopologyZone: zone},
+				})...)
+			}
+			pods = append(pods,
+				namedPods(toleratingPrefix, 1, test.PodOptions{
+					ObjectMeta:          metav1.ObjectMeta{Labels: labels},
+					PodAntiRequirements: antiAffinity,
+					Tolerations:         []corev1.Toleration{toleration},
+					NodeSelector:        map[string]string{corev1.LabelTopologyZone: "test-zone-3"},
+				})...,
+			)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+			for _, p := range pods {
+				ExpectScheduled(ctx, env.Client, p)
+			}
+			ExpectSkew(ctx, env.Client, "default", &corev1.TopologySpreadConstraint{
+				TopologyKey:   corev1.LabelTopologyZone,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+			}).To(ConsistOf(1, 1, 1))
+		},
+		Entry("tolerating pod listed first", true),
+		Entry("tolerating pod listed last", false),
+	)
+	It("should consider all domains for inverse pod anti-affinity regardless of the existing pod's tolerations", func() {
+		ExpectApplied(ctx, env.Client,
+			nodePoolWith("untainted", []string{"test-zone-1", "test-zone-2"}, nil),
+			nodePoolWith("tainted", []string{"test-zone-3"}, nil, taint),
+		)
+		existing := test.UnschedulablePod(test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels},
+			PodAntiRequirements: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+				TopologyKey:   corev1.LabelTopologyZone,
+			}},
+			NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-1"},
+		})
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, existing)
+		ExpectScheduled(ctx, env.Client, existing)
+
+		// The existing pod's anti-affinity only excludes test-zone-1. test-zone-3 is only offered by a NodePool the
+		// existing pod doesn't tolerate, but that is irrelevant to the pod being scheduled.
+		pod := test.UnschedulablePod(test.PodOptions{
+			ObjectMeta:   metav1.ObjectMeta{Labels: labels},
+			Tolerations:  []corev1.Toleration{toleration},
+			NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-3"},
+		})
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+		node := ExpectScheduled(ctx, env.Client, pod)
+		Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelTopologyZone, "test-zone-3"))
+	})
+	DescribeTable("should not share a pod affinity group between pods with different tolerations",
+		func(toleratingFirst bool) {
+			ExpectApplied(ctx, env.Client,
+				nodePoolWith("untainted", []string{"test-zone-1", "test-zone-2"}, nil),
+				nodePoolWith("tainted", []string{"test-zone-3"}, nil, taint),
+			)
+			affinity := []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+				TopologyKey:   corev1.LabelTopologyZone,
+			}}
+			toleratingPrefix, otherPrefix := "b-tolerating", "a-other"
+			if toleratingFirst {
+				toleratingPrefix, otherPrefix = "a-tolerating", "b-other"
+			}
+			// The tolerating pods are self-selecting and must bootstrap their affinity in test-zone-3, a domain only
+			// offered by a NodePool the other pod doesn't tolerate.
+			tolerating := namedPods(toleratingPrefix, 2, test.PodOptions{
+				ObjectMeta:      metav1.ObjectMeta{Labels: labels},
+				PodRequirements: affinity,
+				Tolerations:     []corev1.Toleration{toleration},
+				NodeSelector:    map[string]string{corev1.LabelTopologyZone: "test-zone-3"},
+			})
+			other := namedPods(otherPrefix, 1, test.PodOptions{
+				ObjectMeta:      metav1.ObjectMeta{Labels: map[string]string{"other": "other"}},
+				PodRequirements: affinity,
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, append(tolerating, other...)...)
+			for _, p := range tolerating {
+				node := ExpectScheduled(ctx, env.Client, p)
+				Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelTopologyZone, "test-zone-3"))
+			}
+			// The other pod must join the tolerating pods in test-zone-3, which it can't tolerate.
+			ExpectNotScheduled(ctx, env.Client, other[0])
+		},
+		Entry("tolerating pod listed first", true),
+		Entry("tolerating pod listed last", false),
+	)
+})
+
 var _ = Describe("Taints", func() {
 	var nodePool *v1.NodePool
 	BeforeEach(func() {
