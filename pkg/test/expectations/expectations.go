@@ -911,6 +911,24 @@ func ExpectMetricHistogramSampleCountValue(metricName string, expectedValue uint
 	Expect(lo.FromPtr(metric.Histogram.SampleCount)).To(Equal(expectedValue), "Metric "+metricName+" should have the expected value")
 }
 
+// ExpectTopologyStateHydrated feeds cluster state's topology index the pods, Nodes and Namespaces in the API server,
+// as its informer event handlers would, and marks it synced. Tests don't run informers, so they call this before a
+// scheduling simulation that should read topology from the index. It's a no-op if the index is disabled.
+func ExpectTopologyStateHydrated(ctx context.Context, c client.Client, cluster *state.Cluster) {
+	GinkgoHelper()
+	index := cluster.TopologyIndex()
+	if index == nil {
+		return
+	}
+	pods := &corev1.PodList{}
+	Expect(c.List(ctx, pods)).To(Succeed())
+	nodes := &corev1.NodeList{}
+	Expect(c.List(ctx, nodes)).To(Succeed())
+	namespaces := &corev1.NamespaceList{}
+	Expect(c.List(ctx, namespaces)).To(Succeed())
+	index.Hydrate(lo.ToSlicePtr(pods.Items), lo.ToSlicePtr(nodes.Items), lo.ToSlicePtr(namespaces.Items))
+}
+
 func ExpectManualBinding(ctx context.Context, c client.Client, pod *corev1.Pod, node *corev1.Node) {
 	GinkgoHelper()
 	Expect(c.Create(ctx, &corev1.Binding{

@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -88,6 +89,34 @@ var _ = Describe("Topology Index", func() {
 	})
 	AfterEach(func() {
 		cluster.SetTopologyIndex(nil)
+	})
+
+	It("should hydrate from the API server", func() {
+		node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{corev1.LabelTopologyZone: "zone-a"}}})
+		pods := []*corev1.Pod{
+			test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "a"}}, NodeName: node.Name}),
+			test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "a"}}, NodeName: node.Name}),
+			test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "b"}}, NodeName: node.Name}),
+			test.UnschedulablePod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "a"}}}),
+		}
+		ExpectApplied(ctx, env.Client, node, pods[0], pods[1], pods[2], pods[3])
+		Expect(index.Synced()).To(BeFalse())
+		ExpectTopologyStateHydrated(ctx, env.Client, cluster)
+		Expect(index.Synced()).To(BeTrue())
+		_, counts := index.Register(topoindex.GroupSpec{
+			TopologyKey: corev1.LabelTopologyZone,
+			Namespaces:  []string{pods[0].Namespace},
+			Selector:    labels.SelectorFromSet(labels.Set{"app": "a"}),
+		})
+		Expect(counts.Counts()).To(Equal(map[string]int32{"zone-a": 2}))
+		_, ok := index.Snapshot().Namespace(pods[0].Namespace)
+		Expect(ok).To(BeTrue())
+
+		// a later hydration drops what the API server no longer has
+		ExpectDeleted(ctx, env.Client, pods[0])
+		ExpectTopologyStateHydrated(ctx, env.Client, cluster)
+		counts, _ = index.Snapshot().Counts(counts.Key())
+		Expect(counts.Counts()).To(Equal(map[string]int32{"zone-a": 1}))
 	})
 
 	// The inverse anti-affinity view is fed by cluster state's own writes, so after any sequence of cluster state
