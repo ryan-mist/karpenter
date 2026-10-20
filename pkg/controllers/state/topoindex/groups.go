@@ -24,6 +24,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+
+	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
 
 // NodePredicate decides whether a Node takes part in a group's counts, e.g. a topology spread constraint's node
@@ -175,6 +177,8 @@ func (g *group) freeze() *GroupCounts {
 type GroupCounts struct {
 	*groupSpec
 	counts map[string]int32
+	// base is the scheduler's form of counts, built on first use
+	base atomic.Pointer[topology.BaseCounts]
 }
 
 // Key returns the group's key.
