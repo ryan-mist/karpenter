@@ -36,6 +36,8 @@ type Map[K ~string, V any] struct {
 	// a View and are copied before they're written.
 	gen uint64
 	len int
+	// last is the view returned by the last Freeze, which is returned again if nothing was written since
+	last *View[K, V]
 }
 
 type shard[K ~string, V any] struct {
@@ -83,6 +85,7 @@ func (m *Map[K, V]) writable(i int) *shard[K, V] {
 		s = &shard[K, V]{gen: m.gen, m: maps.Clone(s.m)}
 		m.shards[i] = s
 	}
+	m.last = nil
 	return s
 }
 
@@ -107,11 +110,16 @@ func (m *Map[K, V]) Delete(k K) {
 	m.len--
 }
 
-// Freeze returns an immutable view of the current contents. Later writes to the Map don't affect it.
+// Freeze returns an immutable view of the current contents. Later writes to the Map don't affect it. Freezing a Map
+// that hasn't been written since the last Freeze returns the same view.
 func (m *Map[K, V]) Freeze() *View[K, V] {
+	if m.last != nil {
+		return m.last
+	}
 	v := &View[K, V]{seed: m.seed, shards: make([]*shard[K, V], len(m.shards)), len: m.len}
 	copy(v.shards, m.shards)
 	m.gen++
+	m.last = v
 	return v
 }
 

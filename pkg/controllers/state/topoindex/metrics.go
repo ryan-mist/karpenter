@@ -36,6 +36,10 @@ const (
 
 	resultNoop = "noop"
 	resultDiff = "diff"
+
+	stateLabel   = "state"
+	stateCounted = "counted"
+	stateIgnored = "ignored"
 )
 
 var (
@@ -69,7 +73,97 @@ var (
 		opmetrics.Alpha,
 	)
 
-	eventLabels = map[string][2]map[string]string{}
+	podState = opmetrics.Label{
+		Name: stateLabel,
+		Help: "Whether topology counts the pod.",
+		Values: []opmetrics.Value{
+			{Name: stateCounted, Help: "The pod is scheduled, and not terminal or terminating."},
+			{Name: stateIgnored, Help: "The pod is pending, terminal or terminating."},
+		},
+	}
+
+	Pods = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_pods",
+			Help:      "Number of pods the topology index holds facts for. Labeled by whether topology counts them.",
+		},
+		[]opmetrics.Label{podState},
+		opmetrics.Alpha,
+	)
+	LabelSets = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_label_sets",
+			Help:      "Number of distinct (namespace, labels) sets of the pods the topology index holds.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	RegisteredGroups = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_registered_groups",
+			Help:      "Number of groups whose counts the topology index maintains.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	Generation = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_generation",
+			Help:      "Generation of the last published topology index snapshot.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	GroupRegistrationsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_group_registrations_total",
+			Help:      "Number of groups registered in the topology index.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	GroupEvictionsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_group_evictions_total",
+			Help:      "Number of groups the topology index stopped maintaining because they weren't read for a while or the group limit was reached.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	RegistrationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_registration_duration_seconds",
+			Help:      "Duration of the scan that computes a group's counts when it's first registered.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+
+	eventLabels   = map[string][2]map[string]string{}
+	countedLabels = map[string]string{stateLabel: stateCounted}
+	ignoredLabels = map[string]string{stateLabel: stateIgnored}
 )
 
 func init() {
@@ -87,4 +181,12 @@ func eventsTotal(kind string, changed bool) {
 		labels = eventLabels[kind][1]
 	}
 	EventsTotal.Inc(labels)
+}
+
+func (ix *Index) recordMetricsLocked() {
+	Pods.Set(float64(ix.countable), countedLabels)
+	Pods.Set(float64(len(ix.pods)-ix.countable), ignoredLabels)
+	LabelSets.Set(float64(ix.sets.Len()), nil)
+	RegisteredGroups.Set(float64(len(ix.groups)), nil)
+	Generation.Set(float64(ix.gen), nil)
 }
