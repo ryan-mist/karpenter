@@ -17,6 +17,8 @@ limitations under the License.
 package scheduling
 
 import (
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
@@ -42,6 +44,15 @@ type presence struct {
 	// mask has the domains of a dense key, names the domains of a sparse key
 	mask  topology.Mask
 	names []string
+	set   sets.Set[string]
+}
+
+// nameSet returns the domains of a sparse key as a set
+func (p *presence) nameSet() sets.Set[string] {
+	if p.set == nil {
+		p.set = sets.New(p.names...)
+	}
+	return p.set
 }
 
 func newPresenceIndex(stateNodes []*state.StateNode) *presenceIndex {

@@ -95,6 +95,19 @@ func (m *Mask) Count() int {
 	return n
 }
 
+// CountBelow returns the number of domains in the mask with a lower ID.
+func (m *Mask) CountBelow(id DomainID) int {
+	w := int(id >> 6)
+	n := 0
+	for i := range min(w, m.words()) {
+		n += bits.OnesCount64(m.word(i))
+	}
+	if w < m.words() {
+		n += bits.OnesCount64(m.word(w) & (1<<(id&63) - 1))
+	}
+	return n
+}
+
 // Clone returns a copy of the mask that doesn't share storage with it.
 func (m Mask) Clone() Mask {
 	return Mask{w0: m.w0, rest: slices.Clone(m.rest)}
