@@ -103,11 +103,16 @@ func (s *Snapshot) InverseTerms(fn func(*InverseTerm) bool) {
 
 // Contribution returns the domain the counts of the group include the pod in, or false if they don't include it.
 func (s *Snapshot) Contribution(c *GroupCounts, pod PodFact) (string, bool) {
+	return s.contribution(c, pod, func(node *Node) bool { return c.NodeFilter.Matches(node.Labels, node.Taints) })
+}
+
+// contribution is Contribution with matches evaluating the group's node filter
+func (s *Snapshot) contribution(c *GroupCounts, pod PodFact, matches func(*Node) bool) (string, bool) {
 	if !pod.Countable || !c.selects(pod.Namespace, pod.Labels) {
 		return "", false
 	}
 	node, _ := s.nodes.Get(pod.NodeName)
-	return c.domain(node, func(node *Node) bool { return c.NodeFilter.Matches(node.Labels, node.Taints) })
+	return c.domain(node, matches)
 }
 
 // Snapshot returns a snapshot of the index's current contents. It's lock-free when nothing changed since the last one.
