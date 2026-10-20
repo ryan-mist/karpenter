@@ -544,6 +544,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		}
 	}
 	UnfinishedWorkSeconds.Delete(map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
+	s.topology.seal()
 	for _, m := range s.newNodeClaims {
 		m.FinalizeScheduling(s.draDriversForNodeClaim(m)...)
 	}

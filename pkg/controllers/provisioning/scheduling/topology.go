@@ -57,6 +57,9 @@ type topologyImpl interface {
 	Register(topologyKey string, domain string)
 	Unregister(topologyKey string, domain string)
 	BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements)
+	// seal ends the simulation: afterwards only errors from AddRequirements are rendered (topology errors are lazy), so
+	// an implementation can release what it only needs while scheduling.
+	seal()
 }
 
 func NewTopology(
@@ -126,6 +129,12 @@ func (t *Topology) Register(topologyKey string, domain string) {
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *Topology) Unregister(topologyKey string, domain string) {
 	t.impl.Unregister(topologyKey, domain)
+}
+
+// seal releases what the topology only needs while scheduling, once the scheduler's Solve is done. The topology's
+// errors can still be rendered; any other call is a bug, which panics in tests and is ignored otherwise.
+func (t *Topology) seal() {
+	t.impl.seal()
 }
 
 // BeginPod prepares the topology for the scheduler to try the pod, with its strict requirements, on candidate nodes

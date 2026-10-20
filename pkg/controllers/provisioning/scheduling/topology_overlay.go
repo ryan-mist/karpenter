@@ -23,8 +23,10 @@ import (
 	"math/rand/v2"
 	"reflect"
 	"slices"
+	"testing"
 
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -66,6 +69,9 @@ type overlayTopology struct {
 	// changes to the groups, so that a plan built before one isn't used.
 	plans   map[types.UID]*podPlan
 	version uint64
+	// sealed is set once the simulation is done (see seal)
+	sealed bool
+	log    logr.Logger
 }
 
 // podPlan is the part of AddRequirements for a pod that doesn't depend on the candidate node: the groups that
@@ -102,6 +108,7 @@ func newOverlayTopology(
 		presence:      newPresenceIndex(stateNodes),
 		hosts:         &hostLog{last: map[string]int{}},
 		plans:         map[types.UID]*podPlan{},
+		log:           log.FromContext(ctx),
 	}
 	if opts.topologySeed != nil {
 		t.seed = *opts.topologySeed
@@ -116,6 +123,26 @@ func newOverlayTopology(
 		return nil, errs
 	}
 	return t, nil
+}
+
+// seal drops everything the groups don't need to render errors: the count source and the snapshot it may pin, the
+// plans, the universes, the state node presence and the excluded pods. The groups keep their own counts and domains.
+func (t *overlayTopology) seal() {
+	t.sealed = true
+	t.src, t.excluded, t.kubeClient = nil, nil, nil
+	t.plans, t.universes, t.presence, t.domainSources = nil, nil, nil, nil
+}
+
+// checkSealed reports a call after seal: it panics in tests, and is logged and ignored otherwise.
+func (t *overlayTopology) checkSealed(call string) bool {
+	if !t.sealed {
+		return false
+	}
+	if testing.Testing() {
+		panic(fmt.Sprintf("topology %s called after the simulation ended", call))
+	}
+	t.log.Error(nil, "topology called after the simulation ended", "call", call)
+	return true
 }
 
 // universe returns the universe of domains of the topology key. Like the rest of the Topology's state, it isn't safe
@@ -157,6 +184,9 @@ func (t overlayTopologyError) Error() string {
 // relaxation of a preference to properly break the topology <-> owner relationship so that the preferred topology will
 // no longer influence scheduling.
 func (t *overlayTopology) Update(ctx context.Context, p *corev1.Pod) error {
+	if t.checkSealed("Update") {
+		return nil
+	}
 	t.version++
 	delete(t.plans, p.UID)
 	t.index.removeOwner(p.UID)
@@ -236,6 +266,9 @@ func (t *overlayTopology) newInverseGroup(id *TopologyGroupIdentity) *TopologyGr
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
 func (t *overlayTopology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
+	if t.checkSealed("Record") {
+		return
+	}
 	t.version++
 	// once we've committed to a domain, we record the usage in every topology that cares about it
 	t.index.forEachCandidate(p, func(tg *TopologyGroup) {
@@ -263,6 +296,9 @@ func (t *overlayTopology) Record(p *corev1.Pod, taints []corev1.Taint, requireme
 // scheduler tries the candidates in parallel. It must be called serially. AddRequirements uses the plan as long as it
 // gets the same pod requirements and no group changed since.
 func (t *overlayTopology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements) {
+	if t.checkSealed("BeginPod") {
+		return
+	}
 	t.plans[p.UID] = &podPlan{version: t.version, podRequirements: podRequirements, entries: t.planEntries(p, podRequirements)}
 }
 
@@ -308,6 +344,9 @@ func sameRequirements(a, b scheduling.Requirements) bool {
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
 // cannot be satisfied.
 func (t *overlayTopology) AddRequirements(p *corev1.Pod, _ []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, _ ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+	if t.checkSealed("AddRequirements") {
+		return nil, fmt.Errorf("topology called after the simulation ended")
+	}
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
 	entries := t.plan(p, podRequirements)
 	for i := range entries {
@@ -332,6 +371,9 @@ func (t *overlayTopology) AddRequirements(p *corev1.Pod, _ []corev1.Taint, podRe
 // GetTopologyZoneConstraints returns the set of valid zones from all topology constraints
 // that use the zone topology key for the given pod, along with whether the constraints are satisfiable.
 func (t *overlayTopology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool) {
+	if t.checkSealed("GetTopologyZoneConstraints") {
+		return nil, true
+	}
 	var result sets.Set[string]
 
 	for _, topology := range t.index.ownedBy(p.UID) {
@@ -365,6 +407,9 @@ func (t *overlayTopology) GetTopologyZoneConstraints(p *corev1.Pod, podRequireme
 // Register is used to register a domain as available across topologies for the given topology key. Hostnames are
 // logged once for all groups instead (hostLog).
 func (t *overlayTopology) Register(topologyKey string, domain string) {
+	if t.checkSealed("Register") {
+		return
+	}
 	t.version++
 	if topologyKey == corev1.LabelHostname {
 		t.hosts.register(domain)
@@ -381,6 +426,9 @@ func (t *overlayTopology) Register(topologyKey string, domain string) {
 
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *overlayTopology) Unregister(topologyKey string, domain string) {
+	if t.checkSealed("Unregister") {
+		return
+	}
 	t.version++
 	for _, groups := range []map[uint64]*TopologyGroup{t.groups, t.inverseGroups} {
 		for _, tg := range groups {
