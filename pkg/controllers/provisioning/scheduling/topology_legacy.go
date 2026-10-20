@@ -55,8 +55,8 @@ type legacyTopology struct {
 	inverseTopologyGroups map[uint64]*legacyTopologyGroup
 	// topologyIndex and inverseTopologyIndex index the groups in topologyGroups and inverseTopologyGroups by owner and
 	// by selector, so per-pod lookups don't need to scan every group.
-	topologyIndex        *topologyGroupIndex
-	inverseTopologyIndex *topologyGroupIndex
+	topologyIndex        *topologyGroupIndex[*legacyTopologyGroup]
+	inverseTopologyIndex *topologyGroupIndex[*legacyTopologyGroup]
 	// The universe of domains by topology key. Only the keys of topology spread constraints and pod (anti-)affinity
 	// terms are ever read, so each key's domains are built from the domainSources the first time it is read.
 	domainGroups  map[string]TopologyDomainGroup
@@ -103,8 +103,8 @@ func newLegacyTopology(
 		domainSources:         newDomainSources(nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*legacyTopologyGroup{},
 		inverseTopologyGroups: map[uint64]*legacyTopologyGroup{},
-		topologyIndex:         newTopologyGroupIndex(),
-		inverseTopologyIndex:  newTopologyGroupIndex(),
+		topologyIndex:         newTopologyGroupIndex[*legacyTopologyGroup](),
+		inverseTopologyIndex:  newTopologyGroupIndex[*legacyTopologyGroup](),
 		excludedPods:          sets.New[string](),
 		nodes:                 map[string]*topologyNode{},
 	}

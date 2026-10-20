@@ -63,7 +63,15 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
-	impl, err := newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, option.Resolve(opts...))
+	o := option.Resolve(opts...)
+	if report := shadowReporter(ctx); report != nil {
+		impl, err := newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report)
+		if err != nil {
+			return nil, err
+		}
+		return &Topology{impl: impl}, nil
+	}
+	impl, err := newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
 	if err != nil {
 		return nil, err
 	}

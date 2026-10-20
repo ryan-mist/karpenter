@@ -115,6 +115,12 @@ test: ## Run tests
 		--ginkgo.v \
 		-cover -coverprofile=coverage.out -outputdir=. -coverpkg=./...
 
+test-topology-shadow: ## Run the scheduling suites with every Topology shadowed by the legacy implementation
+	KARPENTER_TOPOLOGY_SHADOW=1 go test ./pkg/controllers/provisioning/... ./pkg/controllers/disruption/... \
+		-timeout 40m \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.randomize-all
+
 test-memory: ## Run memory usage tests for node overlay store
 	go test -v ./pkg/controllers/nodeoverlay/... -run TestMemoryUsage
 

@@ -185,6 +185,10 @@ func (t *legacyTopologyGroup) Unregister(domains ...string) {
 	}
 }
 
+func (t *legacyTopologyGroup) indexSelector() labels.Selector {
+	return t.selector
+}
+
 func (t *legacyTopologyGroup) AddOwner(key types.UID) {
 	t.owners[key] = struct{}{}
 }

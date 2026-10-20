@@ -30,6 +30,7 @@ const (
 	ControllerLabel    = metrics.ControllerLabel
 	schedulingIDLabel  = "scheduling_id"
 	schedulerSubsystem = "scheduler"
+	callLabel          = "call"
 )
 
 // SchedulingID describes the scheduling_id dimension. It is co-located here
@@ -40,6 +41,19 @@ var SchedulingID = opmetrics.Label{
 }
 
 var (
+	TopologyShadowMismatchesTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "topology_shadow_mismatches_total",
+			Help:      "Number of differences between the overlay and legacy topology implementations found by the topology shadow. Labeled by the topology call that found them.",
+		},
+		[]opmetrics.Label{
+			{Name: callLabel, Help: "The topology call that found the difference."},
+		},
+		opmetrics.Alpha,
+	)
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
