@@ -39,6 +39,8 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
+	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -114,6 +116,15 @@ func newOverlayTopology(
 		t.seed = *opts.topologySeed
 	}
 	t.src = newListCountSource(kubeClient, cluster, t.excluded)
+	// with the TopologyIndex gate on, existing pods are counted from cluster state's topology index once it has synced
+	if cluster != nil {
+		if src, ok := topoindex.NewCountSource(cluster.TopologyIndex(), t.src); ok {
+			if rate := karpopts.FromContext(ctx).TopologyIndexDifferentialSampleRate; rate > 0 && rand.Float64() < rate {
+				src.Differential()
+			}
+			t.src = src
+		}
+	}
 
 	errs := t.updateInverseAffinities(ctx)
 	for i := range pods {
