@@ -91,6 +91,27 @@ func shadowMismatches(call string) float64 {
 	return 0
 }
 
+var _ = Describe("Topology Engine", func() {
+	It("should select the implementation from the options", func() {
+		ctx := karpopts.ToContext(context.Background(), test.Options())
+		GinkgoT().Setenv(TopologyShadowEnv, "")
+		g := &identityGen{topologyIndexGen{r: rand.New(rand.NewSource(0))}}
+		f := g.fixture(ctx)
+		newTopology := func(opts ...Options) topologyImpl {
+			t, err := NewTopology(ctx, f.client, f.cluster, f.stateNodes, f.nodePools, f.instanceTypes, f.pods, opts...)
+			Expect(err).ToNot(HaveOccurred())
+			return t.impl
+		}
+		Expect(newTopology()).To(BeAssignableToTypeOf(&overlayTopology{}))
+		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineOverlay))).To(BeAssignableToTypeOf(&overlayTopology{}))
+		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineLegacy))).To(BeAssignableToTypeOf(&legacyTopology{}))
+		Expect(newTopology(TopologyShadowSample(1))).To(BeAssignableToTypeOf(&shadowTopology{}))
+		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineLegacy), TopologyShadowSample(1))).To(BeAssignableToTypeOf(&shadowTopology{}))
+		GinkgoT().Setenv(TopologyShadowEnv, "1")
+		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineLegacy))).To(BeAssignableToTypeOf(&shadowTopology{}))
+	})
+})
+
 // FuzzTopologyShadow checks that the overlay and legacy topologies make the same decisions for random clusters and
 // workloads.
 func FuzzTopologyShadow(f *testing.F) {

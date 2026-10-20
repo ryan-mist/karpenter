@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
@@ -236,7 +237,7 @@ func benchmarkForEachDomain(b *testing.B, domains, taintGroupsPerDomain int, tol
 func BenchmarkTopologyGroups(b *testing.B) {
 	for _, engine := range []string{"legacy", "overlay"} {
 		for _, deployments := range []int{10, 100, 500} {
-			topology, pods := benchTopologyGroups(b, deployments, scheduling.TopologyEngine(engine))
+			topology, pods := benchTopologyGroups(b, deployments, scheduling.TopologyEngine(options.TopologyEngine(engine)))
 			podRequirements := pscheduling.NewRequirements()
 			nodeRequirements := pscheduling.NewRequirements(
 				pscheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "test-zone-1"),

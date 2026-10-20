@@ -49,6 +49,8 @@ type OptionsFields struct {
 	BatchMaxDuration                 *time.Duration
 	BatchIdleDuration                *time.Duration
 	IgnoreDRARequests                *bool
+	TopologyEngine                   *options.TopologyEngine
+	TopologyShadowSample             *float64
 	LegacyNodeRepair                 *bool
 	FeatureGates                     FeatureGates
 	SchedulerConfig                  *options.SchedulerConfiguration
@@ -95,6 +97,8 @@ func Options(overrides ...OptionsFields) *options.Options {
 		PreferencePolicy:                 lo.FromPtrOr(opts.PreferencePolicy, options.PreferencePolicyRespect),
 		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
+		TopologyEngine:                   lo.FromPtrOr(opts.TopologyEngine, options.TopologyEngineOverlay),
+		TopologyShadowSample:             lo.FromPtrOr(opts.TopologyShadowSample, 0),
 		LegacyNodeRepair:                 lo.FromPtrOr(opts.LegacyNodeRepair, false),
 		SchedulerConfig:                  opts.SchedulerConfig,
 		FeatureGates: options.FeatureGates{

@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"context"
+	"math/rand/v2"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
@@ -29,14 +30,10 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
-)
-
-const (
-	topologyEngineLegacy  = "legacy"
-	topologyEngineOverlay = "overlay"
 )
 
 // Topology tracks the topology spread constraints and pod (anti-)affinities of the pods being scheduled, along with
@@ -73,21 +70,20 @@ func NewTopology(
 	opts ...Options,
 ) (*Topology, error) {
 	o := option.Resolve(opts...)
-	if report := shadowReporter(ctx); report != nil {
-		impl, err := newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report)
-		if err != nil {
-			return nil, err
-		}
-		return &Topology{impl: impl}, nil
+	report := shadowReporter(ctx)
+	if report == nil && o.topologyShadowSample > 0 && rand.Float64() < o.topologyShadowSample {
+		report = newShadowLogReporter(ctx)
 	}
-	if o.topologyEngine == topologyEngineOverlay {
-		impl, err := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
-		if err != nil {
-			return nil, err
-		}
-		return &Topology{impl: impl}, nil
+	var impl topologyImpl
+	var err error
+	switch {
+	case report != nil:
+		impl, err = newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report)
+	case o.topologyEngine == karpopts.TopologyEngineLegacy:
+		impl, err = newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
+	default:
+		impl, err = newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
 	}
-	impl, err := newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
 	if err != nil {
 		return nil, err
 	}

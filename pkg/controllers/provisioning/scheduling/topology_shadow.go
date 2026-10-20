@@ -57,16 +57,21 @@ func shadowReporter(ctx context.Context) func(call, mismatch string) {
 			panic(fmt.Sprintf("topology shadow mismatch: %s", mismatch))
 		}
 	case "log":
-		logged := 0
-		return func(call, mismatch string) {
-			TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call})
-			if logged < maxLoggedShadowMismatches {
-				logged++
-				log.FromContext(ctx).Error(nil, "topology shadow mismatch", "mismatch", mismatch)
-			}
-		}
+		return newShadowLogReporter(ctx)
 	}
 	return nil
+}
+
+// newShadowLogReporter returns a reporter that logs the first differences and counts all of them
+func newShadowLogReporter(ctx context.Context) func(call, mismatch string) {
+	logged := 0
+	return func(call, mismatch string) {
+		TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call})
+		if logged < maxLoggedShadowMismatches {
+			logged++
+			log.FromContext(ctx).Error(nil, "topology shadow mismatch", "mismatch", mismatch)
+		}
+	}
 }
 
 // shadowTopology runs the overlay topology and the legacy topology side by side and compares them after every call.
