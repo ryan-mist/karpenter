@@ -64,15 +64,15 @@ var _ = Describe("Topology domain groups", func() {
 		})
 	}
 
-	// domainGroups reads each topology key's domains through a Topology's lazily built domain groups.
+	// domainGroups reads each topology key's domains through a legacyTopology's lazily built domain groups.
 	domainGroups := func(nodePools []*v1.NodePool, its map[string][]*cloudprovider.InstanceType, keys ...string) map[string]TopologyDomainGroup {
-		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources(nodePools, its)}
+		t := &legacyTopology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources(nodePools, its)}
 		return lo.SliceToMap(keys, func(key string) (string, TopologyDomainGroup) { return key, t.domainGroup(key) })
 	}
 
 	It("should only build the domains of the topology keys that are read", func() {
 		np := nodePool("tainted", []corev1.Taint{taint("a")})
-		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(10)})}
+		t := &legacyTopology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(10)})}
 		zones := t.domainGroup(corev1.LabelTopologyZone)
 		Expect(sets.KeySet(zones)).To(Equal(sets.New("z1", "z2", "z3")))
 		Expect(sets.KeySet(t.domainGroups)).To(Equal(sets.New(corev1.LabelTopologyZone)))
