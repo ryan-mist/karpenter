@@ -24,13 +24,10 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
-	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -44,18 +41,18 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
-type Topology struct {
+type legacyTopology struct {
 	kubeClient       client.Client
 	preferencePolicy PreferencePolicy
-	// Both the topologyGroups and inverseTopologies are maps of the hash from TopologyGroup.Hash() to the topology group
+	// Both the topologyGroups and inverseTopologies are maps of the hash from legacyTopologyGroup.Hash() to the topology group
 	// itself. This is used to allow us to store one topology group that tracks the topology of many pods instead of
 	// having a 1<->1 mapping between topology groups and pods owned/selected by that group.
-	topologyGroups map[uint64]*TopologyGroup
+	topologyGroups map[uint64]*legacyTopologyGroup
 	// Anti-affinity works both ways (if a zone has a pod foo with anti-affinity to a pod bar, we can't schedule bar to
 	// that zone, even though bar has no anti affinity terms on it. For this to work, we need to separately track the
 	// topologies of pods with anti-affinity terms, so we can prevent scheduling the pods they have anti-affinity to
 	// in some cases.
-	inverseTopologyGroups map[uint64]*TopologyGroup
+	inverseTopologyGroups map[uint64]*legacyTopologyGroup
 	// topologyIndex and inverseTopologyIndex index the groups in topologyGroups and inverseTopologyGroups by owner and
 	// by selector, so per-pod lookups don't need to scan every group.
 	topologyIndex        *topologyGroupIndex
@@ -75,6 +72,8 @@ type Topology struct {
 	// are only accessed from countDomains, which runs from Update and is never called concurrently.
 	stateNodeLabels []map[string]string
 	nodes           map[string]*topologyNode
+	// domainOrder, if set, returns the order hook of each new topology group (see legacyTopologyGroup.order)
+	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
 }
 
 // topologyNode is the part of a node that countDomains reads
@@ -84,7 +83,7 @@ type topologyNode struct {
 	taints []corev1.Taint
 }
 
-func NewTopology(
+func newLegacyTopology(
 	ctx context.Context,
 	kubeClient client.Client,
 	cluster *state.Cluster,
@@ -92,17 +91,18 @@ func NewTopology(
 	nodePools []*v1.NodePool,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	pods []*corev1.Pod,
-	opts ...Options,
-) (*Topology, error) {
-	t := &Topology{
+	opts *options,
+) (*legacyTopology, error) {
+	t := &legacyTopology{
 		kubeClient:            kubeClient,
-		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
+		preferencePolicy:      opts.preferencePolicy,
+		domainOrder:           opts.domainOrder,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
 		domainGroups:          map[string]TopologyDomainGroup{},
 		domainSources:         newDomainSources(nodePools, instanceTypes),
-		topologyGroups:        map[uint64]*TopologyGroup{},
-		inverseTopologyGroups: map[uint64]*TopologyGroup{},
+		topologyGroups:        map[uint64]*legacyTopologyGroup{},
+		inverseTopologyGroups: map[uint64]*legacyTopologyGroup{},
 		topologyIndex:         newTopologyGroupIndex(),
 		inverseTopologyIndex:  newTopologyGroupIndex(),
 		excludedPods:          sets.New[string](),
@@ -126,8 +126,8 @@ func NewTopology(
 }
 
 // domainGroup returns the universe of domains for the topology key, building it on first use. Like the rest of the
-// Topology's state, this isn't safe for concurrent use; it's only reached from NewTopology and Update.
-func (t *Topology) domainGroup(topologyKey string) TopologyDomainGroup {
+// legacyTopology's state, this isn't safe for concurrent use; it's only reached from NewTopology and Update.
+func (t *legacyTopology) domainGroup(topologyKey string) TopologyDomainGroup {
 	if domainGroup, ok := t.domainGroups[topologyKey]; ok {
 		return domainGroup
 	}
@@ -139,73 +139,17 @@ func (t *Topology) domainGroup(topologyKey string) TopologyDomainGroup {
 	return domainGroup
 }
 
-// domainSource is a NodePool's contribution to the universe of domains: the domains its instance types can launch
-// into, given the NodePool's requirements, along with the NodePool's taints.
-type domainSource struct {
-	// requirements are the NodePool's requirements and template labels
-	requirements  scheduling.Requirements
-	instanceTypes []*cloudprovider.InstanceType
-	taints        []corev1.Taint
-}
-
-func newDomainSources(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) []domainSource {
-	nodePoolIndex := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
-		return np.Name, np
-	})
-	sources := make([]domainSource, 0, len(instanceTypes))
-	for npName, its := range instanceTypes {
-		np := nodePoolIndex[npName]
-		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-		sources = append(sources, domainSource{requirements: requirements, instanceTypes: its, taints: np.Spec.Template.Spec.Taints})
-	}
-	return sources
-}
-
-// insertDomains inserts the NodePool's domains for the topology key into the domain group. For each instance type, the
-// domains are the values of the instance type's requirement intersected with the NodePool's, or the values of whichever
-// requirement exists if only one does. The values of a NodePool In requirement are always domains, even if the
-// NodePool has no instance types. Each domain is inserted once with the NodePool's taints.
-func (s domainSource) insertDomains(domainGroup TopologyDomainGroup, topologyKey string) {
-	requirement := s.requirements[topologyKey]
-	// If the NodePool's requirement is concrete, every instance type's domains are a subset of its values
-	if requirement != nil && (requirement.Operator() == corev1.NodeSelectorOpIn || requirement.Operator() == corev1.NodeSelectorOpDoesNotExist) {
-		for domain := range requirement.ValuesSeq() {
-			domainGroup.Insert(domain, s.taints...)
-		}
-		return
-	}
-	domains := sets.New[string]()
-	requirementOnly := false
-	for _, it := range s.instanceTypes {
-		itRequirement := it.Requirements[topologyKey]
-		switch {
-		case itRequirement == nil:
-			requirementOnly = requirement != nil
-		case requirement == nil:
-			for domain := range itRequirement.ValuesSeq() {
-				domains.Insert(domain)
-			}
-		default:
-			for domain := range itRequirement.IntersectionValuesSeq(requirement) {
-				domains.Insert(domain)
-			}
-		}
-	}
-	if requirementOnly {
-		for domain := range requirement.ValuesSeq() {
-			domains.Insert(domain)
-		}
-	}
-	for domain := range domains {
-		domainGroup.Insert(domain, s.taints...)
+// setOrder sets the order hook of a new topology group or inverse topology group
+func (t *legacyTopology) setOrder(tg *legacyTopologyGroup, hash uint64, inverse bool) {
+	if t.domainOrder != nil {
+		tg.order = t.domainOrder(tg.Key, hash, inverse)
 	}
 }
 
 // topologyError allows lazily generating the error string in the topology error.  If a pod fails to schedule, most often
 // we are only interested in the fact that it failed to schedule and not why.
 type topologyError struct {
-	topology    *TopologyGroup
+	topology    *legacyTopologyGroup
 	podDomains  *scheduling.Requirement
 	nodeDomains *scheduling.Requirement
 }
@@ -219,7 +163,7 @@ func (t topologyError) Error() string {
 // registered the pod as the owner of all associated affinities, new or old.  This allows Update() to be called after
 // relaxation of a preference to properly break the topology <-> owner relationship so that the preferred topology will
 // no longer influence scheduling.
-func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
+func (t *legacyTopology) Update(ctx context.Context, p *corev1.Pod) error {
 	t.topologyIndex.removeOwner(p.UID)
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
@@ -240,6 +184,7 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 		// Avoid populating and recomputing topology counts if we've already seen this group
 		if existing, ok := t.topologyGroups[hash]; !ok {
 			tg.populate(p, t.domainGroup(tg.Key))
+			t.setOrder(tg, hash, false)
 			if err := t.countDomains(ctx, tg); err != nil {
 				return err
 			}
@@ -254,9 +199,9 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 }
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
-func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
+func (t *legacyTopology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
 	// once we've committed to a domain, we record the usage in every topology that cares about it
-	t.topologyIndex.forEachCandidate(p, func(tg *TopologyGroup) {
+	t.topologyIndex.forEachCandidate(p, func(tg *legacyTopologyGroup) {
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
 			domains := requirements.Get(tg.Key)
 			if tg.Type == TopologyTypePodAntiAffinity {
@@ -281,7 +226,7 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
 // cannot be satisfied.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+func (t *legacyTopology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
 	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
@@ -307,7 +252,7 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 
 // GetTopologyZoneConstraints returns the set of valid zones from all topology constraints
 // that use the zone topology key for the given pod, along with whether the constraints are satisfiable.
-func (t *Topology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool) {
+func (t *legacyTopology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool) {
 	var result sets.Set[string]
 
 	for _, topology := range t.topologyIndex.ownedBy(p.UID) {
@@ -339,7 +284,7 @@ func (t *Topology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements sch
 }
 
 // Register is used to register a domain as available across topologies for the given topology key.
-func (t *Topology) Register(topologyKey string, domain string) {
+func (t *legacyTopology) Register(topologyKey string, domain string) {
 	for _, tg := range t.topologyGroups {
 		if tg.Key == topologyKey {
 			tg.Register(domain)
@@ -353,7 +298,7 @@ func (t *Topology) Register(topologyKey string, domain string) {
 }
 
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
-func (t *Topology) Unregister(topologyKey string, domain string) {
+func (t *legacyTopology) Unregister(topologyKey string, domain string) {
 	for _, topology := range t.topologyGroups {
 		if topology.Key == topologyKey {
 			topology.Unregister(domain)
@@ -368,7 +313,7 @@ func (t *Topology) Unregister(topologyKey string, domain string) {
 
 // updateInverseAffinities is used to identify pods with anti-affinity terms so we can track those topologies.  We
 // have to look at every pod in the cluster as there is no way to query for a pod with anti-affinity terms.
-func (t *Topology) updateInverseAffinities(ctx context.Context) error {
+func (t *legacyTopology) updateInverseAffinities(ctx context.Context) error {
 	var errs error
 	t.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
 		// don't count the pod we are excluding
@@ -385,7 +330,7 @@ func (t *Topology) updateInverseAffinities(ctx context.Context) error {
 
 // updateInverseAntiAffinity is used to track topologies of inverse anti-affinities. Here the domains & counts track the
 // pods with the anti-affinity.
-func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Pod, domains map[string]string) error {
+func (t *legacyTopology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Pod, domains map[string]string) error {
 	// We intentionally don't track inverse anti-affinity preferences. We're not
 	// required to enforce them so it just adds complexity for very little
 	// value.  The problem with them comes from the relaxation process, the pod
@@ -396,11 +341,12 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 			return err
 		}
 
-		tg := newTopologyGroupIdentity(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil)
+		tg := newLegacyTopologyGroupIdentity(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil)
 
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
 			tg.populate(pod, t.domainGroup(tg.Key))
+			t.setOrder(tg, hash, true)
 			t.inverseTopologyGroups[hash] = tg
 			t.inverseTopologyIndex.add(tg)
 		} else {
@@ -418,7 +364,7 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 // against the cluster for any existing pods.
 //
 //nolint:gocyclo
-func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
+func (t *legacyTopology) countDomains(ctx context.Context, tg *legacyTopologyGroup) error {
 	podList := &corev1.PodList{}
 
 	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
@@ -506,9 +452,9 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	return nil
 }
 
-// getNode returns the named node, or nil if the node doesn't exist. Results are memoized for the lifetime of the Topology
+// getNode returns the named node, or nil if the node doesn't exist. Results are memoized for the lifetime of the legacyTopology
 // so that each node is fetched at most once across all topology groups.
-func (t *Topology) getNode(ctx context.Context, name string) (*topologyNode, error) {
+func (t *legacyTopology) getNode(ctx context.Context, name string) (*topologyNode, error) {
 	if n, ok := t.nodes[name]; ok {
 		return n, nil
 	}
@@ -527,8 +473,8 @@ func (t *Topology) getNode(ctx context.Context, name string) (*topologyNode, err
 
 // newForTopologies returns the identities of the topology groups for the input pod's topology spread constraints. They
 // must be populated before use.
-func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
-	var topologyGroups []*TopologyGroup
+func (t *legacyTopology) newForTopologies(p *corev1.Pod) []*legacyTopologyGroup {
+	var topologyGroups []*legacyTopologyGroup
 	for _, tsc := range p.Spec.TopologySpreadConstraints {
 		if t.preferencePolicy == PreferencePolicyIgnore && tsc.WhenUnsatisfiable != corev1.DoNotSchedule {
 			continue
@@ -548,7 +494,7 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 				})
 			}
 		}
-		topologyGroups = append(topologyGroups, newTopologyGroupIdentity(
+		topologyGroups = append(topologyGroups, newLegacyTopologyGroupIdentity(
 			TopologyTypeSpread,
 			tsc.TopologyKey,
 			p,
@@ -565,8 +511,8 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 
 // newForAffinities returns the identities of the topology groups for the input pod's required/preferred affinity terms.
 // They must be populated before use.
-func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*TopologyGroup, error) {
-	var topologyGroups []*TopologyGroup
+func (t *legacyTopology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*legacyTopologyGroup, error) {
+	var topologyGroups []*legacyTopologyGroup
 	// No affinity defined
 	if p.Spec.Affinity == nil {
 		return topologyGroups, nil
@@ -600,7 +546,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 			if err != nil {
 				return nil, err
 			}
-			topologyGroups = append(topologyGroups, newTopologyGroupIdentity(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil))
+			topologyGroups = append(topologyGroups, newLegacyTopologyGroupIdentity(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil))
 		}
 	}
 	return topologyGroups, nil
@@ -608,7 +554,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 
 // buildNamespaceList constructs a unique list of namespaces consisting of the pod's namespace and the optional list of
 // namespaces and those selected by the namespace selector
-func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, namespaces []string, selector *metav1.LabelSelector) (sets.Set[string], error) {
+func (t *legacyTopology) buildNamespaceList(ctx context.Context, namespace string, namespaces []string, selector *metav1.LabelSelector) (sets.Set[string], error) {
 	if len(namespaces) == 0 && selector == nil {
 		return sets.New(namespace), nil
 	}
@@ -633,55 +579,13 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 
 // getMatchingTopologies returns a sorted list of topologies that either control the scheduling of pod p, or for which
 // the topology selects pod p and the scheduling of p affects the count per topology domain
-func (t *Topology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*TopologyGroup {
+func (t *legacyTopology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*legacyTopologyGroup {
 	// clone so that appending can't write into the index's backing array, which is shared by concurrent callers
 	matchingTopologies := slices.Clone(t.topologyIndex.ownedBy(p.UID))
-	t.inverseTopologyIndex.forEachCandidate(p, func(tg *TopologyGroup) {
+	t.inverseTopologyIndex.forEachCandidate(p, func(tg *legacyTopologyGroup) {
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
 			matchingTopologies = append(matchingTopologies, tg)
 		}
 	})
 	return matchingTopologies
-}
-
-func TopologyListOptions(namespace string, labelSelector *metav1.LabelSelector) *client.ListOptions {
-	selector := labels.Everything()
-	if labelSelector == nil {
-		return &client.ListOptions{Namespace: namespace, LabelSelector: selector}
-	}
-	for key, value := range labelSelector.MatchLabels {
-		requirement, err := labels.NewRequirement(key, selection.Equals, []string{value})
-		if err != nil {
-			return &client.ListOptions{Namespace: namespace, LabelSelector: labels.Nothing()}
-		}
-		selector = selector.Add(*requirement)
-	}
-	for _, expression := range labelSelector.MatchExpressions {
-		requirement, err := labels.NewRequirement(expression.Key, mapOperator(expression.Operator), expression.Values)
-		if err != nil {
-			return &client.ListOptions{Namespace: namespace, LabelSelector: labels.Nothing()}
-		}
-		selector = selector.Add(*requirement)
-	}
-	return &client.ListOptions{Namespace: namespace, LabelSelector: selector}
-}
-
-func mapOperator(operator metav1.LabelSelectorOperator) selection.Operator {
-	switch operator {
-	case metav1.LabelSelectorOpIn:
-		return selection.In
-	case metav1.LabelSelectorOpNotIn:
-		return selection.NotIn
-	case metav1.LabelSelectorOpExists:
-		return selection.Exists
-	case metav1.LabelSelectorOpDoesNotExist:
-		return selection.DoesNotExist
-	}
-	// this shouldn't occur as we cover all valid cases of LabelSelectorOperator that the API allows.  If it still
-	// does occur somehow we'll panic just later when the requirement throws an error.,
-	return ""
-}
-
-func IgnoredForTopology(p *corev1.Pod) bool {
-	return !pod.IsScheduled(p) || pod.IsTerminal(p) || pod.IsTerminating(p)
 }

@@ -18,7 +18,9 @@ package scheduling
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/mitchellh/hashstructure/v2"
@@ -32,28 +34,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-type TopologyType byte
-
-const (
-	TopologyTypeSpread TopologyType = iota
-	TopologyTypePodAffinity
-	TopologyTypePodAntiAffinity
-)
-
-func (t TopologyType) String() string {
-	switch t {
-	case TopologyTypeSpread:
-		return "topology spread"
-	case TopologyTypePodAffinity:
-		return "pod affinity"
-	case TopologyTypePodAntiAffinity:
-		return "pod anti-affinity"
-	}
-	return ""
-}
-
-// TopologyGroup is used to track pod counts that match a selector by the topology domain (e.g. SELECT COUNT(*) FROM pods GROUP BY(topology_ke
-type TopologyGroup struct {
+// legacyTopologyGroup is used to track pod counts that match a selector by the topology domain (e.g. SELECT COUNT(*) FROM pods GROUP BY(topology_ke
+type legacyTopologyGroup struct {
 	// Hashed Fields
 	Key        string
 	Type       TopologyType
@@ -73,29 +55,16 @@ type TopologyGroup struct {
 	owners       map[types.UID]struct{} // Pods that have this topology as a scheduling rule
 	domains      map[string]int32       // TODO(ellistarn) explore replacing with a minheap
 	emptyDomains sets.Set[string]       // domains for which we know that no pod exists
+
+	// order, if set, sorts domains in place wherever the group picks between tied domains, which otherwise follows map
+	// and set iteration order. Tests set it to make the group's choices deterministic.
+	order func(domains []string)
 }
 
-func NewTopologyGroup(
-	topologyType TopologyType,
-	topologyKey string,
-	pod *corev1.Pod,
-	namespaces sets.Set[string],
-	labelSelector *metav1.LabelSelector,
-	maxSkew int32,
-	minDomains *int32,
-	taintPolicy *corev1.NodeInclusionPolicy,
-	affinityPolicy *corev1.NodeInclusionPolicy,
-	domainGroup TopologyDomainGroup,
-) *TopologyGroup {
-	tg := newTopologyGroupIdentity(topologyType, topologyKey, pod, namespaces, labelSelector, maxSkew, minDomains, taintPolicy, affinityPolicy)
-	tg.populate(pod, domainGroup)
-	return tg
-}
-
-// newTopologyGroupIdentity returns a TopologyGroup with only the fields that identify it set, which is enough to call
+// newLegacyTopologyGroupIdentity returns a legacyTopologyGroup with only the fields that identify it set, which is enough to call
 // Hash(). The expensive parts (parsing the selector and seeding domains from the domain group) are deferred to
 // populate, so callers can dedupe by Hash() and only populate groups they haven't seen before.
-func newTopologyGroupIdentity(
+func newLegacyTopologyGroupIdentity(
 	topologyType TopologyType,
 	topologyKey string,
 	pod *corev1.Pod,
@@ -105,7 +74,7 @@ func newTopologyGroupIdentity(
 	minDomains *int32,
 	taintPolicy *corev1.NodeInclusionPolicy,
 	affinityPolicy *corev1.NodeInclusionPolicy,
-) *TopologyGroup {
+) *legacyTopologyGroup {
 	// the nil *TopologyNodeFilter always passes which is what we need for affinity/anti-affinity
 	var nodeFilter TopologyNodeFilter
 	if topologyType == TopologyTypeSpread {
@@ -126,7 +95,7 @@ func newTopologyGroupIdentity(
 	if topologyType == TopologyTypePodAffinity {
 		seedTolerations = pod.Spec.Tolerations
 	}
-	return &TopologyGroup{
+	return &legacyTopologyGroup{
 		Type:            topologyType,
 		Key:             topologyKey,
 		namespaces:      namespaces,
@@ -140,7 +109,7 @@ func newTopologyGroupIdentity(
 
 // populate parses the selector and seeds the group's domains from the domain group, filtered by the pod's tolerations
 // if the group honors taints.
-func (t *TopologyGroup) populate(pod *corev1.Pod, domainGroup TopologyDomainGroup) {
+func (t *legacyTopologyGroup) populate(pod *corev1.Pod, domainGroup TopologyDomainGroup) {
 	selector, err := metav1.LabelSelectorAsSelector(t.rawSelector)
 	if err != nil {
 		selector = labels.Nothing()
@@ -149,7 +118,7 @@ func (t *TopologyGroup) populate(pod *corev1.Pod, domainGroup TopologyDomainGrou
 	// Topology spread groups seed the domains allowed by their NodeTaintsPolicy. Pod (anti-)affinity isn't subject to
 	// taint filtering in kube-scheduler, so anti-affinity groups seed every domain: an empty domain the creating pod
 	// doesn't tolerate is still a valid domain for other pods sharing the group, or for pods selected by an inverse
-	// group. Pod affinity groups keep filtering by the creating pod's tolerations (see newTopologyGroupIdentity).
+	// group. Pod affinity groups keep filtering by the creating pod's tolerations (see newLegacyTopologyGroupIdentity).
 	seedTaintPolicy := t.nodeFilter.TaintPolicy
 	switch t.Type {
 	case TopologyTypePodAntiAffinity:
@@ -171,7 +140,7 @@ func (t *TopologyGroup) populate(pod *corev1.Pod, domainGroup TopologyDomainGrou
 	t.owners = map[types.UID]struct{}{}
 }
 
-func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
+func (t *legacyTopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
 	switch t.Type {
 	case TopologyTypeSpread:
 		return t.nextDomainTopologySpread(pod, podDomains, nodeDomains)
@@ -186,7 +155,7 @@ func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling
 	}
 }
 
-func (t *TopologyGroup) Record(domains ...string) {
+func (t *legacyTopologyGroup) Record(domains ...string) {
 	for _, domain := range domains {
 		t.domains[domain]++
 		t.emptyDomains.Delete(domain)
@@ -195,12 +164,12 @@ func (t *TopologyGroup) Record(domains ...string) {
 
 // Counts returns true if the pod would count for the topology, given that it schedule to a node with the provided
 // requirements
-func (t *TopologyGroup) Counts(pod *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) bool {
+func (t *legacyTopologyGroup) Counts(pod *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) bool {
 	return t.selects(pod) && t.nodeFilter.Matches(taints, requirements, compatibilityOptions...)
 }
 
 // Register ensures that the topology is aware of the given domain names.
-func (t *TopologyGroup) Register(domains ...string) {
+func (t *legacyTopologyGroup) Register(domains ...string) {
 	for _, domain := range domains {
 		if _, ok := t.domains[domain]; !ok {
 			t.domains[domain] = 0
@@ -209,29 +178,29 @@ func (t *TopologyGroup) Register(domains ...string) {
 	}
 }
 
-func (t *TopologyGroup) Unregister(domains ...string) {
+func (t *legacyTopologyGroup) Unregister(domains ...string) {
 	for _, domain := range domains {
 		delete(t.domains, domain)
 		t.emptyDomains.Delete(domain)
 	}
 }
 
-func (t *TopologyGroup) AddOwner(key types.UID) {
+func (t *legacyTopologyGroup) AddOwner(key types.UID) {
 	t.owners[key] = struct{}{}
 }
 
-func (t *TopologyGroup) RemoveOwner(key types.UID) {
+func (t *legacyTopologyGroup) RemoveOwner(key types.UID) {
 	delete(t.owners, key)
 }
 
-func (t *TopologyGroup) IsOwnedBy(key types.UID) bool {
+func (t *legacyTopologyGroup) IsOwnedBy(key types.UID) bool {
 	_, ok := t.owners[key]
 	return ok
 }
 
 // Hash is used so we can track single topologies that affect multiple groups of pods.  If a deployment has 100x pods
 // with self anti-affinity, we track that as a single topology with 100 owners instead of 100x topologies.
-func (t *TopologyGroup) Hash() uint64 {
+func (t *legacyTopologyGroup) Hash() uint64 {
 	return lo.Must(hashstructure.Hash(struct {
 		TopologyKey         string
 		Type                TopologyType
@@ -253,30 +222,12 @@ func (t *TopologyGroup) Hash() uint64 {
 	}, hashstructure.FormatV2, nil))
 }
 
-// hashSelector is a specialized hash function for a metav1.LabelSelector. Due to https://github.com/mitchellh/hashstructure/issues/36
-// repeated requirements inside a label selector can result in hash collisions when using SlicesAsSets. This function provides the same
-// behavior while avoiding that bug by storing the individual expression hashes in a set, ensuring there aren't repeated elements.
-//
-// NOTE: Although repeated elements typically won't occur, they can occur on k8s 1.34+ when using matchLabelKeys since both Karpenter
-// and the API server inject an expression.
-func hashSelector(selector *metav1.LabelSelector) uint64 {
-	expressionHashes := sets.New[uint64]()
-	var selectorHash uint64
-	if selector != nil {
-		for i := range selector.MatchExpressions {
-			expressionHashes.Insert(lo.Must(hashstructure.Hash(selector.MatchExpressions[i], hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})))
-		}
-		selectorHash = lo.Must(hashstructure.Hash(selector.MatchLabels, hashstructure.FormatV2, nil))
-	}
-	return lo.Must(hashstructure.Hash([]any{expressionHashes, selectorHash}, hashstructure.FormatV2, nil))
-}
-
 // nextDomainTopologySpread returns a scheduling.Requirement that includes a node domain that a pod should be scheduled to,
 // along with the number of valid domains that satisfied the maxSkew constraint.
 // If there are multiple eligible domains, we return any random domain that satisfies the `maxSkew` configuration.
 // If there are no eligible domains, we return a `DoesNotExist` requirement, implying that we could not satisfy the topologySpread requirement.
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
+func (t *legacyTopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
 	// min count is calculated across all domains
 	min := t.domainMinCount(podDomains)
 	selfSelecting := t.selects(pod)
@@ -306,7 +257,11 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 	// This is particularly useful when considering the hostname topology key that can have a
 	// lot of t.domains but only a single nodeDomain
 	if nodeDomains.Operator() == corev1.NodeSelectorOpIn {
-		for _, domain := range nodeDomains.Values() {
+		domains := nodeDomains.Values()
+		if t.order != nil {
+			domains = t.sorted(domains)
+		}
+		for _, domain := range domains {
 			if count, ok := t.domains[domain]; ok {
 				if selfSelecting {
 					count++
@@ -321,7 +276,7 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 			}
 		}
 	} else {
-		for domain := range t.domains {
+		t.forEachDomain(func(domain string) {
 			// but we can only choose from the node domains
 			if nodeDomains.Has(domain) {
 				// comment from kube-scheduler regarding the viable choices to schedule to based on skew is:
@@ -338,7 +293,7 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 					}
 				}
 			}
-		}
+		})
 	}
 	if minDomain == "" {
 		// avoids an error message about 'zone in [""]', preferring 'zone in []'
@@ -347,7 +302,7 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 	return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpIn, minDomain), validDomains
 }
 
-func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
+func (t *legacyTopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
 	// hostname based topologies always have a min pod count of zero since we can create one
 	if t.Key == corev1.LabelHostname {
 		return 0
@@ -371,7 +326,7 @@ func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *legacyTopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
@@ -419,19 +374,13 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 		// this causes us to pick the domain that the existing in-flight node is already in if possible instead of picking
 		// a random viable domain.
 		intersected := podDomains.Intersection(nodeDomains)
-		for domain := range t.domains {
-			if intersected.Has(domain) {
-				options.Insert(domain)
-				break
-			}
+		if domain, ok := t.firstDomain(intersected.Has); ok {
+			options.Insert(domain)
 		}
 
 		// and if there are no node domains, just return the first random domain that is viable
-		for domain := range t.domains {
-			if podDomains.Has(domain) {
-				options.Insert(domain)
-				break
-			}
+		if domain, ok := t.firstDomain(podDomains.Has); ok {
+			options.Insert(domain)
 		}
 	}
 	return options
@@ -439,9 +388,9 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 
 // anyCompatiblePodDomain validates whether any t.domain is compatible with our podDomains
 // This is only useful in affinity checking because it tells us whether we can schedule the pod
-// to the current node since it is the first pod that exists in the TopologyGroup OR all other domains
-// in the TopologyGroup are incompatible with the podDomains
-func (t *TopologyGroup) anyCompatiblePodDomain(podDomains *scheduling.Requirement) bool {
+// to the current node since it is the first pod that exists in the legacyTopologyGroup OR all other domains
+// in the legacyTopologyGroup are incompatible with the podDomains
+func (t *legacyTopologyGroup) anyCompatiblePodDomain(podDomains *scheduling.Requirement) bool {
 	for domain := range t.domains {
 		if podDomains.Has(domain) && t.domains[domain] > 0 {
 			return true
@@ -451,7 +400,7 @@ func (t *TopologyGroup) anyCompatiblePodDomain(podDomains *scheduling.Requiremen
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *legacyTopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 	// pods with anti-affinity must schedule to a domain where there are currently none of those pods (an empty
 	// domain). If there are none of those domains, then the pod can't schedule and we don't need to walk this
@@ -488,7 +437,46 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 	return options
 }
 
+// forEachDomain calls f for each of the group's domains, in map order or in the order hook's order if one is set.
+func (t *legacyTopologyGroup) forEachDomain(f func(domain string)) {
+	if t.order == nil {
+		for domain := range t.domains {
+			f(domain)
+		}
+		return
+	}
+	for _, domain := range t.sorted(slices.Collect(maps.Keys(t.domains))) {
+		f(domain)
+	}
+}
+
+// firstDomain returns the first of the group's domains, in map order or in the order hook's order if one is set, for
+// which f returns true.
+func (t *legacyTopologyGroup) firstDomain(f func(domain string) bool) (string, bool) {
+	if t.order == nil {
+		for domain := range t.domains {
+			if f(domain) {
+				return domain, true
+			}
+		}
+		return "", false
+	}
+	for _, domain := range t.sorted(slices.Collect(maps.Keys(t.domains))) {
+		if f(domain) {
+			return domain, true
+		}
+	}
+	return "", false
+}
+
+// sorted returns a copy of the domains sorted with the order hook
+func (t *legacyTopologyGroup) sorted(domains []string) []string {
+	result := slices.Clone(domains)
+	t.order(result)
+	return result
+}
+
 // selects returns true if the given pod is selected by this topology
-func (t *TopologyGroup) selects(pod *corev1.Pod) bool {
+func (t *legacyTopologyGroup) selects(pod *corev1.Pod) bool {
 	return t.namespaces.Has(pod.Namespace) && t.selector.Matches(labels.Set(pod.Labels))
 }

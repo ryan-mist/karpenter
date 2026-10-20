@@ -102,6 +102,11 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// topologySeed seeds the tie-breaking between topology domains with equal counts. It's random if unset.
+	topologySeed *uint64
+	// domainOrder, if set, orders each legacy topology group's domains wherever the group picks between tied domains,
+	// given the group's topology key and hash, and whether it's an inverse group. It's only used by tests.
+	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
 }
 
 type Options = option.Function[options]
@@ -118,6 +123,14 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 			opts.creditReservationCapacity = map[string]int{}
 		}
 		opts.creditReservationCapacity[reservationID] += count
+	}
+}
+
+// TopologySeed seeds the tie-breaking between topology domains with equal counts, which is otherwise random, so that
+// scheduling decisions are reproducible. The legacy topology breaks ties in map iteration order and ignores it.
+var TopologySeed = func(seed uint64) Options {
+	return func(opts *options) {
+		opts.topologySeed = &seed
 	}
 }
 
