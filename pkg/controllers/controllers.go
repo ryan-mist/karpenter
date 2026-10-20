@@ -64,6 +64,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
 	statenodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
 	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	staticprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
@@ -150,6 +151,13 @@ func NewControllers(
 		nodeclaimdisruption.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimhydration.NewController(kubeClient, cloudProvider),
 		nodehydration.NewController(kubeClient, cloudProvider),
+	}
+
+	// With the gate off the index isn't created, so nothing feeds or reads it
+	if options.FromContext(ctx).FeatureGates.TopologyIndex {
+		index := topoindex.New()
+		cluster.SetTopologyIndex(index)
+		controllers = append(controllers, informer.NewTopologyIndexController(index))
 	}
 
 	if !options.FromContext(ctx).IgnoreDRARequests {
