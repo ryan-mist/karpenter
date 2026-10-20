@@ -19,11 +19,13 @@ package topoindex
 import (
 	"encoding/json"
 	"maps"
+	"sync/atomic"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex/internal/cow"
+	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
 
 // The inverse anti-affinity view mirrors Cluster.ForPodsWithAntiAffinity, which reads cluster state rather than the
@@ -52,6 +54,9 @@ type InverseTerm struct {
 	Owners []InverseOwner
 	// Counts are the owners per domain of the term's topology key, counting a pod once per time it has the term.
 	Counts map[string]int32
+
+	// scheduler is the scheduler's form of the term, built on first use
+	scheduler atomic.Pointer[topology.InverseTerm]
 }
 
 type invOwner struct {

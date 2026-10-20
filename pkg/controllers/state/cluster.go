@@ -296,9 +296,21 @@ func (c *Cluster) DeepCopyNodes() StateNodes {
 	})
 }
 
-// SetTopologyIndex sets the topology fact index that scheduling reads topology counts from.
+// SetTopologyIndex sets the topology fact index that scheduling reads topology counts from, seeding its inverse
+// anti-affinity view with the pods cluster state already tracks.
 func (c *Cluster) SetTopologyIndex(index *topoindex.Index) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.topologyIndex.Store(index)
+	if index == nil {
+		return
+	}
+	c.antiAffinityPods.Range(func(k, v any) bool {
+		podKey := k.(types.NamespacedName)
+		nodeName, bound := c.bindings[podKey]
+		index.SetAntiAffinityPod(podKey, v.(*corev1.Pod), nodeName, bound, c.stateNodeByName(nodeName))
+		return true
+	})
 }
 
 // TopologyIndex returns the topology fact index, or nil when the TopologyIndex feature gate is off.

@@ -37,6 +37,10 @@ const (
 	resultNoop = "noop"
 	resultDiff = "diff"
 
+	resultHit        = "hit"
+	resultRegistered = "registered"
+	resultCollision  = "collision"
+
 	stateLabel   = "state"
 	stateCounted = "counted"
 	stateIgnored = "ignored"
@@ -161,6 +165,32 @@ var (
 		opmetrics.Alpha,
 	)
 
+	lookupResult = opmetrics.Label{
+		Name: resultLabel,
+		Help: "How a scheduling simulation's topology group was answered.",
+		Values: []opmetrics.Value{
+			{Name: resultHit, Help: "The group was registered in the snapshot the simulation took."},
+			{Name: resultRegistered, Help: "The group was registered on first use, scanning the pods once."},
+			{Name: resultCollision, Help: "Another node filter with the same hash was registered, so the pods were listed instead."},
+		},
+	}
+	LookupsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_lookups_total",
+			Help:      "Number of topology group counts that scheduling simulations read from the topology index. Labeled by how they were answered.",
+		},
+		[]opmetrics.Label{lookupResult},
+		opmetrics.Alpha,
+	)
+	lookupLabels = map[string]map[string]string{
+		resultHit:        {resultLabel: resultHit},
+		resultRegistered: {resultLabel: resultRegistered},
+		resultCollision:  {resultLabel: resultCollision},
+	}
+
 	eventLabels   = map[string][2]map[string]string{}
 	countedLabels = map[string]string{stateLabel: stateCounted}
 	ignoredLabels = map[string]string{stateLabel: stateIgnored}
@@ -189,4 +219,8 @@ func (ix *Index) recordMetricsLocked() {
 	LabelSets.Set(float64(ix.sets.Len()), nil)
 	RegisteredGroups.Set(float64(len(ix.groups)), nil)
 	Generation.Set(float64(ix.gen), nil)
+}
+
+func lookupsTotal(result string) {
+	LookupsTotal.Inc(lookupLabels[result])
 }
