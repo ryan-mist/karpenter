@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -96,7 +97,11 @@ func (d *differential) excludedContributions(ctx context.Context, key *topology.
 		return err
 	}
 	if !maps.Equal(listed, indexed) {
-		d.mismatch(ctx, mismatchCounts, "key", key.TopologyKey, "namespaces", key.Namespaces, "selector", key.Selector, "listed", pretty.Map(listed, 25), "index", pretty.Map(indexed, 25))
+		cause := mismatchCounts
+		if d.recheckCounts(ctx, key, excluded) {
+			cause = mismatchRace
+		}
+		d.mismatch(ctx, cause, "key", key.TopologyKey, "namespaces", key.Namespaces, "selector", key.Selector, "listed", pretty.Map(listed, 25), "index", pretty.Map(indexed, 25))
 	}
 	for _, domain := range listedDomains {
 		f(domain)
@@ -141,20 +146,95 @@ func (d *differential) inverseAntiAffinityTerms(ctx context.Context, excluded *t
 	if err := d.source.indexInverseAntiAffinityTerms(excluded, func(t *topology.InverseTerm) { mergeInverseTerms(indexed, t) }); err != nil {
 		return err
 	}
-	for key, l := range listed {
-		if i, ok := indexed[key]; !ok || !l.owners.Equal(i.owners) || !maps.Equal(l.counts, i.counts) {
-			d.mismatch(ctx, mismatchInverse, "term", key, "listedOwners", l.owners.Len(), "listed", pretty.Map(l.counts, 25))
+	if !inverseTermsEqual(listed, indexed) {
+		cause := mismatchInverse
+		if d.recheckInverse(ctx, excluded) {
+			cause = mismatchRace
 		}
-	}
-	for key, i := range indexed {
-		if _, ok := listed[key]; !ok {
-			d.mismatch(ctx, mismatchInverse, "term", key, "indexOwners", i.owners.Len(), "index", pretty.Map(i.counts, 25))
+		for key, l := range listed {
+			if i, ok := indexed[key]; !ok || !l.owners.Equal(i.owners) || !maps.Equal(l.counts, i.counts) {
+				d.mismatch(ctx, cause, "term", key, "listedOwners", l.owners.Len(), "listed", pretty.Map(l.counts, 25))
+			}
+		}
+		for key, i := range indexed {
+			if _, ok := listed[key]; !ok {
+				d.mismatch(ctx, cause, "term", key, "indexOwners", i.owners.Len(), "index", pretty.Map(i.counts, 25))
+			}
 		}
 	}
 	for _, t := range terms {
 		f(t)
 	}
 	return nil
+}
+
+func inverseTermsEqual(a, b inverseTerms) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, x := range a {
+		if y, ok := b[key]; !ok || !x.owners.Equal(y.owners) || !maps.Equal(x.counts, y.counts) {
+			return false
+		}
+	}
+	return true
+}
+
+// The index is fed by informer event handlers, which run just after the informer cache applies an event, so it can
+// trail the cache that listing reads by the handler delivery latency, and the simulation's snapshot is older still. A
+// mismatch is a race if the two agree again when compared at about the same moment: list first, give the handlers a
+// moment to deliver what the cache already has, then read a fresh snapshot. A logic bug disagrees every time.
+const (
+	recheckAttempts = 3
+	recheckDelay    = 20 * time.Millisecond
+)
+
+// recheckCounts returns true if the key's counts net of the excluded pods agree between listing and a fresh snapshot
+func (d *differential) recheckCounts(ctx context.Context, key *topology.CountKey, excluded *topology.ExcludedPods) bool {
+	for range recheckAttempts {
+		listedBase, err := d.source.fallback.Counts(ctx, key)
+		if err != nil {
+			return false
+		}
+		listed, err := net(listedBase, func(f func(string)) error { return d.source.fallback.ExcludedContributions(ctx, key, excluded, f) })
+		if err != nil {
+			return false
+		}
+		time.Sleep(recheckDelay)
+		fresh, ok := NewCountSource(d.source.index, d.source.fallback)
+		if !ok {
+			return false
+		}
+		indexedBase, err := fresh.indexCounts(ctx, key)
+		if err != nil {
+			return false
+		}
+		indexed, err := net(indexedBase, func(f func(string)) error { return fresh.indexExcludedContributions(ctx, key, excluded, f) })
+		if err == nil && maps.Equal(listed, indexed) {
+			return true
+		}
+	}
+	return false
+}
+
+// recheckInverse returns true if the inverse anti-affinity terms agree between cluster state and a fresh snapshot
+func (d *differential) recheckInverse(ctx context.Context, excluded *topology.ExcludedPods) bool {
+	for range recheckAttempts {
+		listed := inverseTerms{}
+		if err := d.source.fallback.InverseAntiAffinityTerms(ctx, excluded, func(t *topology.InverseTerm) { mergeInverseTerms(listed, t) }); err != nil {
+			return false
+		}
+		time.Sleep(recheckDelay)
+		fresh, ok := NewCountSource(d.source.index, d.source.fallback)
+		if !ok {
+			return false
+		}
+		indexed := inverseTerms{}
+		if err := fresh.indexInverseAntiAffinityTerms(excluded, func(t *topology.InverseTerm) { mergeInverseTerms(indexed, t) }); err == nil && inverseTermsEqual(listed, indexed) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *differential) mismatch(ctx context.Context, cause string, keysAndValues ...any) {

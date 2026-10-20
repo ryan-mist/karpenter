@@ -40,6 +40,7 @@ const (
 	causeLabel         = "cause"
 	mismatchCounts     = "counts"
 	mismatchInverse    = "inverse"
+	mismatchRace       = "race"
 	schedulerSubsystem = "scheduler"
 
 	resultHit        = "hit"
@@ -176,6 +177,7 @@ var (
 		Values: []opmetrics.Value{
 			{Name: mismatchCounts, Help: "A topology group's counts of existing pods, net of the pods the simulation schedules."},
 			{Name: mismatchInverse, Help: "The required anti-affinity terms of existing pods, their owners or their counts."},
+			{Name: mismatchRace, Help: "Either of the above, but the index and listing agreed when compared again at about the same moment: the index trailed the informer cache. Doesn't indicate a bug."},
 		},
 	}
 	DifferentialChecksTotal = opmetrics.NewPrometheusCounter(
@@ -195,7 +197,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "topology_index_differential_mismatches_total",
-			Help:      "Number of differences between the topology index and listing pods found in compared simulations. Labeled by what differed.",
+			Help:      "Number of differences between the topology index and listing pods found in compared simulations. Labeled by what differed; cause=race differences went away when compared again, so only the other causes indicate a bug.",
 		},
 		[]opmetrics.Label{mismatchCause},
 		opmetrics.Alpha,
@@ -203,6 +205,7 @@ var (
 	mismatchLabels = map[string]map[string]string{
 		mismatchCounts:  {causeLabel: mismatchCounts},
 		mismatchInverse: {causeLabel: mismatchInverse},
+		mismatchRace:    {causeLabel: mismatchRace},
 	}
 	lookupResult = opmetrics.Label{
 		Name: resultLabel,
