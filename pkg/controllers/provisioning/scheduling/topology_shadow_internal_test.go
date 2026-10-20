@@ -29,6 +29,12 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
@@ -109,6 +115,38 @@ var _ = Describe("Topology Engine", func() {
 		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineLegacy), TopologyShadowSample(1))).To(BeAssignableToTypeOf(&shadowTopology{}))
 		GinkgoT().Setenv(TopologyShadowEnv, "1")
 		Expect(newTopology(TopologyEngine(karpopts.TopologyEngineLegacy))).To(BeAssignableToTypeOf(&shadowTopology{}))
+	})
+})
+
+var _ = Describe("Topology Shadow Snapshot Client", func() {
+	It("should return the first read of each list and object to every caller", func() {
+		ctx := context.Background()
+		kube := fakecr.NewFakeClient()
+		Expect(kube.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default", Labels: map[string]string{"app": "a"}}})).To(Succeed())
+		c := newSnapshotClient(kube)
+		list := func(selector labels.Selector) []string {
+			pods := &corev1.PodList{}
+			Expect(c.List(ctx, pods, &client.ListOptions{Namespace: "default", LabelSelector: selector})).To(Succeed())
+			return lo.Map(pods.Items, func(p corev1.Pod, _ int) string { return p.Name })
+		}
+		Expect(list(labels.Everything())).To(ConsistOf("a"))
+		Expect(list(labels.Nothing())).To(BeEmpty())
+		Expect(kube.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "default", Labels: map[string]string{"app": "a"}}})).To(Succeed())
+		// the same reads are unchanged, new ones see the cluster
+		Expect(list(labels.Everything())).To(ConsistOf("a"))
+		Expect(list(labels.Nothing())).To(BeEmpty())
+		Expect(list(labels.SelectorFromSet(labels.Set{"app": "a"}))).To(ConsistOf("a", "b"))
+
+		node := &corev1.Node{}
+		Expect(errors.IsNotFound(c.Get(ctx, types.NamespacedName{Name: "n"}, node))).To(BeTrue())
+		Expect(kube.Create(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}})).To(Succeed())
+		Expect(errors.IsNotFound(c.Get(ctx, types.NamespacedName{Name: "n"}, node))).To(BeTrue())
+
+		// callers get copies
+		pods := &corev1.PodList{}
+		Expect(c.List(ctx, pods, &client.ListOptions{Namespace: "default", LabelSelector: labels.Everything()})).To(Succeed())
+		pods.Items[0].Name = "changed"
+		Expect(list(labels.Everything())).To(ConsistOf("a"))
 	})
 })
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
 
 // TopologyShadowEnv names the environment variable that makes every Topology a shadowTopology, which compares the
@@ -103,6 +106,9 @@ func newShadowTopology(
 	report func(call, mismatch string),
 ) (*shadowTopology, error) {
 	s := &shadowTopology{report: report, compareAll: true}
+	// both implementations read the same pods, nodes and namespaces, so pods that change between their reads on a
+	// live cluster don't show up as differences
+	kubeClient = newSnapshotClient(kubeClient)
 	overlay, overlayErr := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, opts)
 	s.overlay = overlay
 	legacyOpts := *opts
@@ -241,4 +247,58 @@ func requirementsString(requirements scheduling.Requirements) string {
 	}
 	slices.Sort(parts)
 	return strings.Join(parts, "; ")
+}
+
+// snapshotClient memoizes the reads of a client: the first List or Get of each object, list options or key is
+// returned to every later caller. The shadow topology gives it to both implementations, which then count the same
+// cluster. Results are deep copies, so callers can't change what others read.
+type snapshotClient struct {
+	client.Client
+	mu    sync.Mutex
+	reads map[string]snapshotRead
+}
+
+type snapshotRead struct {
+	obj runtime.Object
+	err error
+}
+
+func newSnapshotClient(c client.Client) *snapshotClient {
+	return &snapshotClient{Client: c, reads: map[string]snapshotRead{}}
+}
+
+func (c *snapshotClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	o := &client.ListOptions{}
+	o.ApplyOptions(opts)
+	key := fmt.Sprintf("list\x00%T\x00%s", list, o.Namespace)
+	if o.LabelSelector != nil {
+		key += "\x00" + topology.SelectorKey(o.LabelSelector)
+	}
+	if o.FieldSelector != nil {
+		key += "\x00fields=" + o.FieldSelector.String()
+	}
+	return c.read(key, list, func() error { return c.Client.List(ctx, list, opts...) })
+}
+
+func (c *snapshotClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.read(fmt.Sprintf("get\x00%T\x00%s", obj, key), obj, func() error { return c.Client.Get(ctx, key, obj, opts...) })
+}
+
+// read fills obj with the memoized read of the key, reading it into obj first if needed
+func (c *snapshotClient) read(key string, obj runtime.Object, read func() error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.reads[key]; ok {
+		if r.err == nil {
+			reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(r.obj.DeepCopyObject()).Elem())
+		}
+		return r.err
+	}
+	err := read()
+	r := snapshotRead{err: err}
+	if err == nil {
+		r.obj = obj.DeepCopyObject()
+	}
+	c.reads[key] = r
+	return err
 }
