@@ -24,10 +24,12 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex/internal/cow"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex/internal/intern"
@@ -35,9 +37,11 @@ import (
 )
 
 const (
-	podShards       = 1024
+	// podShards keeps shards small at 150k pods (about 37 each), since a write copies its shard once per snapshot
+	podShards       = 4096
 	nodeShards      = 256
 	namespaceShards = 16
+	groupShards     = 64
 )
 
 // PodFact is what the index knows about a pod.
@@ -71,6 +75,8 @@ type labelSet = intern.LabelSet[setData]
 type setData struct {
 	// pods are the countable pods with this label set
 	pods []*podRec
+	// groups are the registered groups that select this label set
+	groups []*group
 }
 
 type podRec struct {
@@ -93,41 +99,83 @@ type nodeRec struct {
 	pods []*podRec
 }
 
-// Index is the topology fact index. Writers (the informer event handlers) and readers synchronize on mu. The index
-// has a generation that only increases when a fact changes, so a resync or a status-only update doesn't bump it.
+// Index is the topology fact index. Writers (the informer event handlers) hold mu. Readers take an immutable Snapshot,
+// which only takes mu when something changed since the last one. The index has a generation that increases when a
+// fact changes or a group is registered, so a resync or a status-only update doesn't bump it.
 type Index struct {
+	clock     clock.Clock
+	ttl       time.Duration
+	maxGroups int
+
 	mu   sync.Mutex
 	gen  uint64
 	genA atomic.Uint64
+	pub  atomic.Pointer[Snapshot]
 
-	sets       *intern.Table[setData]
-	pods       map[types.UID]*podRec
-	nodes      map[string]*nodeRec
-	podFacts   *cow.Map[types.UID, PodFact]
+	sets  *intern.Table[setData]
+	pods  map[types.UID]*podRec
+	nodes map[string]*nodeRec
+	// countable is the number of countable pods
+	countable  int
+	podFacts   *cow.Map[types.UID, *PodFact]
 	nodeFacts  *cow.Map[string, *Node]
 	namespaces *cow.Map[string, *Namespace]
 	// nsSets are the label sets in use per namespace
 	nsSets map[string]map[*labelSet]struct{}
+
+	groups map[GroupKey]*group
+	// nsGroups are the registered groups per namespace they count pods in
+	nsGroups map[string][]*group
+	// frozenGroups are the published counts of the registered groups
+	frozenGroups *cow.Map[GroupKey, *GroupCounts]
+	// changedGroups are the groups whose counts changed since the last snapshot
+	changedGroups []*group
+	lastGC        time.Time
+	// synced is set by Hydrate and SetSynced, for indexes that aren't fed by informer event handlers
+	synced atomic.Bool
 
 	// handlersSynced report whether the informer event handlers that feed the index have seen the informers' initial
 	// lists
 	handlersSynced atomic.Pointer[[]func() bool]
 }
 
-func New() *Index {
-	ix := &Index{}
+// Option configures an Index.
+type Option func(*Index)
+
+// WithClock sets the clock used to age out unused groups.
+func WithClock(clk clock.Clock) Option {
+	return func(ix *Index) { ix.clock = clk }
+}
+
+// WithGroupLimits sets how long a registered group is kept without being read, and how many groups are kept at most.
+func WithGroupLimits(ttl time.Duration, maxGroups int) Option {
+	return func(ix *Index) { ix.ttl, ix.maxGroups = ttl, maxGroups }
+}
+
+func New(opts ...Option) *Index {
+	ix := &Index{clock: clock.RealClock{}, ttl: defaultGroupTTL, maxGroups: defaultMaxGroups}
+	for _, opt := range opts {
+		opt(ix)
+	}
 	ix.resetLocked()
+	ix.publishLocked()
 	return ix
 }
 
 func (ix *Index) resetLocked() {
 	ix.sets = intern.NewTable[setData]()
 	ix.pods = map[types.UID]*podRec{}
+	ix.countable = 0
 	ix.nodes = map[string]*nodeRec{}
-	ix.podFacts = cow.NewMap[types.UID, PodFact](podShards)
+	ix.podFacts = cow.NewMap[types.UID, *PodFact](podShards)
 	ix.nodeFacts = cow.NewMap[string, *Node](nodeShards)
 	ix.namespaces = cow.NewMap[string, *Namespace](namespaceShards)
 	ix.nsSets = map[string]map[*labelSet]struct{}{}
+	ix.groups = map[GroupKey]*group{}
+	ix.nsGroups = map[string][]*group{}
+	ix.frozenGroups = cow.NewMap[GroupKey, *GroupCounts](groupShards)
+	ix.changedGroups = nil
+	ix.synced.Store(false)
 }
 
 // Generation returns the index's generation. It increases whenever a fact changes.
@@ -167,6 +215,7 @@ func (ix *Index) Reset() {
 	defer ix.mu.Unlock()
 	ix.resetLocked()
 	ix.bumpLocked()
+	ix.publishLocked()
 }
 
 // ObservePod records the pod as the informer cache has it. It returns true if a fact changed.
@@ -201,7 +250,7 @@ func (ix *Index) observePodLocked(pod *corev1.Pod) bool {
 	rec.nodeName = pod.Spec.NodeName
 	rec.countable = countable
 	ix.countLocked(rec)
-	ix.podFacts.Set(rec.uid, PodFact{Namespace: rec.set.Namespace, Labels: rec.set.Labels, NodeName: rec.nodeName, Countable: rec.countable})
+	ix.podFacts.Set(rec.uid, &PodFact{Namespace: rec.set.Namespace, Labels: rec.set.Labels, NodeName: rec.nodeName, Countable: rec.countable})
 	ix.bumpLocked()
 	return true
 }
@@ -237,6 +286,11 @@ func (ix *Index) acquireSetLocked(namespace string, l map[string]string) *labelS
 			ix.nsSets[namespace] = sets
 		}
 		sets[set] = struct{}{}
+		for _, g := range ix.nsGroups[namespace] {
+			if g.selects(set.Namespace, set.Labels) {
+				set.Data.groups = append(set.Data.groups, g)
+			}
+		}
 	}
 	return set
 }
@@ -257,11 +311,15 @@ func (ix *Index) countLocked(rec *podRec) {
 	if !rec.countable {
 		return
 	}
+	ix.countable++
 	rec.setPos = len(rec.set.Data.pods)
 	rec.set.Data.pods = append(rec.set.Data.pods, rec)
 	n := ix.nodeLocked(rec.nodeName)
 	rec.nodePos = len(n.pods)
 	n.pods = append(n.pods, rec)
+	for _, g := range rec.set.Data.groups {
+		ix.addLocked(g, n, 1)
+	}
 }
 
 // uncountLocked removes a countable pod from its label set's and node's postings
@@ -269,10 +327,20 @@ func (ix *Index) uncountLocked(rec *podRec) {
 	if !rec.countable {
 		return
 	}
-	rec.set.Data.pods = removeAt(rec.set.Data.pods, rec.setPos, func(moved *podRec) { moved.setPos = rec.setPos })
+	ix.countable--
 	n := ix.nodes[rec.nodeName]
+	for _, g := range rec.set.Data.groups {
+		ix.addLocked(g, n, -1)
+	}
+	rec.set.Data.pods = removeAt(rec.set.Data.pods, rec.setPos, func(moved *podRec) { moved.setPos = rec.setPos })
 	n.pods = removeAt(n.pods, rec.nodePos, func(moved *podRec) { moved.nodePos = rec.nodePos })
 	ix.gcNodeLocked(n)
+}
+
+func (ix *Index) addLocked(g *group, n *nodeRec, delta int32) {
+	if g.add(n, delta) {
+		ix.changedGroups = append(ix.changedGroups, g)
+	}
 }
 
 // removeAt removes s[i] by moving the last element into its place, calling moved for the element that moved.
@@ -321,10 +389,31 @@ func (ix *Index) observeNodeLocked(node *corev1.Node) bool {
 	if n.node != nil && maps.Equal(n.node.Labels, node.Labels) && taintsEqual(n.node.Taints, node.Spec.Taints) {
 		return false
 	}
-	n.node = &Node{Name: node.Name, Labels: maps.Clone(node.Labels), Taints: slices.Clone(node.Spec.Taints)}
+	ix.setNodeLocked(n, &Node{Name: node.Name, Labels: maps.Clone(node.Labels), Taints: slices.Clone(node.Spec.Taints)})
 	ix.nodeFacts.Set(n.name, n.node)
 	ix.bumpLocked()
 	return true
+}
+
+// setNodeLocked replaces the Node of a node record, moving the counts of the pods bound to it from the old Node's
+// domains to the new Node's.
+func (ix *Index) setNodeLocked(n *nodeRec, node *Node) {
+	for _, rec := range n.pods {
+		for _, g := range rec.set.Data.groups {
+			ix.addLocked(g, n, -1)
+		}
+	}
+	if n.node != nil {
+		for _, g := range ix.groups {
+			delete(g.filterMemo, n.node)
+		}
+	}
+	n.node = node
+	for _, rec := range n.pods {
+		for _, g := range rec.set.Data.groups {
+			ix.addLocked(g, n, 1)
+		}
+	}
 }
 
 // taintsEqual compares the taint fields that topology reads: Taints.Tolerates only reads the key, value and effect.
@@ -349,7 +438,7 @@ func (ix *Index) deleteNodeLocked(name string) bool {
 	if !ok || n.node == nil {
 		return false
 	}
-	n.node = nil
+	ix.setNodeLocked(n, nil)
 	n.rv = ""
 	ix.nodeFacts.Delete(name)
 	ix.gcNodeLocked(n)

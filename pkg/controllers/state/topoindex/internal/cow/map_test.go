@@ -102,11 +102,13 @@ func TestFreezeSharesUnchangedShards(t *testing.T) {
 		m.Set(fmt.Sprintf("k%d", i), i)
 	}
 	v1 := m.Freeze()
+	if v2 := m.Freeze(); v2 != v1 {
+		t.Fatal("freezing without a write should return the same view")
+	}
+	m.Set("k1", 1) // same value: still a write
 	v2 := m.Freeze()
-	for i := range v1.shards {
-		if v1.shards[i] != v2.shards[i] {
-			t.Fatalf("shard %d was copied without a write", i)
-		}
+	if v2 == v1 {
+		t.Fatal("freezing after a write should return a new view")
 	}
 	m.Set("k0", -1)
 	v3 := m.Freeze()
