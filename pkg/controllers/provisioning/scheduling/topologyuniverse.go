@@ -131,7 +131,9 @@ func (u *keyUniverse) seed(policy corev1.NodeInclusionPolicy, tolerations []core
 	for i, taints := range u.taintSets {
 		tolerated[i] = taints.Tolerates(tolerations) == nil
 	}
-	s := u.newSeed(func(d universeDomain) bool { return slices.ContainsFunc(d.taintSets, func(i int) bool { return tolerated[i] }) })
+	s := u.newSeed(func(d universeDomain) bool {
+		return slices.ContainsFunc(d.taintSets, func(i int) bool { return tolerated[i] })
+	})
 	u.seeds[signature] = s
 	return s
 }
