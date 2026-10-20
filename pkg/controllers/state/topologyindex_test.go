@@ -17,6 +17,7 @@ limitations under the License.
 package state_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -29,9 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -89,6 +93,42 @@ var _ = Describe("Topology Index", func() {
 	})
 	AfterEach(func() {
 		cluster.SetTopologyIndex(nil)
+	})
+
+	It("should be fed by informer event handlers", func() {
+		mgr, err := manager.New(env.Config, manager.Options{Metrics: server.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+		Expect(err).ToNot(HaveOccurred())
+		fed := topoindex.New()
+		Expect(informer.NewTopologyIndexController(fed).Register(ctx, mgr)).To(Succeed())
+		mgrCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			defer GinkgoRecover()
+			Expect(mgr.Start(mgrCtx)).To(Succeed())
+		}()
+		Eventually(fed.Synced).Should(BeTrue())
+
+		node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{corev1.LabelTopologyZone: "zone-a"}}})
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "fed"}}, NodeName: node.Name})
+		ExpectApplied(ctx, env.Client, node, pod)
+		spec := topoindex.GroupSpec{TopologyKey: corev1.LabelTopologyZone, Namespaces: []string{pod.Namespace}, Selector: labels.SelectorFromSet(labels.Set{"app": "fed"})}
+		counts := func() map[string]int32 {
+			_, c := fed.Register(spec)
+			return c.Counts()
+		}
+		Eventually(counts).Should(Equal(map[string]int32{"zone-a": 1}))
+
+		stored := &corev1.Node{}
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), stored)).To(Succeed())
+		stored.Labels[corev1.LabelTopologyZone] = "zone-b"
+		Expect(env.Client.Update(ctx, stored)).To(Succeed())
+		Eventually(counts).Should(Equal(map[string]int32{"zone-b": 1}))
+
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+		pod.Finalizers = nil
+		Expect(env.Client.Update(ctx, pod)).To(Succeed())
+		Expect(env.Client.Delete(ctx, pod)).To(Succeed())
+		Eventually(counts).Should(BeEmpty())
 	})
 
 	It("should hydrate from the API server", func() {
