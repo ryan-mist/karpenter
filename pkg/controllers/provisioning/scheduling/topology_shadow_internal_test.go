@@ -164,9 +164,25 @@ func (g *identityGen) runShadow(ctx context.Context, f *topologyFixture, policy 
 		candidates = append(candidates, newNodeClaim(i))
 	}
 
+	// the pods' requirements are kept until they're relaxed, as in the scheduler's pod data, and planned once up front,
+	// so those plans go stale as soon as a pod is recorded
+	strict := map[*corev1.Pod]scheduling.Requirements{}
+	for _, p := range f.pods {
+		strict[p] = scheduling.NewStrictPodRequirements(p)
+		s.BeginPod(p, strict[p])
+	}
 	for i, p := range f.pods {
 		for attempt := range 3 {
-			podRequirements := scheduling.NewStrictPodRequirements(p)
+			podRequirements := strict[p]
+			// most attempts plan the pod, as the scheduler does. The rest leave a stale plan (from before other pods were
+			// recorded) or plan with other requirements, which AddRequirements must not use.
+			switch g.r.Intn(6) {
+			case 0:
+			case 1:
+				s.BeginPod(p, scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, g.zone())))
+			default:
+				s.BeginPod(p, podRequirements)
+			}
 			s.GetTopologyZoneConstraints(p, scheduling.NewPodRequirements(p))
 			// every candidate is tried concurrently, as in the scheduler's parallel rounds
 			results := make([]scheduling.Requirements, len(candidates))
@@ -204,6 +220,7 @@ func (g *identityGen) runShadow(ctx context.Context, f *topologyFixture, policy 
 				p.Spec.Tolerations = append(p.Spec.Tolerations, corev1.Toleration{Key: g.taintKey(), Operator: corev1.TolerationOpExists})
 			}
 			_ = s.Update(ctx, p)
+			strict[p] = scheduling.NewStrictPodRequirements(p)
 		}
 	}
 	stats.ordered += int(s.ordered.Load())

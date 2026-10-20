@@ -34,6 +34,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
+const (
+	topologyEngineLegacy  = "legacy"
+	topologyEngineOverlay = "overlay"
+)
+
 // Topology tracks the topology spread constraints and pod (anti-)affinities of the pods being scheduled, along with
 // the counts of the existing pods they select, and tightens the requirements of the nodes the pods schedule to so the
 // constraints are met. It delegates to an implementation so that an implementation can be checked against the legacy
@@ -51,6 +56,7 @@ type topologyImpl interface {
 	GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool)
 	Register(topologyKey string, domain string)
 	Unregister(topologyKey string, domain string)
+	BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements)
 }
 
 func NewTopology(
@@ -66,6 +72,13 @@ func NewTopology(
 	o := option.Resolve(opts...)
 	if report := shadowReporter(ctx); report != nil {
 		impl, err := newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report)
+		if err != nil {
+			return nil, err
+		}
+		return &Topology{impl: impl}, nil
+	}
+	if o.topologyEngine == topologyEngineOverlay {
+		impl, err := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
 		if err != nil {
 			return nil, err
 		}
@@ -113,6 +126,12 @@ func (t *Topology) Register(topologyKey string, domain string) {
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *Topology) Unregister(topologyKey string, domain string) {
 	t.impl.Unregister(topologyKey, domain)
+}
+
+// BeginPod prepares the topology for the scheduler to try the pod, with its strict requirements, on candidate nodes
+// in parallel. AddRequirements calls with the same requirements are cheaper afterwards; it isn't required.
+func (t *Topology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements) {
+	t.impl.BeginPod(p, podRequirements)
 }
 
 // domainSource is a NodePool's contribution to the universe of domains: the domains its instance types can launch
