@@ -24,34 +24,36 @@ import (
 	"github.com/samber/lo"
 
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
 
 type OptionsFields struct {
 	// Vendor Neutral
-	ServiceName                      *string
-	MetricsPort                      *int
-	HealthProbePort                  *int
-	KubeClientQPS                    *int
-	KubeClientBurst                  *int
-	EnableProfiling                  *bool
-	DisableControllerWarmup          *bool
-	DisableLeaderElection            *bool
-	DisableClusterStateObservability *bool
-	LeaderElectionName               *string
-	LeaderElectionNamespace          *string
-	MemoryLimit                      *int64
-	CPURequests                      *int64
-	LogLevel                         *string
-	LogOutputPaths                   *string
-	LogErrorOutputPaths              *string
-	PreferencePolicy                 *options.PreferencePolicy
-	MinValuesPolicy                  *options.MinValuesPolicy
-	BatchMaxDuration                 *time.Duration
-	BatchIdleDuration                *time.Duration
-	IgnoreDRARequests                *bool
-	LegacyNodeRepair                 *bool
-	FeatureGates                     FeatureGates
-	SchedulerConfig                  *options.SchedulerConfiguration
+	ServiceName                         *string
+	MetricsPort                         *int
+	HealthProbePort                     *int
+	KubeClientQPS                       *int
+	KubeClientBurst                     *int
+	EnableProfiling                     *bool
+	DisableControllerWarmup             *bool
+	DisableLeaderElection               *bool
+	DisableClusterStateObservability    *bool
+	LeaderElectionName                  *string
+	LeaderElectionNamespace             *string
+	MemoryLimit                         *int64
+	CPURequests                         *int64
+	LogLevel                            *string
+	LogOutputPaths                      *string
+	LogErrorOutputPaths                 *string
+	PreferencePolicy                    *options.PreferencePolicy
+	MinValuesPolicy                     *options.MinValuesPolicy
+	BatchMaxDuration                    *time.Duration
+	BatchIdleDuration                   *time.Duration
+	IgnoreDRARequests                   *bool
+	LegacyNodeRepair                    *bool
+	TopologyIndexDifferentialSampleRate *float64
+	FeatureGates                        FeatureGates
+	SchedulerConfig                     *options.SchedulerConfiguration
 }
 
 type FeatureGates struct {
@@ -97,7 +99,10 @@ func Options(overrides ...OptionsFields) *options.Options {
 		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
 		LegacyNodeRepair:                 lo.FromPtrOr(opts.LegacyNodeRepair, false),
-		SchedulerConfig:                  opts.SchedulerConfig,
+		// suites run the topology index's differential mode with TOPOLOGY_INDEX_DIFFERENTIAL_SAMPLE_RATE (see
+		// ExpectTopologyIndexFromEnv)
+		TopologyIndexDifferentialSampleRate: lo.FromPtrOr(opts.TopologyIndexDifferentialSampleRate, env.WithDefaultFloat64("TOPOLOGY_INDEX_DIFFERENTIAL_SAMPLE_RATE", 0)),
+		SchedulerConfig:                     opts.SchedulerConfig,
 		FeatureGates: options.FeatureGates{
 			NodeRepair:                lo.FromPtrOr(opts.FeatureGates.NodeRepair, options.NodeRepairFeatureGate.Default),
 			ReservedCapacity:          lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, options.ReservedCapacityFeatureGate.Default),

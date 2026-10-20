@@ -104,9 +104,10 @@ type nodeRec struct {
 // which only takes mu when something changed since the last one. The index has a generation that increases when a
 // fact changes or a group is registered, so a resync or a status-only update doesn't bump it.
 type Index struct {
-	clock     clock.Clock
-	ttl       time.Duration
-	maxGroups int
+	clock             clock.Clock
+	ttl               time.Duration
+	maxGroups         int
+	beforeCountSource func(*Index)
 
 	mu   sync.Mutex
 	gen  uint64
@@ -153,6 +154,12 @@ type Option func(*Index)
 // WithClock sets the clock used to age out unused groups.
 func WithClock(clk clock.Clock) Option {
 	return func(ix *Index) { ix.clock = clk }
+}
+
+// WithBeforeCountSource sets a function that's called whenever a count source is created over the index. Tests use it
+// to hydrate the index from the API server before each scheduling simulation, since they don't run informers.
+func WithBeforeCountSource(fn func(*Index)) Option {
+	return func(ix *Index) { ix.beforeCountSource = fn }
 }
 
 // WithGroupLimits sets how long a registered group is kept without being read, and how many groups are kept at most.

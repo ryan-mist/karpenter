@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
@@ -114,5 +115,71 @@ var _ = Describe("index CountSource", func() {
 		Expect(ok).To(BeFalse())
 		_, ok = topoindex.NewCountSource(nil, nil)
 		Expect(ok).To(BeFalse())
+	})
+})
+
+// differentialMismatches returns the total of karpenter_scheduler_topology_index_differential_mismatches_total
+func differentialMismatches() float64 {
+	GinkgoHelper()
+	families, err := crmetrics.Registry.Gather()
+	Expect(err).ToNot(HaveOccurred())
+	total := 0.0
+	for _, mf := range families {
+		if mf.GetName() == "karpenter_scheduler_topology_index_differential_mismatches_total" {
+			for _, m := range mf.GetMetric() {
+				total += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return total
+}
+
+var _ = Describe("index CountSource differential mode", func() {
+	It("should answer like the list source and only count mismatches when the index is stale", func() {
+		ctx := karpopts.ToContext(context.Background(), test.Options())
+		stale := 0.0
+		for seed := range int64(200) {
+			g := &identityGen{topologyIndexGen{r: rand.New(rand.NewSource(seed))}}
+			f := g.fixture(ctx)
+			legacy, err := newLegacyTopology(ctx, f.client, f.cluster, f.stateNodes, f.nodePools, f.instanceTypes, f.pods, &options{})
+			Expect(err).ToNot(HaveOccurred())
+			index := topoindex.New()
+			f.cluster.SetTopologyIndex(index)
+			pods, nodes, namespaces := &corev1.PodList{}, &corev1.NodeList{}, &corev1.NamespaceList{}
+			Expect(f.client.List(ctx, pods)).To(Succeed())
+			Expect(f.client.List(ctx, nodes)).To(Succeed())
+			Expect(f.client.List(ctx, namespaces)).To(Succeed())
+			index.Hydrate(lo.ToSlicePtr(pods.Items), lo.ToSlicePtr(nodes.Items), lo.ToSlicePtr(namespaces.Items))
+			var keys []*topology.CountKey
+			for _, tg := range legacy.topologyGroups {
+				keys = append(keys, topology.NewCountKey(tg.Key, sets.List(tg.namespaces), tg.rawSelector, newTopologyNodePredicate(tg.nodeFilter)))
+			}
+			check := func() {
+				excluded := topology.NewExcludedPods(f.pods)
+				list := newListCountSource(f.client, f.cluster, excluded)
+				src, ok := topoindex.NewCountSource(index, newListCountSource(f.client, f.cluster, excluded))
+				Expect(ok).To(BeTrue())
+				src.Differential()
+				for _, key := range keys {
+					Expect(sourceCounts(ctx, src, key, excluded)).To(Equal(sourceCounts(ctx, list, key, excluded)), "seed %d", seed)
+				}
+				Expect(sourceInverseTerms(ctx, src, excluded)).To(Equal(sourceInverseTerms(ctx, list, excluded)), "seed %d", seed)
+			}
+			before := differentialMismatches()
+			check()
+			Expect(differentialMismatches()).To(Equal(before), "seed %d: mismatches against a fresh index", seed)
+
+			// the index misses a counted pod's deletion
+			for i := range pods.Items {
+				if pods.Items[i].Spec.NodeName != "" && !IgnoredForTopology(&pods.Items[i]) {
+					Expect(f.client.Delete(ctx, &pods.Items[i])).To(Succeed())
+					break
+				}
+			}
+			before = differentialMismatches()
+			check()
+			stale += differentialMismatches() - before
+		}
+		Expect(stale).To(BeNumerically(">", 0))
 	})
 })

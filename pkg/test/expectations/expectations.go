@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
@@ -65,6 +66,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
@@ -927,6 +929,25 @@ func ExpectTopologyStateHydrated(ctx context.Context, c client.Client, cluster *
 	namespaces := &corev1.NamespaceList{}
 	Expect(c.List(ctx, namespaces)).To(Succeed())
 	index.Hydrate(lo.ToSlicePtr(pods.Items), lo.ToSlicePtr(nodes.Items), lo.ToSlicePtr(namespaces.Items))
+}
+
+// ExpectTopologyIndexFromEnv enables cluster state's topology index when KARPENTER_TOPOLOGY_INDEX=true, hydrating it from
+// the API server before every scheduling simulation, so a suite can be run with scheduling reading topology counts
+// from the index instead of listing pods.
+func ExpectTopologyIndexFromEnv(ctx context.Context, c client.Client, cluster *state.Cluster) {
+	GinkgoHelper()
+	if os.Getenv("KARPENTER_TOPOLOGY_INDEX") != "true" {
+		return
+	}
+	cluster.SetTopologyIndex(topoindex.New(topoindex.WithBeforeCountSource(func(index *topoindex.Index) {
+		pods, nodes, namespaces := &corev1.PodList{}, &corev1.NodeList{}, &corev1.NamespaceList{}
+		if c.List(ctx, pods) != nil || c.List(ctx, nodes) != nil || c.List(ctx, namespaces) != nil {
+			// the simulation falls back to listing pods
+			index.SetSynced(false)
+			return
+		}
+		index.Hydrate(lo.ToSlicePtr(pods.Items), lo.ToSlicePtr(nodes.Items), lo.ToSlicePtr(namespaces.Items))
+	})))
 }
 
 func ExpectManualBinding(ctx context.Context, c client.Client, pod *corev1.Pod, node *corev1.Node) {

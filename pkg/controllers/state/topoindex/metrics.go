@@ -37,6 +37,11 @@ const (
 	resultNoop = "noop"
 	resultDiff = "diff"
 
+	causeLabel         = "cause"
+	mismatchCounts     = "counts"
+	mismatchInverse    = "inverse"
+	schedulerSubsystem = "scheduler"
+
 	resultHit        = "hit"
 	resultRegistered = "registered"
 	resultCollision  = "collision"
@@ -165,6 +170,40 @@ var (
 		opmetrics.Alpha,
 	)
 
+	mismatchCause = opmetrics.Label{
+		Name: causeLabel,
+		Help: "What differed between the topology index and listing pods.",
+		Values: []opmetrics.Value{
+			{Name: mismatchCounts, Help: "A topology group's counts of existing pods, net of the pods the simulation schedules."},
+			{Name: mismatchInverse, Help: "The required anti-affinity terms of existing pods, their owners or their counts."},
+		},
+	}
+	DifferentialChecksTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "topology_index_differential_checks_total",
+			Help:      "Number of scheduling simulations that compared the topology index with listing pods (--topology-index-differential-sample-rate).",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	DifferentialMismatchesTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "topology_index_differential_mismatches_total",
+			Help:      "Number of differences between the topology index and listing pods found in compared simulations. Labeled by what differed.",
+		},
+		[]opmetrics.Label{mismatchCause},
+		opmetrics.Alpha,
+	)
+	mismatchLabels = map[string]map[string]string{
+		mismatchCounts:  {causeLabel: mismatchCounts},
+		mismatchInverse: {causeLabel: mismatchInverse},
+	}
 	lookupResult = opmetrics.Label{
 		Name: resultLabel,
 		Help: "How a scheduling simulation's topology group was answered.",
