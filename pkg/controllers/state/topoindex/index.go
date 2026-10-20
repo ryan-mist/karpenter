@@ -42,6 +42,7 @@ const (
 	nodeShards      = 256
 	namespaceShards = 16
 	groupShards     = 64
+	inverseShards   = 64
 )
 
 // PodFact is what the index knows about a pod.
@@ -131,6 +132,13 @@ type Index struct {
 	// changedGroups are the groups whose counts changed since the last snapshot
 	changedGroups []*group
 	lastGC        time.Time
+	// the inverse anti-affinity view, see inverse.go
+	invOwners    map[types.NamespacedName]*invOwner
+	invNodes     map[string]*invNode
+	invTerms     map[string]*invTerm
+	changedTerms map[string]struct{}
+	inverseTerms *cow.Map[string, *InverseTerm]
+
 	// synced is set by Hydrate and SetSynced, for indexes that aren't fed by informer event handlers
 	synced atomic.Bool
 
@@ -175,6 +183,7 @@ func (ix *Index) resetLocked() {
 	ix.nsGroups = map[string][]*group{}
 	ix.frozenGroups = cow.NewMap[GroupKey, *GroupCounts](groupShards)
 	ix.changedGroups = nil
+	ix.resetInverseLocked()
 	ix.synced.Store(false)
 }
 

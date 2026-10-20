@@ -451,6 +451,9 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	}
 	c.nodes[node.Spec.ProviderID] = n
 	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
+	if index := c.topologyIndex.Load(); index != nil {
+		index.SetStateNode(node.Name, node)
+	}
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 	return nil
 }
@@ -631,6 +634,9 @@ func (c *Cluster) DeletePod(podKey types.NamespacedName) {
 	defer c.mu.Unlock()
 
 	c.antiAffinityPods.Delete(podKey)
+	if index := c.topologyIndex.Load(); index != nil {
+		index.SetAntiAffinityPod(podKey, nil, "", false, nil)
+	}
 	c.updateNodeUsageFromPodCompletion(podKey)
 	c.ClearPodSchedulingMappings(podKey)
 	c.MarkUnconsolidated()
@@ -852,6 +858,9 @@ func (c *Cluster) cleanupNode(name string) {
 			c.updateNodePoolResources(oldNode, c.nodes[id])
 		}
 		delete(c.nodeNameToProviderID, name)
+		if index := c.topologyIndex.Load(); index != nil {
+			index.SetStateNode(name, nil)
+		}
 		c.MarkUnconsolidated()
 	}
 }
@@ -960,7 +969,7 @@ func (c *Cluster) populateResourceRequests(ctx context.Context, n *StateNode) er
 			return err
 		}
 		c.cleanupOldBindings(pod)
-		c.bindings[client.ObjectKeyFromObject(pod)] = pod.Spec.NodeName
+		c.setBinding(client.ObjectKeyFromObject(pod), pod.Spec.NodeName)
 	}
 	return nil
 }
@@ -982,7 +991,7 @@ func (c *Cluster) updateNodeUsageFromPod(ctx context.Context, pod *corev1.Pod) e
 		return err
 	}
 	c.cleanupOldBindings(pod)
-	c.bindings[client.ObjectKeyFromObject(pod)] = pod.Spec.NodeName
+	c.setBinding(client.ObjectKeyFromObject(pod), pod.Spec.NodeName)
 	return nil
 }
 
@@ -993,7 +1002,7 @@ func (c *Cluster) updateNodeUsageFromPodCompletion(podKey types.NamespacedName) 
 		return
 	}
 
-	delete(c.bindings, podKey)
+	c.deleteBinding(podKey)
 	n, ok := c.nodes[c.nodeNameToProviderID[nodeName]]
 	if !ok {
 		// we weren't tracking the node yet, so nothing to do
@@ -1013,7 +1022,7 @@ func (c *Cluster) cleanupOldBindings(pod *corev1.Pod) {
 		if oldNode, ok := c.nodes[c.nodeNameToProviderID[oldNodeName]]; ok {
 			// we were tracking the old node, so we need to reduce its capacity by the amount of the pod that left
 			oldNode.cleanupForPod(client.ObjectKeyFromObject(pod))
-			delete(c.bindings, client.ObjectKeyFromObject(pod))
+			c.deleteBinding(client.ObjectKeyFromObject(pod))
 		}
 	}
 	// new pod binding has occurred
@@ -1025,11 +1034,44 @@ func (c *Cluster) updatePodAntiAffinities(pod *corev1.Pod) {
 	// required to enforce them so it just adds complexity for very little
 	// value. The problem with them comes from the relaxation process, the pod
 	// we are relaxing is not the pod with the anti-affinity term.
-	if podKey := client.ObjectKeyFromObject(pod); podutils.HasRequiredPodAntiAffinity(pod) {
-		c.antiAffinityPods.Store(podKey, pod)
-	} else {
+	podKey := client.ObjectKeyFromObject(pod)
+	if !podutils.HasRequiredPodAntiAffinity(pod) {
 		c.antiAffinityPods.Delete(podKey)
+		if index := c.topologyIndex.Load(); index != nil {
+			index.SetAntiAffinityPod(podKey, nil, "", false, nil)
+		}
+		return
 	}
+	c.antiAffinityPods.Store(podKey, pod)
+	if index := c.topologyIndex.Load(); index != nil {
+		nodeName, bound := c.bindings[podKey]
+		index.SetAntiAffinityPod(podKey, pod, nodeName, bound, c.stateNodeByName(nodeName))
+	}
+}
+
+// setBinding and deleteBinding are the only writers of c.bindings, so the topology index's inverse anti-affinity view
+// sees every binding ForPodsWithAntiAffinity would.
+func (c *Cluster) setBinding(podKey types.NamespacedName, nodeName string) {
+	c.bindings[podKey] = nodeName
+	if index := c.topologyIndex.Load(); index != nil {
+		index.SetBinding(podKey, nodeName, true, c.stateNodeByName(nodeName))
+	}
+}
+
+func (c *Cluster) deleteBinding(podKey types.NamespacedName) {
+	delete(c.bindings, podKey)
+	if index := c.topologyIndex.Load(); index != nil {
+		index.SetBinding(podKey, "", false, nil)
+	}
+}
+
+// stateNodeByName returns the Node cluster state has under the name, the way ForPodsWithAntiAffinity looks it up, or
+// nil if it has none.
+func (c *Cluster) stateNodeByName(name string) *corev1.Node {
+	if n, ok := c.nodes[c.nodeNameToProviderID[name]]; ok {
+		return n.Node
+	}
+	return nil
 }
 
 func (c *Cluster) triggerConsolidationOnChange(old, new *StateNode) {

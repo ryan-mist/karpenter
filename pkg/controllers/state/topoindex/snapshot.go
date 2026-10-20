@@ -46,6 +46,7 @@ type Snapshot struct {
 	pods       *cow.View[types.UID, *PodFact]
 	nodes      *cow.View[string, *Node]
 	namespaces *cow.View[string, *Namespace]
+	inverse    *cow.View[string, *InverseTerm]
 	clock      clock.PassiveClock
 }
 
@@ -92,6 +93,12 @@ func (s *Snapshot) NamespacesMatching(selector labels.Selector) sets.Set[string]
 		return true
 	})
 	return names
+}
+
+// InverseTerms calls fn for every required anti-affinity term of the pods that cluster state tracks as bound to a Node
+// it has, with the counts of those pods. These are the pods Cluster.ForPodsWithAntiAffinity yields.
+func (s *Snapshot) InverseTerms(fn func(*InverseTerm) bool) {
+	s.inverse.All(func(_ string, t *InverseTerm) bool { return fn(t) })
 }
 
 // Contribution returns the domain the counts of the group include the pod in, or false if they don't include it.
@@ -209,6 +216,7 @@ func (ix *Index) publishLocked() *Snapshot {
 		}
 	}
 	ix.changedGroups = ix.changedGroups[:0]
+	ix.freezeInverseLocked()
 	if last := ix.pub.Load(); last != nil && last.gen == ix.gen {
 		return last
 	}
@@ -218,6 +226,7 @@ func (ix *Index) publishLocked() *Snapshot {
 		pods:       ix.podFacts.Freeze(),
 		nodes:      ix.nodeFacts.Freeze(),
 		namespaces: ix.namespaces.Freeze(),
+		inverse:    ix.inverseTerms.Freeze(),
 		clock:      ix.clock,
 	}
 	ix.pub.Store(s)
