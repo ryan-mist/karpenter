@@ -130,16 +130,24 @@ func newDomainSources(nodePools []*v1.NodePool, instanceTypes map[string][]*clou
 	return sources
 }
 
-// insertDomains inserts the NodePool's domains for the topology key into the domain group. For each instance type, the
+// insertDomains inserts the NodePool's domains for the topology key into the domain group, each once with the
+// NodePool's taints.
+func (s domainSource) insertDomains(domainGroup TopologyDomainGroup, topologyKey string) {
+	s.forEachDomain(topologyKey, func(domain string) {
+		domainGroup.Insert(domain, s.taints...)
+	})
+}
+
+// forEachDomain calls f once for each of the NodePool's domains for the topology key. For each instance type, the
 // domains are the values of the instance type's requirement intersected with the NodePool's, or the values of whichever
 // requirement exists if only one does. The values of a NodePool In requirement are always domains, even if the
-// NodePool has no instance types. Each domain is inserted once with the NodePool's taints.
-func (s domainSource) insertDomains(domainGroup TopologyDomainGroup, topologyKey string) {
+// NodePool has no instance types.
+func (s domainSource) forEachDomain(topologyKey string, f func(domain string)) {
 	requirement := s.requirements[topologyKey]
 	// If the NodePool's requirement is concrete, every instance type's domains are a subset of its values
 	if requirement != nil && (requirement.Operator() == corev1.NodeSelectorOpIn || requirement.Operator() == corev1.NodeSelectorOpDoesNotExist) {
 		for domain := range requirement.ValuesSeq() {
-			domainGroup.Insert(domain, s.taints...)
+			f(domain)
 		}
 		return
 	}
@@ -166,7 +174,7 @@ func (s domainSource) insertDomains(domainGroup TopologyDomainGroup, topologyKey
 		}
 	}
 	for domain := range domains {
-		domainGroup.Insert(domain, s.taints...)
+		f(domain)
 	}
 }
 
