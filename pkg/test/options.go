@@ -65,6 +65,7 @@ type FeatureGates struct {
 	TerminateFirstRepair      *bool
 	PodDeletionCostManagement *bool
 	PredictionEnabled         *bool
+	TopologyIndex             *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -108,6 +109,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 			TerminateFirstRepair:      lo.FromPtrOr(opts.FeatureGates.TerminateFirstRepair, options.TerminateFirstRepairFeatureGate.Default),
 			PodDeletionCostManagement: lo.FromPtrOr(opts.FeatureGates.PodDeletionCostManagement, options.PodDeletionCostManagementFeatureGate.Default),
 			PredictionEnabled:         lo.FromPtrOr(opts.FeatureGates.PredictionEnabled, options.PredictionEnabledFeatureGate.Default),
+			TopologyIndex:             lo.FromPtrOr(opts.FeatureGates.TopologyIndex, options.TopologyIndexFeatureGate.Default),
 		},
 	}
 }

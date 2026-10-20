@@ -46,6 +46,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/topoindex"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -103,6 +104,9 @@ type Cluster struct {
 	// into the pending set. Any replacement must fit both real and virtual pods.
 	bufferPodCountsMu sync.RWMutex
 	bufferPodCounts   map[string]int
+
+	// topologyIndex is the topology fact index, or nil when the TopologyIndex feature gate is off
+	topologyIndex atomic.Pointer[topoindex.Index]
 }
 
 type ClusterOptions struct {
@@ -290,6 +294,16 @@ func (c *Cluster) DeepCopyNodes() StateNodes {
 	return lo.Map(lo.Values(c.nodes), func(n *StateNode, _ int) *StateNode {
 		return n.DeepCopy()
 	})
+}
+
+// SetTopologyIndex sets the topology fact index that scheduling reads topology counts from.
+func (c *Cluster) SetTopologyIndex(index *topoindex.Index) {
+	c.topologyIndex.Store(index)
+}
+
+// TopologyIndex returns the topology fact index, or nil when the TopologyIndex feature gate is off.
+func (c *Cluster) TopologyIndex() *topoindex.Index {
+	return c.topologyIndex.Load()
 }
 
 // RepairPolicyMatcher returns the matcher cluster state matches Nodes with, or nil when node repair is disabled.
@@ -691,6 +705,9 @@ func (c *Cluster) Reset() {
 	c.podsSchedulableTimes = sync.Map{}
 	c.podToNodeClaim = sync.Map{}
 	c.bufferPodCounts = map[string]int{}
+	if index := c.topologyIndex.Load(); index != nil {
+		index.Reset()
+	}
 }
 
 // sets the cluster to be synced or unsynced for unit testing

@@ -366,6 +366,7 @@ var _ = Describe("Options", func() {
 			Entry("when CapacityBuffer is overridden", "CapacityBuffer"),
 			Entry("when TerminateFirstDrift is overridden", "TerminateFirstDrift"),
 			Entry("when TerminateFirstRepair is overridden", "TerminateFirstRepair"),
+			Entry("when TopologyIndex is overridden", "TopologyIndex"),
 		)
 	})
 
