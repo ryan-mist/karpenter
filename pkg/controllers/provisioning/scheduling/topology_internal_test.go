@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -64,15 +65,15 @@ var _ = Describe("Topology domain groups", func() {
 		})
 	}
 
-	// domainGroups reads each topology key's domains through a Topology's lazily built domain groups.
+	// domainGroups reads each topology key's domains through a legacyTopology's lazily built domain groups.
 	domainGroups := func(nodePools []*v1.NodePool, its map[string][]*cloudprovider.InstanceType, keys ...string) map[string]TopologyDomainGroup {
-		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources(nodePools, its)}
+		t := &legacyTopology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources(nodePools, its)}
 		return lo.SliceToMap(keys, func(key string) (string, TopologyDomainGroup) { return key, t.domainGroup(key) })
 	}
 
 	It("should only build the domains of the topology keys that are read", func() {
 		np := nodePool("tainted", []corev1.Taint{taint("a")})
-		t := &Topology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(10)})}
+		t := &legacyTopology{domainGroups: map[string]TopologyDomainGroup{}, domainSources: newDomainSources([]*v1.NodePool{np}, map[string][]*cloudprovider.InstanceType{np.Name: instanceTypes(10)})}
 		zones := t.domainGroup(corev1.LabelTopologyZone)
 		Expect(sets.KeySet(zones)).To(Equal(sets.New("z1", "z2", "z3")))
 		Expect(sets.KeySet(t.domainGroups)).To(Equal(sets.New(corev1.LabelTopologyZone)))
@@ -138,10 +139,32 @@ var _ = Describe("Topology domain groups", func() {
 			}
 		}
 	})
+	It("should seed sparse keys by name", func() {
+		sparseKey := "test.example.com/many-domains"
+		topology.Dict(sparseKey).InternAll(lo.Times(topology.MaxDenseDomains+1, func(i int) string { return fmt.Sprint("filler-", i) })...)
+		nodePools := []*v1.NodePool{
+			nodePool("a", []corev1.Taint{taint("a")}, corev1.NodeSelectorRequirement{Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"h1", "h2"}},
+				corev1.NodeSelectorRequirement{Key: sparseKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"x", "y"}}),
+			nodePool("b", nil, corev1.NodeSelectorRequirement{Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"h2", "h3"}},
+				corev1.NodeSelectorRequirement{Key: sparseKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"y"}}),
+		}
+		its := map[string][]*cloudprovider.InstanceType{"a": instanceTypes(2), "b": instanceTypes(2)}
+		sources := newDomainSources(nodePools, its)
+		for key, want := range map[string][2]sets.Set[string]{
+			corev1.LabelHostname: {sets.New("h1", "h2", "h3"), sets.New("h2", "h3")},
+			sparseKey:            {sets.New("x", "y"), sets.New("y")},
+		} {
+			u := newKeyUniverse(key, sources)
+			Expect(u.dense).To(BeFalse())
+			Expect(universeSeedNames(u, u.seed(corev1.NodeInclusionPolicyIgnore, nil))).To(Equal(want[0]))
+			Expect(universeSeedNames(u, u.seed(corev1.NodeInclusionPolicyHonor, nil))).To(Equal(want[1]))
+			Expect(universeSeedNames(u, u.seed(corev1.NodeInclusionPolicyHonor, []corev1.Toleration{{Key: "a", Operator: corev1.TolerationOpExists}}))).To(Equal(want[0]))
+		}
+	})
 	It("should build the same domain groups as intersecting requirements per instance type", func() {
 		keys := []string{corev1.LabelTopologyZone, v1.CapacityTypeLabelKey, corev1.LabelArchStable, fake.IntegerInstanceLabelKey, fake.LabelInstanceSize, "custom/team", "custom/int"}
 		values := []string{"test-zone-1", "test-zone-2", "test-zone-3", "test-zone-4", "spot", "on-demand", "reserved", "amd64", "arm64", "a", "b", "1", "2", "3", "5", "8", "13", "small", "large"}
-		taintSets := [][]corev1.Taint{nil, {taint("a")}, {taint("a"), taint("b")}, {taint("b"), taint("a")}, {{Key: "c", Effect: corev1.TaintEffectPreferNoSchedule}}}
+		taintSets := [][]corev1.Taint{nil, {taint("a")}, {taint("a"), taint("b")}, {taint("b"), taint("a")}, {{Key: "c", Effect: corev1.TaintEffectPreferNoSchedule}}, {{Key: "a", Value: "other", Effect: corev1.TaintEffectNoExecute}}}
 		randomRequirement := func(r *rand.Rand) v1.NodeSelectorRequirementWithMinValues {
 			requirement := v1.NodeSelectorRequirementWithMinValues{Key: keys[r.Intn(len(keys))]}
 			for range 1 + r.Intn(3) {
@@ -209,6 +232,7 @@ var _ = Describe("Topology domain groups", func() {
 				return corev1.Toleration{Key: k, Operator: corev1.TolerationOpExists}
 			})})
 		})
+		pods = append(pods, test.Pod(test.PodOptions{Tolerations: []corev1.Toleration{{Key: "a", Operator: corev1.TolerationOpEqual, Value: "true", Effect: corev1.TaintEffectNoSchedule}}}))
 		for seed := range int64(2000) {
 			r := rand.New(rand.NewSource(seed))
 			nodePools := lo.Times(1+r.Intn(5), func(i int) *v1.NodePool {
@@ -230,17 +254,37 @@ var _ = Describe("Topology domain groups", func() {
 			// Also read keys that no NodePool or instance type defines, which have no domains
 			actual := domainGroups(nodePools, its, lo.Uniq(append(append(lo.Keys(expected), keys...), corev1.LabelHostname))...)
 			Expect(canonical(actual)).To(Equal(canonical(expected)), "seed %d", seed)
+			sources := newDomainSources(nodePools, its)
 			for key := range expected {
+				universe := newKeyUniverse(key, sources)
 				for _, pod := range pods {
 					want, got := sets.New[string](), sets.New[string]()
 					expected[key].ForEachDomain(pod, corev1.NodeInclusionPolicyHonor, func(domain string) { want.Insert(domain) })
 					actual[key].ForEachDomain(pod, corev1.NodeInclusionPolicyHonor, func(domain string) { got.Insert(domain) })
 					Expect(got).To(Equal(want), "seed %d, key %s, tolerations %v", seed, key, pod.Spec.Tolerations)
+					Expect(universeSeedNames(universe, universe.seed(corev1.NodeInclusionPolicyHonor, pod.Spec.Tolerations))).To(Equal(want), "seed %d, key %s, tolerations %v", seed, key, pod.Spec.Tolerations)
 				}
+				Expect(universeSeedNames(universe, universe.seed(corev1.NodeInclusionPolicyIgnore, nil))).To(Equal(sets.KeySet(expected[key])), "seed %d, key %s", seed, key)
 			}
 		}
 	})
 })
+
+// universeSeedNames returns the names of the seed's domains
+func universeSeedNames(u *keyUniverse, s *universeSeed) sets.Set[string] {
+	if !u.dense {
+		Expect(s.mask.Any()).To(BeFalse())
+		return sets.New(s.names...)
+	}
+	Expect(s.names).To(BeEmpty())
+	view := topology.Dict(u.key).View()
+	names := sets.New[string]()
+	s.mask.ForEach(func(id topology.DomainID) bool {
+		names.Insert(view.Name(id))
+		return true
+	})
+	return names
+}
 
 // buildDomainGroupsReference is the previous implementation of the domain groups, which builds every topology key
 // and intersects the NodePool's requirements with each instance type's requirements.

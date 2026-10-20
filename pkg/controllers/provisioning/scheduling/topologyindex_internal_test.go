@@ -120,23 +120,23 @@ var _ = Describe("Topology Group Index", func() {
 	})
 })
 
-func newTopologyForIndexTest() *Topology {
-	return &Topology{
+func newTopologyForIndexTest() *legacyTopology {
+	return &legacyTopology{
 		kubeClient:            fakecr.NewFakeClient(),
 		preferencePolicy:      PreferencePolicyRespect,
 		domainGroups:          map[string]TopologyDomainGroup{},
-		topologyGroups:        map[uint64]*TopologyGroup{},
-		inverseTopologyGroups: map[uint64]*TopologyGroup{},
+		topologyGroups:        map[uint64]*legacyTopologyGroup{},
+		inverseTopologyGroups: map[uint64]*legacyTopologyGroup{},
 		topologyIndex:         newTopologyGroupIndex(),
 		inverseTopologyIndex:  newTopologyGroupIndex(),
 		excludedPods:          sets.New[string](),
 	}
 }
 
-func expectOwnerIndexConsistent(t *Topology, uid types.UID) {
+func expectOwnerIndexConsistent(t *legacyTopology, uid types.UID) {
 	GinkgoHelper()
-	owned := func(groups map[uint64]*TopologyGroup) []uint64 {
-		return groupHashes(lo.Filter(lo.Values(groups), func(tg *TopologyGroup, _ int) bool { return tg.IsOwnedBy(uid) }))
+	owned := func(groups map[uint64]*legacyTopologyGroup) []uint64 {
+		return groupHashes(lo.Filter(lo.Values(groups), func(tg *legacyTopologyGroup, _ int) bool { return tg.IsOwnedBy(uid) }))
 	}
 	Expect(groupHashes(t.topologyIndex.ownedBy(uid))).To(Equal(owned(t.topologyGroups)))
 	Expect(groupHashes(t.inverseTopologyIndex.ownedBy(uid))).To(Equal(owned(t.inverseTopologyGroups)))
@@ -146,8 +146,8 @@ func expectOwnerIndexConsistent(t *Topology, uid types.UID) {
 }
 
 // linearMatchingTopologies is getMatchingTopologies implemented as a scan of every group.
-func linearMatchingTopologies(t *Topology, p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements) []*TopologyGroup {
-	var matchingTopologies []*TopologyGroup
+func linearMatchingTopologies(t *legacyTopology, p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements) []*legacyTopologyGroup {
+	var matchingTopologies []*legacyTopologyGroup
 	for _, tg := range t.topologyGroups {
 		if tg.IsOwnedBy(p.UID) {
 			matchingTopologies = append(matchingTopologies, tg)
@@ -161,8 +161,8 @@ func linearMatchingTopologies(t *Topology, p *corev1.Pod, taints []corev1.Taint,
 	return matchingTopologies
 }
 
-// linearRecord is Topology.Record implemented as a scan of every group.
-func linearRecord(t *Topology, p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements) {
+// linearRecord is legacyTopology.Record implemented as a scan of every group.
+func linearRecord(t *legacyTopology, p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements) {
 	for _, tg := range t.topologyGroups {
 		if tg.Counts(p, taints, requirements) {
 			domains := requirements.Get(tg.Key)
@@ -180,15 +180,15 @@ func linearRecord(t *Topology, p *corev1.Pod, taints []corev1.Taint, requirement
 	}
 }
 
-func groupHashes(groups []*TopologyGroup) []uint64 {
-	hashes := lo.Map(groups, func(tg *TopologyGroup, _ int) uint64 { return tg.Hash() })
+func groupHashes(groups []*legacyTopologyGroup) []uint64 {
+	hashes := lo.Map(groups, func(tg *legacyTopologyGroup, _ int) uint64 { return tg.Hash() })
 	// sort so that comparisons are independent of iteration order, but keep duplicates so they are detected
 	slices.Sort(hashes)
 	return hashes
 }
 
-func groupCounts(groups map[uint64]*TopologyGroup) map[uint64]map[string]int32 {
-	return lo.MapValues(groups, func(tg *TopologyGroup, _ uint64) map[string]int32 { return tg.domains })
+func groupCounts(groups map[uint64]*legacyTopologyGroup) map[uint64]map[string]int32 {
+	return lo.MapValues(groups, func(tg *legacyTopologyGroup, _ uint64) map[string]int32 { return tg.domains })
 }
 
 type topologyIndexGen struct {

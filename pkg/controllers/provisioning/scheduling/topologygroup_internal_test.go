@@ -17,8 +17,12 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
+	"slices"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -26,13 +30,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 var _ = Describe("TopologyGroup Hostname Fast Path", func() {
 	// newHostnameGroup builds a hostname topology group with the given per-host counts. Pods in the "default" namespace
 	// are selected by the group.
-	newHostnameGroup := func(topologyType TopologyType, counts map[string]int32) *TopologyGroup {
-		tg := &TopologyGroup{
+	newHostnameGroup := func(topologyType TopologyType, counts map[string]int32) *legacyTopologyGroup {
+		tg := &legacyTopologyGroup{
 			Type:         topologyType,
 			Key:          corev1.LabelHostname,
 			namespaces:   sets.New("default"),
@@ -91,5 +96,88 @@ var _ = Describe("TopologyGroup Hostname Fast Path", func() {
 				Expect(req.Values()).To(ConsistOf("new"), topologyType.String())
 			}
 		})
+	})
+})
+
+var _ = Describe("Legacy TopologyGroup Order Hook", func() {
+	ascending := func(domains []string) { slices.Sort(domains) }
+	descending := func(domains []string) { slices.Sort(domains); slices.Reverse(domains) }
+	newZoneGroup := func(topologyType TopologyType, order func([]string), counts map[string]int32) *legacyTopologyGroup {
+		tg := &legacyTopologyGroup{
+			Type:         topologyType,
+			Key:          corev1.LabelTopologyZone,
+			namespaces:   sets.New("default"),
+			selector:     labels.Everything(),
+			maxSkew:      1,
+			domains:      map[string]int32{},
+			emptyDomains: sets.New[string](),
+			owners:       map[types.UID]struct{}{},
+			order:        order,
+		}
+		for domain, count := range counts {
+			tg.domains[domain] = count
+			if count == 0 {
+				tg.emptyDomains.Insert(domain)
+			}
+		}
+		return tg
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
+	exists := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpExists)
+	in := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "c", "a", "b", "d")
+	counts := map[string]int32{"a": 0, "b": 0, "c": 0, "d": 1}
+
+	It("should break topology spread ties in hook order", func() {
+		for _, nodeDomains := range []*scheduling.Requirement{exists, in} {
+			for range 20 {
+				req, _ := newZoneGroup(TopologyTypeSpread, ascending, counts).Get(pod, exists, nodeDomains)
+				Expect(req.Values()).To(ConsistOf("a"))
+				req, _ = newZoneGroup(TopologyTypeSpread, descending, counts).Get(pod, exists, nodeDomains)
+				Expect(req.Values()).To(ConsistOf("c"))
+			}
+		}
+	})
+	It("should bootstrap pod affinity in hook order", func() {
+		empty := map[string]int32{"a": 0, "b": 0, "c": 0}
+		podDomains := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "b", "c")
+		for range 20 {
+			// the first pick is from podDomains ∩ nodeDomains, the second from podDomains
+			req, _ := newZoneGroup(TopologyTypePodAffinity, ascending, empty).Get(pod, podDomains, scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "a", "c"))
+			Expect(req.Values()).To(ConsistOf("b", "c"))
+			req, _ = newZoneGroup(TopologyTypePodAffinity, descending, empty).Get(pod, podDomains, exists)
+			Expect(req.Values()).To(ConsistOf("c"))
+		}
+	})
+	It("should give the order hook every new group's key and hash", func() {
+		ctx := context.Background()
+		p := test.Pod(test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "a"}},
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew: 1, TopologyKey: corev1.LabelTopologyZone, WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+			}},
+			PodRequirements:     []corev1.PodAffinityTerm{{TopologyKey: corev1.LabelHostname, LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}}}},
+			PodAntiRequirements: []corev1.PodAffinityTerm{{TopologyKey: corev1.LabelHostname, LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}}}},
+		})
+		called := map[uint64]string{}
+		calledInverse := map[uint64]string{}
+		t := newTopologyForIndexTest()
+		t.domainOrder = func(key string, hash uint64, inverse bool) func([]string) {
+			lo.Ternary(inverse, calledInverse, called)[hash] = key
+			return ascending
+		}
+		Expect(t.Update(ctx, p)).To(Succeed())
+		// the pod's anti-affinity term creates a forward and an inverse group with the same hash
+		Expect(t.topologyGroups).To(HaveLen(3))
+		Expect(t.inverseTopologyGroups).To(HaveLen(1))
+		for groups, called := range map[*map[uint64]*legacyTopologyGroup]map[uint64]string{&t.topologyGroups: called, &t.inverseTopologyGroups: calledInverse} {
+			expected := map[uint64]string{}
+			for hash, tg := range *groups {
+				Expect(tg.Hash()).To(Equal(hash))
+				Expect(tg.order).ToNot(BeNil())
+				expected[hash] = tg.Key
+			}
+			Expect(called).To(Equal(expected))
+		}
 	})
 })
