@@ -19,6 +19,7 @@ package scheduling
 import (
 	"context"
 	"math/rand/v2"
+	"os"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
@@ -71,6 +72,9 @@ func NewTopology(
 ) (*Topology, error) {
 	o := option.Resolve(opts...)
 	report := shadowReporter(ctx)
+	// tests compare after every call; log mode and sampled simulations on real clusters only compare decisions after
+	// NewTopology (see shadowTopology.compareAll)
+	compareAll := os.Getenv(TopologyShadowEnv) == "1"
 	if report == nil && o.topologyShadowSample > 0 && rand.Float64() < o.topologyShadowSample {
 		report = newShadowLogReporter(ctx)
 	}
@@ -78,7 +82,11 @@ func NewTopology(
 	var err error
 	switch {
 	case report != nil:
-		impl, err = newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report)
+		var shadow *shadowTopology
+		if shadow, err = newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report); err == nil {
+			shadow.compareAll = compareAll
+			impl = shadow
+		}
 	case o.topologyEngine == karpopts.TopologyEngineLegacy:
 		impl, err = newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
 	default:

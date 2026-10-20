@@ -82,7 +82,11 @@ type shadowTopology struct {
 	legacy  *legacyTopology
 	// report is called with each difference, with the name of the call that found it
 	report func(call, mismatch string)
-	mu     sync.Mutex
+	// compareAll compares the groups after every call that changes them. Otherwise they're compared once, after
+	// NewTopology, and decisions are still compared on every call: comparing every group, with every hostname, after
+	// every Register and Record costs more than both implementations together on large clusters.
+	compareAll bool
+	mu         sync.Mutex
 	// ordered counts the legacy topology's calls to its order hook with more than one domain
 	ordered atomic.Int64
 }
@@ -98,7 +102,7 @@ func newShadowTopology(
 	opts *options,
 	report func(call, mismatch string),
 ) (*shadowTopology, error) {
-	s := &shadowTopology{report: report}
+	s := &shadowTopology{report: report, compareAll: true}
 	overlay, overlayErr := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, opts)
 	s.overlay = overlay
 	legacyOpts := *opts
@@ -137,6 +141,13 @@ func (s *shadowTopology) compareErrors(call string, overlayErr, legacyErr error)
 	}
 }
 
+// compareChangedGroups compares the groups after a call that changed them, if the shadow compares after every call
+func (s *shadowTopology) compareChangedGroups(call string) {
+	if s.compareAll {
+		s.compareGroups(call)
+	}
+}
+
 // compareGroups compares every group's domains, counts and owners
 func (s *shadowTopology) compareGroups(call string) {
 	s.compareGroupMaps(call, "group", s.overlay.groups, s.legacy.topologyGroups)
@@ -167,14 +178,14 @@ func (s *shadowTopology) Update(ctx context.Context, p *corev1.Pod) error {
 	overlayErr := s.overlay.Update(ctx, p)
 	legacyErr := s.legacy.Update(ctx, p)
 	s.compareErrors("Update", overlayErr, legacyErr)
-	s.compareGroups("Update")
+	s.compareChangedGroups("Update")
 	return overlayErr
 }
 
 func (s *shadowTopology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
 	s.overlay.Record(p, taints, requirements, compatibilityOptions...)
 	s.legacy.Record(p, taints, requirements, compatibilityOptions...)
-	s.compareGroups("Record")
+	s.compareChangedGroups("Record")
 }
 
 func (s *shadowTopology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
@@ -211,13 +222,13 @@ func (s *shadowTopology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requ
 func (s *shadowTopology) Register(topologyKey string, domain string) {
 	s.overlay.Register(topologyKey, domain)
 	s.legacy.Register(topologyKey, domain)
-	s.compareGroups("Register")
+	s.compareChangedGroups("Register")
 }
 
 func (s *shadowTopology) Unregister(topologyKey string, domain string) {
 	s.overlay.Unregister(topologyKey, domain)
 	s.legacy.Unregister(topologyKey, domain)
-	s.compareGroups("Unregister")
+	s.compareChangedGroups("Unregister")
 }
 
 // requirementsString renders requirements canonically
