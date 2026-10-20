@@ -18,17 +18,28 @@ package scheduling
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// indexedGroup is a topology group that a topologyGroupIndex can index
+type indexedGroup interface {
+	comparable
+	// indexSelector returns the selector the group selects pods with
+	indexSelector() labels.Selector
+	IsOwnedBy(types.UID) bool
+	AddOwner(types.UID)
+	RemoveOwner(types.UID)
+}
+
 // topologyGroupIndex indexes a set of topology groups by owner and by selector so that the per-pod lookups made during
-// scheduling don't need to scan every group. Groups are never removed from the index, which matches how legacyTopology only
+// scheduling don't need to scan every group. Groups are never removed from the index, which matches how a Topology only
 // ever adds groups during a scheduling simulation. Mutations must be serialized; concurrent reads are safe.
-type topologyGroupIndex struct {
-	// owned maps a pod UID to the groups it owns. It mirrors legacyTopologyGroup.owners and is only kept consistent if owners
+type topologyGroupIndex[G indexedGroup] struct {
+	// owned maps a pod UID to the groups it owns. It mirrors the groups' owners and is only kept consistent if owners
 	// are added and removed through the index.
-	owned map[types.UID][]*legacyTopologyGroup
+	owned map[types.UID][]G
 	// Each group is filed under exactly one requirement of its selector so that a pod, which has at most one value per
 	// label key, reaches each group at most once. The index is a pre-filter: callers must still check the group's
 	// selector and namespaces against the pod.
@@ -36,22 +47,22 @@ type topologyGroupIndex struct {
 	//   Exists / Gt / Lt             -> byKey[key]
 	//   only NotIn / DoesNotExist, {} -> always
 	//   nothing                      -> not indexed, as it can never select a pod
-	byLabel map[string]map[string][]*legacyTopologyGroup
-	byKey   map[string][]*legacyTopologyGroup
-	always  []*legacyTopologyGroup
+	byLabel map[string]map[string][]G
+	byKey   map[string][]G
+	always  []G
 }
 
-func newTopologyGroupIndex() *topologyGroupIndex {
-	return &topologyGroupIndex{
-		owned:   map[types.UID][]*legacyTopologyGroup{},
-		byLabel: map[string]map[string][]*legacyTopologyGroup{},
-		byKey:   map[string][]*legacyTopologyGroup{},
+func newTopologyGroupIndex[G indexedGroup]() *topologyGroupIndex[G] {
+	return &topologyGroupIndex[G]{
+		owned:   map[types.UID][]G{},
+		byLabel: map[string]map[string][]G{},
+		byKey:   map[string][]G{},
 	}
 }
 
 // add files the group in the selector index. It must be called once per group.
-func (x *topologyGroupIndex) add(tg *legacyTopologyGroup) {
-	requirements, selectable := tg.selector.Requirements()
+func (x *topologyGroupIndex[G]) add(tg G) {
+	requirements, selectable := tg.indexSelector().Requirements()
 	if !selectable {
 		return
 	}
@@ -61,7 +72,7 @@ func (x *topologyGroupIndex) add(tg *legacyTopologyGroup) {
 		case selection.Equals, selection.DoubleEquals, selection.In:
 			values, ok := x.byLabel[r.Key()]
 			if !ok {
-				values = map[string][]*legacyTopologyGroup{}
+				values = map[string][]G{}
 				x.byLabel[r.Key()] = values
 			}
 			for value := range r.Values() {
@@ -83,7 +94,7 @@ func (x *topologyGroupIndex) add(tg *legacyTopologyGroup) {
 
 // forEachCandidate calls f for every group whose selector may select the pod, each at most once. It is a superset of
 // the groups that select the pod.
-func (x *topologyGroupIndex) forEachCandidate(p *corev1.Pod, f func(*legacyTopologyGroup)) {
+func (x *topologyGroupIndex[G]) forEachCandidate(p *corev1.Pod, f func(G)) {
 	for _, tg := range x.always {
 		f(tg)
 	}
@@ -100,7 +111,7 @@ func (x *topologyGroupIndex) forEachCandidate(p *corev1.Pod, f func(*legacyTopol
 }
 
 // addOwner registers the pod as an owner of the group.
-func (x *topologyGroupIndex) addOwner(tg *legacyTopologyGroup, uid types.UID) {
+func (x *topologyGroupIndex[G]) addOwner(tg G, uid types.UID) {
 	if tg.IsOwnedBy(uid) {
 		return
 	}
@@ -109,7 +120,7 @@ func (x *topologyGroupIndex) addOwner(tg *legacyTopologyGroup, uid types.UID) {
 }
 
 // removeOwner unregisters the pod as an owner of every group it owns.
-func (x *topologyGroupIndex) removeOwner(uid types.UID) {
+func (x *topologyGroupIndex[G]) removeOwner(uid types.UID) {
 	for _, tg := range x.owned[uid] {
 		tg.RemoveOwner(uid)
 	}
@@ -117,6 +128,6 @@ func (x *topologyGroupIndex) removeOwner(uid types.UID) {
 }
 
 // ownedBy returns the groups owned by the pod. The returned slice must not be modified.
-func (x *topologyGroupIndex) ownedBy(uid types.UID) []*legacyTopologyGroup {
+func (x *topologyGroupIndex[G]) ownedBy(uid types.UID) []G {
 	return x.owned[uid]
 }

@@ -54,6 +54,8 @@ type OptionsFields struct {
 	TopologyIndexDifferentialSampleRate *float64
 	FeatureGates                        FeatureGates
 	SchedulerConfig                     *options.SchedulerConfiguration
+	TopologyEngine                      *options.TopologyEngine
+	TopologyShadowSample                *float64
 }
 
 type FeatureGates struct {
@@ -98,6 +100,8 @@ func Options(overrides ...OptionsFields) *options.Options {
 		PreferencePolicy:                 lo.FromPtrOr(opts.PreferencePolicy, options.PreferencePolicyRespect),
 		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
+		TopologyEngine:                   lo.FromPtrOr(opts.TopologyEngine, options.TopologyEngineOverlay),
+		TopologyShadowSample:             lo.FromPtrOr(opts.TopologyShadowSample, 0),
 		LegacyNodeRepair:                 lo.FromPtrOr(opts.LegacyNodeRepair, false),
 		// suites run the topology index's differential mode with TOPOLOGY_INDEX_DIFFERENTIAL_SAMPLE_RATE (see
 		// ExpectTopologyIndexFromEnv)

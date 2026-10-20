@@ -22,6 +22,7 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
@@ -58,6 +59,15 @@ type universeDomain struct {
 type universeSeed struct {
 	mask  topology.Mask // dense keys
 	names []string      // sparse keys
+	set   sets.Set[string]
+}
+
+// nameSet returns the domains of a sparse key's seed as a set
+func (s *universeSeed) nameSet() sets.Set[string] {
+	if s.set == nil {
+		s.set = sets.New(s.names...)
+	}
+	return s.set
 }
 
 // newKeyUniverse builds the universe of the topology key from the NodePools. A domain's taint sets follow

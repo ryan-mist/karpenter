@@ -127,8 +127,8 @@ func newTopologyForIndexTest() *legacyTopology {
 		domainGroups:          map[string]TopologyDomainGroup{},
 		topologyGroups:        map[uint64]*legacyTopologyGroup{},
 		inverseTopologyGroups: map[uint64]*legacyTopologyGroup{},
-		topologyIndex:         newTopologyGroupIndex(),
-		inverseTopologyIndex:  newTopologyGroupIndex(),
+		topologyIndex:         newTopologyGroupIndex[*legacyTopologyGroup](),
+		inverseTopologyIndex:  newTopologyGroupIndex[*legacyTopologyGroup](),
 		excludedPods:          sets.New[string](),
 	}
 }

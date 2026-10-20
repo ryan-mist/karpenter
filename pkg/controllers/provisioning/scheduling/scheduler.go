@@ -104,6 +104,10 @@ type options struct {
 	creditReservationCapacity map[string]int
 	// topologySeed seeds the tie-breaking between topology domains with equal counts. It's random if unset.
 	topologySeed *uint64
+	// topologyEngine selects the topology implementation; the overlay implementation unless it's legacy
+	topologyEngine karpopts.TopologyEngine
+	// topologyShadowSample is the fraction of topologies that also run the legacy implementation and count differences
+	topologyShadowSample float64
 	// domainOrder, if set, orders each legacy topology group's domains wherever the group picks between tied domains,
 	// given the group's topology key and hash, and whether it's an inverse group. It's only used by tests.
 	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
@@ -131,6 +135,22 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 var TopologySeed = func(seed uint64) Options {
 	return func(opts *options) {
 		opts.topologySeed = &seed
+	}
+}
+
+// TopologyEngine selects the topology implementation. Both make the same decisions; the legacy implementation is kept
+// to check the overlay implementation against until it's removed.
+var TopologyEngine = func(engine karpopts.TopologyEngine) Options {
+	return func(opts *options) {
+		opts.topologyEngine = engine
+	}
+}
+
+// TopologyShadowSample makes that fraction of topologies shadow topologies, which also run the legacy implementation
+// and count every difference in TopologyShadowMismatchesTotal (see TopologyShadowEnv).
+var TopologyShadowSample = func(fraction float64) Options {
+	return func(opts *options) {
+		opts.topologyShadowSample = fraction
 	}
 }
 
@@ -542,6 +562,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		}
 	}
 	UnfinishedWorkSeconds.Delete(map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
+	s.topology.seal()
 	for _, m := range s.newNodeClaims {
 		m.FinalizeScheduling(s.draDriversForNodeClaim(m)...)
 	}
@@ -647,6 +668,9 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if err := s.cachedPodData[pod.UID].ResourceClaimErr; err != nil {
 		return err
 	}
+
+	// the candidates below are tried in parallel, so the topology prepares what doesn't depend on the candidate first
+	s.topology.BeginPod(pod, s.cachedPodData[pod.UID].StrictRequirements)
 
 	// determine the volumes that will be mounted if the pod schedules
 	volumes, err := scheduling.GetVolumes(ctx, s.kubeClient, pod)
