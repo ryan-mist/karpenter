@@ -51,6 +51,7 @@ var (
 		},
 		[]opmetrics.Label{
 			{Name: callLabel, Help: "The topology call that found the difference."},
+			metrics.Controller,
 		},
 		opmetrics.Alpha,
 	)

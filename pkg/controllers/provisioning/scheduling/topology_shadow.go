@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,7 +39,10 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
 
 // TopologyShadowEnv names the environment variable that makes every Topology a shadowTopology, which compares the
@@ -57,16 +62,24 @@ func shadowReporter(ctx context.Context) func(call, mismatch string) {
 			panic(fmt.Sprintf("topology shadow mismatch: %s", mismatch))
 		}
 	case "log":
-		logged := 0
-		return func(call, mismatch string) {
-			TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call})
-			if logged < maxLoggedShadowMismatches {
-				logged++
-				log.FromContext(ctx).Error(nil, "topology shadow mismatch", "mismatch", mismatch)
-			}
-		}
+		return newShadowLogReporter(ctx)
 	}
 	return nil
+}
+
+// newShadowLogReporter returns a reporter that logs the first differences and counts all of them
+func newShadowLogReporter(ctx context.Context) func(call, mismatch string) {
+	// disruption simulates with a no-op logger in the context, so log to the root logger
+	controller := injection.GetControllerName(ctx)
+	logger := log.Log.WithName("topology-shadow").WithValues("controller", controller)
+	logged := 0
+	return func(call, mismatch string) {
+		TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call, metrics.ControllerLabel: controller})
+		if logged < maxLoggedShadowMismatches {
+			logged++
+			logger.Error(nil, "topology shadow mismatch", "mismatch", mismatch)
+		}
+	}
 }
 
 // shadowTopology runs the overlay topology and the legacy topology side by side and compares them after every call.
@@ -77,7 +90,11 @@ type shadowTopology struct {
 	legacy  *legacyTopology
 	// report is called with each difference, with the name of the call that found it
 	report func(call, mismatch string)
-	mu     sync.Mutex
+	// compareAll compares the groups after every call that changes them. Otherwise they're compared once, after
+	// NewTopology, and decisions are still compared on every call: comparing every group, with every hostname, after
+	// every Register and Record costs more than both implementations together on large clusters.
+	compareAll bool
+	mu         sync.Mutex
 	// ordered counts the legacy topology's calls to its order hook with more than one domain
 	ordered atomic.Int64
 }
@@ -93,7 +110,11 @@ func newShadowTopology(
 	opts *options,
 	report func(call, mismatch string),
 ) (*shadowTopology, error) {
-	s := &shadowTopology{report: report}
+	s := &shadowTopology{report: report, compareAll: true}
+	// both implementations read the same pods, nodes and namespaces, so pods that change between their reads on a
+	// live cluster don't show up as differences
+	kubeClient = newSnapshotClient(kubeClient)
+	opts = withAntiAffinitySnapshot(opts, cluster)
 	overlay, overlayErr := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, opts)
 	s.overlay = overlay
 	legacyOpts := *opts
@@ -132,6 +153,13 @@ func (s *shadowTopology) compareErrors(call string, overlayErr, legacyErr error)
 	}
 }
 
+// compareChangedGroups compares the groups after a call that changed them, if the shadow compares after every call
+func (s *shadowTopology) compareChangedGroups(call string) {
+	if s.compareAll {
+		s.compareGroups(call)
+	}
+}
+
 // compareGroups compares every group's domains, counts and owners
 func (s *shadowTopology) compareGroups(call string) {
 	s.compareGroupMaps(call, "group", s.overlay.groups, s.legacy.topologyGroups)
@@ -162,14 +190,14 @@ func (s *shadowTopology) Update(ctx context.Context, p *corev1.Pod) error {
 	overlayErr := s.overlay.Update(ctx, p)
 	legacyErr := s.legacy.Update(ctx, p)
 	s.compareErrors("Update", overlayErr, legacyErr)
-	s.compareGroups("Update")
+	s.compareChangedGroups("Update")
 	return overlayErr
 }
 
 func (s *shadowTopology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
 	s.overlay.Record(p, taints, requirements, compatibilityOptions...)
 	s.legacy.Record(p, taints, requirements, compatibilityOptions...)
-	s.compareGroups("Record")
+	s.compareChangedGroups("Record")
 }
 
 func (s *shadowTopology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
@@ -206,13 +234,13 @@ func (s *shadowTopology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requ
 func (s *shadowTopology) Register(topologyKey string, domain string) {
 	s.overlay.Register(topologyKey, domain)
 	s.legacy.Register(topologyKey, domain)
-	s.compareGroups("Register")
+	s.compareChangedGroups("Register")
 }
 
 func (s *shadowTopology) Unregister(topologyKey string, domain string) {
 	s.overlay.Unregister(topologyKey, domain)
 	s.legacy.Unregister(topologyKey, domain)
-	s.compareGroups("Unregister")
+	s.compareChangedGroups("Unregister")
 }
 
 // requirementsString renders requirements canonically
@@ -225,4 +253,81 @@ func requirementsString(requirements scheduling.Requirements) string {
 	}
 	slices.Sort(parts)
 	return strings.Join(parts, "; ")
+}
+
+// withAntiAffinitySnapshot returns the options with the cluster's pods with required anti-affinity, as they are now,
+// for both implementations' inverse anti-affinity groups
+func withAntiAffinitySnapshot(opts *options, cluster *state.Cluster) *options {
+	type podOnNode struct {
+		pod  *corev1.Pod
+		node *corev1.Node
+	}
+	var pods []podOnNode
+	cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		pods = append(pods, podOnNode{pod: p, node: n.DeepCopy()})
+		return true
+	})
+	snapshot := *opts
+	snapshot.forPodsWithAntiAffinity = func(f func(*corev1.Pod, *corev1.Node) bool) {
+		for _, p := range pods {
+			if !f(p.pod, p.node) {
+				return
+			}
+		}
+	}
+	return &snapshot
+}
+
+// snapshotClient memoizes the reads of a client: the first List or Get of each object, list options or key is
+// returned to every later caller. The shadow topology gives it to both implementations, which then count the same
+// cluster. Results are deep copies, so callers can't change what others read.
+type snapshotClient struct {
+	client.Client
+	mu    sync.Mutex
+	reads map[string]snapshotRead
+}
+
+type snapshotRead struct {
+	obj runtime.Object
+	err error
+}
+
+func newSnapshotClient(c client.Client) *snapshotClient {
+	return &snapshotClient{Client: c, reads: map[string]snapshotRead{}}
+}
+
+func (c *snapshotClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	o := &client.ListOptions{}
+	o.ApplyOptions(opts)
+	key := fmt.Sprintf("list\x00%T\x00%s", list, o.Namespace)
+	if o.LabelSelector != nil {
+		key += "\x00" + topology.SelectorKey(o.LabelSelector)
+	}
+	if o.FieldSelector != nil {
+		key += "\x00fields=" + o.FieldSelector.String()
+	}
+	return c.read(key, list, func() error { return c.Client.List(ctx, list, opts...) })
+}
+
+func (c *snapshotClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.read(fmt.Sprintf("get\x00%T\x00%s", obj, key), obj, func() error { return c.Client.Get(ctx, key, obj, opts...) })
+}
+
+// read fills obj with the memoized read of the key, reading it into obj first if needed
+func (c *snapshotClient) read(key string, obj runtime.Object, read func() error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.reads[key]; ok {
+		if r.err == nil {
+			reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(r.obj.DeepCopyObject()).Elem())
+		}
+		return r.err
+	}
+	err := read()
+	r := snapshotRead{err: err}
+	if err == nil {
+		r.obj = obj.DeepCopyObject()
+	}
+	c.reads[key] = r
+	return err
 }

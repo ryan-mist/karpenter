@@ -104,11 +104,16 @@ type options struct {
 	creditReservationCapacity map[string]int
 	// topologySeed seeds the tie-breaking between topology domains with equal counts. It's random if unset.
 	topologySeed *uint64
-	// topologyEngine selects the topology implementation: topologyEngineLegacy (the default) or topologyEngineOverlay
-	topologyEngine string
+	// topologyEngine selects the topology implementation; the overlay implementation unless it's legacy
+	topologyEngine karpopts.TopologyEngine
+	// topologyShadowSample is the fraction of topologies that also run the legacy implementation and count differences
+	topologyShadowSample float64
 	// domainOrder, if set, orders each legacy topology group's domains wherever the group picks between tied domains,
 	// given the group's topology key and hash, and whether it's an inverse group. It's only used by tests.
 	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
+	// forPodsWithAntiAffinity, if set, replaces cluster.ForPodsWithAntiAffinity for the topology's inverse
+	// anti-affinity groups. The shadow topology uses it so both implementations see the same pods.
+	forPodsWithAntiAffinity func(func(*corev1.Pod, *corev1.Node) bool)
 }
 
 type Options = option.Function[options]
@@ -133,6 +138,22 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 var TopologySeed = func(seed uint64) Options {
 	return func(opts *options) {
 		opts.topologySeed = &seed
+	}
+}
+
+// TopologyEngine selects the topology implementation. Both make the same decisions; the legacy implementation is kept
+// to check the overlay implementation against until it's removed.
+var TopologyEngine = func(engine karpopts.TopologyEngine) Options {
+	return func(opts *options) {
+		opts.topologyEngine = engine
+	}
+}
+
+// TopologyShadowSample makes that fraction of topologies shadow topologies, which also run the legacy implementation
+// and count every difference in TopologyShadowMismatchesTotal (see TopologyShadowEnv).
+var TopologyShadowSample = func(fraction float64) Options {
+	return func(opts *options) {
+		opts.topologyShadowSample = fraction
 	}
 }
 

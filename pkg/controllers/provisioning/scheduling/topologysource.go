@@ -37,7 +37,9 @@ import (
 type listCountSource struct {
 	kubeClient client.Client
 	cluster    *state.Cluster
-	excluded   *topology.ExcludedPods
+	// forPodsWithAntiAffinity, if set, replaces cluster.ForPodsWithAntiAffinity
+	forPodsWithAntiAffinity func(func(*corev1.Pod, *corev1.Node) bool)
+	excluded                *topology.ExcludedPods
 	// nodes holds the nodes that existing pods are bound to, keyed by node name, with a nil entry for nodes that were
 	// not found
 	nodes map[string]*topologyNode
@@ -128,7 +130,11 @@ func (s *listCountSource) ExcludedContributions(ctx context.Context, key *topolo
 }
 
 func (s *listCountSource) InverseAntiAffinityTerms(_ context.Context, excluded *topology.ExcludedPods, f func(*topology.InverseTerm)) error {
-	s.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
+	forPodsWithAntiAffinity := s.forPodsWithAntiAffinity
+	if forPodsWithAntiAffinity == nil {
+		forPodsWithAntiAffinity = s.cluster.ForPodsWithAntiAffinity
+	}
+	forPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
 		// don't count the pod we are excluding
 		if excluded.Has(pod.UID) {
 			return true

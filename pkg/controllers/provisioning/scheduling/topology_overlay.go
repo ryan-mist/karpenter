@@ -113,7 +113,9 @@ func newOverlayTopology(
 	if opts.topologySeed != nil {
 		t.seed = *opts.topologySeed
 	}
-	t.src = newListCountSource(kubeClient, cluster, t.excluded)
+	src := newListCountSource(kubeClient, cluster, t.excluded)
+	src.forPodsWithAntiAffinity = opts.forPodsWithAntiAffinity
+	t.src = src
 
 	errs := t.updateInverseAffinities(ctx)
 	for i := range pods {

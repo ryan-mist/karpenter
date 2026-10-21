@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +44,14 @@ const (
 )
 
 type MinValuesPolicy string
+
+// TopologyEngine selects the scheduler's topology implementation
+type TopologyEngine string
+
+const (
+	TopologyEngineOverlay TopologyEngine = "overlay"
+	TopologyEngineLegacy  TopologyEngine = "legacy"
+)
 
 const (
 	MinValuesPolicyStrict     MinValuesPolicy = "Strict"
@@ -198,7 +207,11 @@ type Options struct {
 	minValuesPolicyRaw               string
 	MinValuesPolicy                  MinValuesPolicy
 	IgnoreDRARequests                bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
-	LegacyNodeRepair                 bool // NOTE: This flag is planned for deprecation along with the legacy node repair controller.
+	topologyEngineRaw                string
+	TopologyEngine                   TopologyEngine // NOTE: This flag will be removed with the legacy topology implementation.
+	topologyShadowSampleRaw          string
+	TopologyShadowSample             float64 // NOTE: This is a debugging flag that will be removed with the legacy topology implementation.
+	LegacyNodeRepair                 bool    // NOTE: This flag is planned for deprecation along with the legacy node repair controller.
 	FeatureGates                     FeatureGates
 	schedulerConfigRaw               string
 	SchedulerConfig                  *SchedulerConfiguration
@@ -243,6 +256,8 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
 	fs.BoolVarWithEnv(&o.IgnoreDRARequests, "ignore-dra-requests", "IGNORE_DRA_REQUESTS", true, "When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.")
+	fs.StringVar(&o.topologyEngineRaw, "topology-engine", env.WithDefaultString("TOPOLOGY_ENGINE", string(TopologyEngineOverlay)), "The scheduler's topology implementation, 'overlay' or 'legacy'. Both make the same decisions; 'legacy' is the implementation 'overlay' replaced. NOTE: This flag will be removed with the legacy implementation.")
+	fs.StringVar(&o.topologyShadowSampleRaw, "topology-shadow-sample", env.WithDefaultString("TOPOLOGY_SHADOW_SAMPLE", "0"), "Debugging only: the fraction, between 0 and 1, of scheduling simulations that also run the legacy topology implementation and count every difference in karpenter_scheduler_topology_shadow_mismatches_total. Those simulations cost about twice as much topology work. NOTE: This flag will be removed with the legacy implementation.")
 	fs.BoolVarWithEnv(&o.LegacyNodeRepair, "legacy-node-repair", "LEGACY_NODE_REPAIR", false, "When set with the NodeRepair feature gate, Karpenter runs the legacy node repair controller instead of node repair as a disruption method. The legacy controller only replaces nodes: it does not support terminate-first repair, reboot, repair policy priority or termination grace periods, or the karpenter.sh/do-not-repair annotation. NOTE: The legacy node repair controller is planned for deprecation. If you use it because the new one does not work for you, please open an issue with your use case or problem.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", featureGatesDefault()), featureGatesHelp())
 	fs.StringVar(&o.schedulerConfigRaw, "scheduler-config", env.WithDefaultString("SCHEDULER_CONFIG", ""), "A YAML/JSON document configuring the parts of the cluster's kube-scheduler behavior that Karpenter must mirror during scheduling simulation, currently only podTopologySpread.defaultConstraints. Empty means no scheduler-config overrides.")
@@ -264,6 +279,15 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if !lo.Contains([]MinValuesPolicy{MinValuesPolicyStrict, MinValuesPolicyBestEffort}, MinValuesPolicy(o.minValuesPolicyRaw)) {
 		return fmt.Errorf("validating cli flags / env vars, invalid MIN_VALUES_POLICY %q", o.minValuesPolicyRaw)
 	}
+	if !lo.Contains([]TopologyEngine{TopologyEngineOverlay, TopologyEngineLegacy}, TopologyEngine(o.topologyEngineRaw)) {
+		return fmt.Errorf("validating cli flags / env vars, invalid TOPOLOGY_ENGINE %q", o.topologyEngineRaw)
+	}
+	shadowSample, err := strconv.ParseFloat(o.topologyShadowSampleRaw, 64)
+	if err != nil || shadowSample < 0 || shadowSample > 1 {
+		return fmt.Errorf("validating cli flags / env vars, invalid TOPOLOGY_SHADOW_SAMPLE %q, must be between 0 and 1", o.topologyShadowSampleRaw)
+	}
+	o.TopologyShadowSample = shadowSample
+	o.TopologyEngine = TopologyEngine(o.topologyEngineRaw)
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}

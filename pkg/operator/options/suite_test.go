@@ -68,6 +68,8 @@ var _ = Describe("Options", func() {
 		"FEATURE_GATES",
 		"SCHEDULER_CONFIG",
 		"LEGACY_NODE_REPAIR",
+		"TOPOLOGY_ENGINE",
+		"TOPOLOGY_SHADOW_SAMPLE",
 	}
 
 	BeforeEach(func() {
@@ -397,6 +399,37 @@ var _ = Describe("Options", func() {
 		})
 	})
 
+	Context("Topology", func() {
+		It("should default to the overlay engine without shadowing", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.TopologyEngine).To(Equal(options.TopologyEngineOverlay))
+			Expect(opts.TopologyShadowSample).To(BeZero())
+		})
+		It("should be set by CLI flags", func() {
+			Expect(opts.Parse(fs, "--topology-engine", "legacy", "--topology-shadow-sample", "0.25")).To(Succeed())
+			Expect(opts.TopologyEngine).To(Equal(options.TopologyEngineLegacy))
+			Expect(opts.TopologyShadowSample).To(Equal(0.25))
+		})
+		It("should be set by environment variables", func() {
+			os.Setenv("TOPOLOGY_ENGINE", "legacy")
+			os.Setenv("TOPOLOGY_SHADOW_SAMPLE", "1")
+			fs = &options.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+			opts = &options.Options{}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.TopologyEngine).To(Equal(options.TopologyEngineLegacy))
+			Expect(opts.TopologyShadowSample).To(Equal(1.0))
+		})
+		DescribeTable("should reject invalid values", func(args ...string) {
+			Expect(opts.Parse(fs, args...)).ToNot(Succeed())
+		},
+			Entry("unknown engine", "--topology-engine", "fast"),
+			Entry("sample below 0", "--topology-shadow-sample", "-0.1"),
+			Entry("sample above 1", "--topology-shadow-sample", "1.5"),
+			Entry("sample not a number", "--topology-shadow-sample", "half"),
+		)
+	})
+
 	Context("Validation", func() {
 		DescribeTable(
 			"should parse valid log levels successfully",
@@ -594,6 +627,8 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.BatchIdleDuration).To(Equal(optsB.BatchIdleDuration))
 	Expect(optsA.PreferencePolicy).To(Equal(optsB.PreferencePolicy))
 	Expect(optsA.MinValuesPolicy).To(Equal(optsB.MinValuesPolicy))
+	Expect(optsA.TopologyEngine).To(Equal(optsB.TopologyEngine))
+	Expect(optsA.TopologyShadowSample).To(Equal(optsB.TopologyShadowSample))
 	Expect(optsA.FeatureGates.ReservedCapacity).To(Equal(optsB.FeatureGates.ReservedCapacity))
 	Expect(optsA.FeatureGates.NodeRepair).To(Equal(optsB.FeatureGates.NodeRepair))
 	Expect(optsA.FeatureGates.NodeOverlay).To(Equal(optsB.FeatureGates.NodeOverlay))
