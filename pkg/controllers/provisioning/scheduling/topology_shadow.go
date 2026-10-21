@@ -39,6 +39,8 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 )
@@ -67,12 +69,15 @@ func shadowReporter(ctx context.Context) func(call, mismatch string) {
 
 // newShadowLogReporter returns a reporter that logs the first differences and counts all of them
 func newShadowLogReporter(ctx context.Context) func(call, mismatch string) {
+	// disruption simulates with a no-op logger in the context, so log to the root logger
+	controller := injection.GetControllerName(ctx)
+	logger := log.Log.WithName("topology-shadow").WithValues("controller", controller)
 	logged := 0
 	return func(call, mismatch string) {
-		TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call})
+		TopologyShadowMismatchesTotal.Inc(map[string]string{callLabel: call, metrics.ControllerLabel: controller})
 		if logged < maxLoggedShadowMismatches {
 			logged++
-			log.FromContext(ctx).Error(nil, "topology shadow mismatch", "mismatch", mismatch)
+			logger.Error(nil, "topology shadow mismatch", "mismatch", mismatch)
 		}
 	}
 }
@@ -109,6 +114,7 @@ func newShadowTopology(
 	// both implementations read the same pods, nodes and namespaces, so pods that change between their reads on a
 	// live cluster don't show up as differences
 	kubeClient = newSnapshotClient(kubeClient)
+	opts = withAntiAffinitySnapshot(opts, cluster)
 	overlay, overlayErr := newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, opts)
 	s.overlay = overlay
 	legacyOpts := *opts
@@ -247,6 +253,29 @@ func requirementsString(requirements scheduling.Requirements) string {
 	}
 	slices.Sort(parts)
 	return strings.Join(parts, "; ")
+}
+
+// withAntiAffinitySnapshot returns the options with the cluster's pods with required anti-affinity, as they are now,
+// for both implementations' inverse anti-affinity groups
+func withAntiAffinitySnapshot(opts *options, cluster *state.Cluster) *options {
+	type podOnNode struct {
+		pod  *corev1.Pod
+		node *corev1.Node
+	}
+	var pods []podOnNode
+	cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		pods = append(pods, podOnNode{pod: p, node: n.DeepCopy()})
+		return true
+	})
+	snapshot := *opts
+	snapshot.forPodsWithAntiAffinity = func(f func(*corev1.Pod, *corev1.Node) bool) {
+		for _, p := range pods {
+			if !f(p.pod, p.node) {
+				return
+			}
+		}
+	}
+	return &snapshot
 }
 
 // snapshotClient memoizes the reads of a client: the first List or Get of each object, list options or key is

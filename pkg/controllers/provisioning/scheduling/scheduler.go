@@ -111,6 +111,9 @@ type options struct {
 	// domainOrder, if set, orders each legacy topology group's domains wherever the group picks between tied domains,
 	// given the group's topology key and hash, and whether it's an inverse group. It's only used by tests.
 	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
+	// forPodsWithAntiAffinity, if set, replaces cluster.ForPodsWithAntiAffinity for the topology's inverse
+	// anti-affinity groups. The shadow topology uses it so both implementations see the same pods.
+	forPodsWithAntiAffinity func(func(*corev1.Pod, *corev1.Node) bool)
 }
 
 type Options = option.Function[options]

@@ -74,6 +74,8 @@ type legacyTopology struct {
 	nodes           map[string]*topologyNode
 	// domainOrder, if set, returns the order hook of each new topology group (see legacyTopologyGroup.order)
 	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
+	// forPodsWithAntiAffinity, if set, replaces cluster.ForPodsWithAntiAffinity (see options)
+	forPodsWithAntiAffinity func(func(*corev1.Pod, *corev1.Node) bool)
 }
 
 // topologyNode is the part of a node that countDomains reads
@@ -94,19 +96,20 @@ func newLegacyTopology(
 	opts *options,
 ) (*legacyTopology, error) {
 	t := &legacyTopology{
-		kubeClient:            kubeClient,
-		preferencePolicy:      opts.preferencePolicy,
-		domainOrder:           opts.domainOrder,
-		cluster:               cluster,
-		stateNodes:            stateNodes,
-		domainGroups:          map[string]TopologyDomainGroup{},
-		domainSources:         newDomainSources(nodePools, instanceTypes),
-		topologyGroups:        map[uint64]*legacyTopologyGroup{},
-		inverseTopologyGroups: map[uint64]*legacyTopologyGroup{},
-		topologyIndex:         newTopologyGroupIndex[*legacyTopologyGroup](),
-		inverseTopologyIndex:  newTopologyGroupIndex[*legacyTopologyGroup](),
-		excludedPods:          sets.New[string](),
-		nodes:                 map[string]*topologyNode{},
+		kubeClient:              kubeClient,
+		preferencePolicy:        opts.preferencePolicy,
+		domainOrder:             opts.domainOrder,
+		forPodsWithAntiAffinity: opts.forPodsWithAntiAffinity,
+		cluster:                 cluster,
+		stateNodes:              stateNodes,
+		domainGroups:            map[string]TopologyDomainGroup{},
+		domainSources:           newDomainSources(nodePools, instanceTypes),
+		topologyGroups:          map[uint64]*legacyTopologyGroup{},
+		inverseTopologyGroups:   map[uint64]*legacyTopologyGroup{},
+		topologyIndex:           newTopologyGroupIndex[*legacyTopologyGroup](),
+		inverseTopologyIndex:    newTopologyGroupIndex[*legacyTopologyGroup](),
+		excludedPods:            sets.New[string](),
+		nodes:                   map[string]*topologyNode{},
 	}
 
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
@@ -321,7 +324,11 @@ func (t *legacyTopology) Unregister(topologyKey string, domain string) {
 // have to look at every pod in the cluster as there is no way to query for a pod with anti-affinity terms.
 func (t *legacyTopology) updateInverseAffinities(ctx context.Context) error {
 	var errs error
-	t.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
+	forPodsWithAntiAffinity := t.forPodsWithAntiAffinity
+	if forPodsWithAntiAffinity == nil {
+		forPodsWithAntiAffinity = t.cluster.ForPodsWithAntiAffinity
+	}
+	forPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
 		// don't count the pod we are excluding
 		if t.excludedPods.Has(string(pod.UID)) {
 			return true
