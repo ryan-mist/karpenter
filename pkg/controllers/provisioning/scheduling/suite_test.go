@@ -101,6 +101,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider.InstanceTypes = instanceTypes
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	ExpectTopologyIndexFromEnv(ctx, env.Client, cluster)
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	podStateController = informer.NewPodController(env.Client, cluster)

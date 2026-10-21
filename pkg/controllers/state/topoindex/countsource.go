@@ -34,6 +34,8 @@ type CountSource struct {
 	// fallback answers the keys the index can't: those whose node filter's hash collides with another filter's
 	fallback topology.CountSource
 	groups   map[*topology.CountKey]pinnedGroup
+	// diff is set in differential mode (see Differential)
+	diff *differential
 }
 
 type pinnedGroup struct {
@@ -46,7 +48,13 @@ var _ topology.CountSource = (*CountSource)(nil)
 // NewCountSource returns a count source over the index's current snapshot, or false if the index can't answer yet
 // because it hasn't seen the informers' initial lists. fallback answers the keys the index can't.
 func NewCountSource(index *Index, fallback topology.CountSource) (*CountSource, bool) {
-	if index == nil || !index.Synced() {
+	if index == nil {
+		return nil, false
+	}
+	if index.beforeCountSource != nil {
+		index.beforeCountSource(index)
+	}
+	if !index.Synced() {
 		return nil, false
 	}
 	return &CountSource{index: index, snapshot: index.Snapshot(), fallback: fallback, groups: map[*topology.CountKey]pinnedGroup{}}, true
@@ -102,6 +110,13 @@ func (s *CountSource) group(key *topology.CountKey) (pinnedGroup, bool) {
 }
 
 func (s *CountSource) Counts(ctx context.Context, key *topology.CountKey) (*topology.BaseCounts, error) {
+	if s.diff != nil {
+		return s.diff.counts(ctx, key)
+	}
+	return s.indexCounts(ctx, key)
+}
+
+func (s *CountSource) indexCounts(ctx context.Context, key *topology.CountKey) (*topology.BaseCounts, error) {
 	g, ok := s.group(key)
 	if !ok {
 		return s.fallback.Counts(ctx, key)
@@ -110,6 +125,13 @@ func (s *CountSource) Counts(ctx context.Context, key *topology.CountKey) (*topo
 }
 
 func (s *CountSource) ExcludedContributions(ctx context.Context, key *topology.CountKey, excluded *topology.ExcludedPods, f func(domain string)) error {
+	if s.diff != nil {
+		return s.diff.excludedContributions(ctx, key, excluded, f)
+	}
+	return s.indexExcludedContributions(ctx, key, excluded, f)
+}
+
+func (s *CountSource) indexExcludedContributions(ctx context.Context, key *topology.CountKey, excluded *topology.ExcludedPods, f func(domain string)) error {
 	g, ok := s.group(key)
 	if !ok {
 		return s.fallback.ExcludedContributions(ctx, key, excluded, f)
@@ -140,7 +162,14 @@ func countableExcluded(snapshot *Snapshot, excluded *topology.ExcludedPods) []Po
 	}).([]PodFact)
 }
 
-func (s *CountSource) InverseAntiAffinityTerms(_ context.Context, excluded *topology.ExcludedPods, f func(*topology.InverseTerm)) error {
+func (s *CountSource) InverseAntiAffinityTerms(ctx context.Context, excluded *topology.ExcludedPods, f func(*topology.InverseTerm)) error {
+	if s.diff != nil {
+		return s.diff.inverseAntiAffinityTerms(ctx, excluded, f)
+	}
+	return s.indexInverseAntiAffinityTerms(excluded, f)
+}
+
+func (s *CountSource) indexInverseAntiAffinityTerms(excluded *topology.ExcludedPods, f func(*topology.InverseTerm)) error {
 	s.snapshot.InverseTerms(func(t *InverseTerm) bool {
 		if term := t.withoutExcluded(excluded); term != nil {
 			f(term)
