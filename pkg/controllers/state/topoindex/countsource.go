@@ -36,6 +36,13 @@ type CountSource struct {
 	groups   map[*topology.CountKey]pinnedGroup
 	// diff is set in differential mode (see Differential)
 	diff *differential
+	// filterMemo memoizes node filter results for excluded pods' nodes; Nodes are immutable
+	filterMemo map[filterMemoKey]bool
+}
+
+type filterMemoKey struct {
+	counts *GroupCounts
+	node   *Node
 }
 
 type pinnedGroup struct {
@@ -57,7 +64,7 @@ func NewCountSource(index *Index, fallback topology.CountSource) (*CountSource, 
 	if !index.Synced() {
 		return nil, false
 	}
-	return &CountSource{index: index, snapshot: index.Snapshot(), fallback: fallback, groups: map[*topology.CountKey]pinnedGroup{}}, true
+	return &CountSource{index: index, snapshot: index.Snapshot(), fallback: fallback, groups: map[*topology.CountKey]pinnedGroup{}, filterMemo: map[filterMemoKey]bool{}}, true
 }
 
 // predicate adapts the scheduler's node predicate. Its key is the predicate's hash; since keys with equal hashes may
@@ -136,8 +143,17 @@ func (s *CountSource) indexExcludedContributions(ctx context.Context, key *topol
 	if !ok {
 		return s.fallback.ExcludedContributions(ctx, key, excluded, f)
 	}
+	matches := func(node *Node) bool {
+		k := filterMemoKey{counts: g.counts, node: node}
+		result, ok := s.filterMemo[k]
+		if !ok {
+			result = g.counts.NodeFilter.Matches(node.Labels, node.Taints)
+			s.filterMemo[k] = result
+		}
+		return result
+	}
 	for _, pod := range countableExcluded(g.snapshot, excluded) {
-		if domain, ok := g.snapshot.Contribution(g.counts, pod); ok {
+		if domain, ok := g.snapshot.contribution(g.counts, pod, matches); ok {
 			f(domain)
 		}
 	}
