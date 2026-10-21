@@ -18,6 +18,8 @@ package scheduling
 
 import (
 	"context"
+	"math/rand/v2"
+	"os"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
@@ -29,6 +31,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/topology"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -51,6 +54,10 @@ type topologyImpl interface {
 	GetTopologyZoneConstraints(p *corev1.Pod, podRequirements scheduling.Requirements) (sets.Set[string], bool)
 	Register(topologyKey string, domain string)
 	Unregister(topologyKey string, domain string)
+	BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements)
+	// seal ends the simulation: afterwards only errors from AddRequirements are rendered (topology errors are lazy), so
+	// an implementation can release what it only needs while scheduling.
+	seal()
 }
 
 func NewTopology(
@@ -63,7 +70,28 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
-	impl, err := newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, option.Resolve(opts...))
+	o := option.Resolve(opts...)
+	report := shadowReporter(ctx)
+	// tests compare after every call; log mode and sampled simulations on real clusters only compare decisions after
+	// NewTopology (see shadowTopology.compareAll)
+	compareAll := os.Getenv(TopologyShadowEnv) == "1"
+	if report == nil && o.topologyShadowSample > 0 && rand.Float64() < o.topologyShadowSample {
+		report = newShadowLogReporter(ctx)
+	}
+	var impl topologyImpl
+	var err error
+	switch {
+	case report != nil:
+		var shadow *shadowTopology
+		if shadow, err = newShadowTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o, report); err == nil {
+			shadow.compareAll = compareAll
+			impl = shadow
+		}
+	case o.topologyEngine == karpopts.TopologyEngineLegacy:
+		impl, err = newLegacyTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
+	default:
+		impl, err = newOverlayTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods, o)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +133,18 @@ func (t *Topology) Register(topologyKey string, domain string) {
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *Topology) Unregister(topologyKey string, domain string) {
 	t.impl.Unregister(topologyKey, domain)
+}
+
+// seal releases what the topology only needs while scheduling, once the scheduler's Solve is done. The topology's
+// errors can still be rendered; any other call is a bug, which panics in tests and is ignored otherwise.
+func (t *Topology) seal() {
+	t.impl.seal()
+}
+
+// BeginPod prepares the topology for the scheduler to try the pod, with its strict requirements, on candidate nodes
+// in parallel. AddRequirements calls with the same requirements are cheaper afterwards; it isn't required.
+func (t *Topology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements) {
+	t.impl.BeginPod(p, podRequirements)
 }
 
 // domainSource is a NodePool's contribution to the universe of domains: the domains its instance types can launch

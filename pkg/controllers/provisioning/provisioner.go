@@ -347,6 +347,11 @@ func (p *Provisioner) NewScheduler(
 	scheduler.NewDefaultTopologySpreadInjector(p.kubeClient).Inject(ctx, pods)
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
+	// the topology implementation is an operator option; options passed in take precedence
+	opts = append([]scheduler.Options{
+		scheduler.TopologyEngine(options.FromContext(ctx).TopologyEngine),
+		scheduler.TopologyShadowSample(options.FromContext(ctx).TopologyShadowSample),
+	}, opts...)
 	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)

@@ -136,6 +136,9 @@ var _ = Describe("Mask", func() {
 			Expect(ids(&a)).To(Equal(sets.List(as)), "Or must not change its argument or the clone's source")
 			Expect(or.Equal(&a)).To(Equal(as.Union(bs).Equal(as)))
 			Expect(a.Equal(&a)).To(BeTrue())
+			for id := range universe + 70 {
+				Expect(a.CountBelow(topology.DomainID(id))).To(Equal(len(lo.Filter(sets.List(as), func(x int, _ int) bool { return x < id }))))
+			}
 
 			// rotated iteration visits ids >= start ascending, then ids < start ascending
 			start := r.Intn(universe + 70)
