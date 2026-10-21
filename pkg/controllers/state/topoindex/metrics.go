@@ -17,6 +17,8 @@ limitations under the License.
 package topoindex
 
 import (
+	"time"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -158,6 +160,18 @@ var (
 		[]opmetrics.Label{},
 		opmetrics.Alpha,
 	)
+	EventDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: subsystem,
+			Name:      "topology_index_event_duration_seconds",
+			Help:      "Duration of applying an informer event that changed a fact to the topology index, including the wait for its lock. Labeled by object kind.",
+			Buckets:   []float64{1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 1e-3, 1e-2},
+		},
+		[]opmetrics.Label{eventKind},
+		opmetrics.Alpha,
+	)
 	RegistrationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
@@ -234,17 +248,28 @@ var (
 	}
 
 	eventLabels   = map[string][2]map[string]string{}
+	kindLabels    = map[string]map[string]string{}
 	countedLabels = map[string]string{stateLabel: stateCounted}
 	ignoredLabels = map[string]string{stateLabel: stateIgnored}
 )
 
 func init() {
 	for _, kind := range []string{kindPod, kindNode, kindNamespace} {
+		kindLabels[kind] = map[string]string{kindLabel: kind}
 		eventLabels[kind] = [2]map[string]string{
 			{kindLabel: kind, resultLabel: resultNoop},
 			{kindLabel: kind, resultLabel: resultDiff},
 		}
 	}
+}
+
+// observeEvent records an applied informer event that started at start. Only events that changed a fact are timed:
+// no-op events (resyncs, status updates) are a map lookup, and timing them would cost more than applying them.
+func observeEvent(kind string, start time.Time, changed bool) {
+	if changed {
+		EventDurationSeconds.Observe(time.Since(start).Seconds(), kindLabels[kind])
+	}
+	eventsTotal(kind, changed)
 }
 
 func eventsTotal(kind string, changed bool) {

@@ -236,10 +236,11 @@ func (ix *Index) Reset() {
 
 // ObservePod records the pod as the informer cache has it. It returns true if a fact changed.
 func (ix *Index) ObservePod(pod *corev1.Pod) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.observePodLocked(pod)
-	eventsTotal(kindPod, changed)
+	observeEvent(kindPod, start, changed)
 	return changed
 }
 
@@ -273,10 +274,11 @@ func (ix *Index) observePodLocked(pod *corev1.Pod) bool {
 
 // DeletePod removes the pod. It returns true if the pod was known.
 func (ix *Index) DeletePod(uid types.UID) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.deletePodLocked(uid)
-	eventsTotal(kindPod, changed)
+	observeEvent(kindPod, start, changed)
 	return changed
 }
 
@@ -389,10 +391,11 @@ func (ix *Index) gcNodeLocked(n *nodeRec) {
 
 // ObserveNode records the Node as the informer cache has it. It returns true if a fact changed.
 func (ix *Index) ObserveNode(node *corev1.Node) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.observeNodeLocked(node)
-	eventsTotal(kindNode, changed)
+	observeEvent(kindNode, start, changed)
 	return changed
 }
 
@@ -442,10 +445,11 @@ func taintsEqual(a, b []corev1.Taint) bool {
 // DeleteNode removes the Node. Pods bound to it stay, and count again if the Node comes back. It returns true if the
 // Node was known.
 func (ix *Index) DeleteNode(name string) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.deleteNodeLocked(name)
-	eventsTotal(kindNode, changed)
+	observeEvent(kindNode, start, changed)
 	return changed
 }
 
@@ -464,10 +468,11 @@ func (ix *Index) deleteNodeLocked(name string) bool {
 
 // ObserveNamespace records the Namespace. It returns true if a fact changed.
 func (ix *Index) ObserveNamespace(namespace *corev1.Namespace) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.observeNamespaceLocked(namespace)
-	eventsTotal(kindNamespace, changed)
+	observeEvent(kindNamespace, start, changed)
 	return changed
 }
 
@@ -482,10 +487,11 @@ func (ix *Index) observeNamespaceLocked(namespace *corev1.Namespace) bool {
 
 // DeleteNamespace removes the Namespace. It returns true if the Namespace was known.
 func (ix *Index) DeleteNamespace(name string) bool {
+	start := time.Now()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	changed := ix.deleteNamespaceLocked(name)
-	eventsTotal(kindNamespace, changed)
+	observeEvent(kindNamespace, start, changed)
 	return changed
 }
 
