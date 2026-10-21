@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"math"
+	"slices"
 	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -763,6 +764,35 @@ var _ = Describe("Requirement", func() {
 			Entry(nil, lessThan9OperatorWithFlexibility, lessThan1OperatorWithFlexibility, lessThan1OperatorWithFlexibility),
 			Entry(nil, lessThan9OperatorWithFlexibility, lessThan9OperatorWithFlexibility, lessThan9OperatorWithFlexibility),
 		)
+	})
+	Context("IntersectionValuesSeq", func() {
+		It("should yield the values of the intersection", func() {
+			mixed := NewRequirement("key", corev1.NodeSelectorOpIn, "1", "5", "9", "A")
+			notInMixed := NewRequirement("key", corev1.NodeSelectorOpNotIn, "2", "B")
+			requirements := []*Requirement{
+				exists, doesNotExist, inA, inB, inAB, notInA, in1, in9, in19, notIn12, greaterThan1, greaterThan9, lessThan1, lessThan9, mixed, notInMixed,
+				existsOperatorWithFlexibility, inABOperatorWithFlexibility, notIn12OperatorWithFlexibility, greaterThan1OperatorWithFlexibility,
+			}
+			for _, a := range requirements {
+				for _, b := range requirements {
+					Expect(sets.New(slices.Collect(a.IntersectionValuesSeq(b))...)).To(Equal(sets.New(a.Intersection(b).Values()...)), "%s ∩ %s", a, b)
+					Expect(slices.Collect(a.IntersectionValuesSeq(b))).To(HaveLen(len(a.Intersection(b).Values())), "%s ∩ %s", a, b)
+				}
+			}
+		})
+		It("should stop when the consumer stops", func() {
+			for v := range inAB.IntersectionValuesSeq(exists) {
+				Expect([]string{"A", "B"}).To(ContainElement(v))
+				break
+			}
+		})
+	})
+	Context("ValuesSeq", func() {
+		It("should yield the same values as Values", func() {
+			for _, r := range []*Requirement{exists, doesNotExist, inAB, notIn12, greaterThan1, lessThan9} {
+				Expect(slices.Collect(r.ValuesSeq())).To(ConsistOf(r.Values()))
+			}
+		})
 	})
 	Context("Has", func() {
 		DescribeTable("should have the right values",
