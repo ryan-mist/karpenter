@@ -109,7 +109,8 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommands orders eligible candidates by the repair score and returns one command for the highest-scoring
 // candidate whose NodePool has budget. Workload-bearing candidates verify rescheduling capacity and pre-spin any
-// required replacement; empty candidates may produce a delete-only command. Only one command per pass, mirroring drift.
+// required replacement; empty candidates may produce a delete-only command. Reboot candidates produce a Reboot command
+// whose handoff to the reboot controller runs when the command starts. Only one command per pass, mirroring drift.
 //
 // It logs the resolved repair decision for each candidate it acts on, which records why that policy and drain bound won.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
@@ -159,17 +160,20 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		candidate.TerminationGracePeriod = effectiveDrainBound(candidate, candidate.RepairPolicyResult)
 		// Reboot is in-place, so skip replacement and termination paths.
 		if candidate.RepairPolicyResult.Action == cloudprovider.RebootNode {
-			committed, err := r.commitReboot(ctx, candidate)
+			nodeClaim, err := r.rebootTarget(ctx, candidate)
 			if err != nil {
 				return []Command{}, err
 			}
-			if !committed {
+			if nodeClaim == nil {
 				continue
 			}
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 				Reboot:              true,
+				commitReboot: func(ctx context.Context) error {
+					return r.commitReboot(ctx, candidate, nodeClaim)
+				},
 			}}, nil
 		}
 		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
@@ -264,16 +268,23 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 	return []Command{}, nil
 }
 
-// commitReboot hands the candidate to the reboot controller and returns false if it is already rebooting or deleting.
-func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, error) {
+// rebootTarget re-reads the candidate's NodeClaim for a reboot, returning nil if it is already rebooting, deleting, or
+// gone, so repair moves on to the next candidate.
+func (r *Repair) rebootTarget(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, error) {
 	// Re-read in case cluster state lags the API server.
 	nodeClaim := &v1.NodeClaim{}
 	if err := r.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-		return false, client.IgnoreNotFound(err)
+		return nil, client.IgnoreNotFound(err)
 	}
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue() || !nodeClaim.DeletionTimestamp.IsZero() {
-		return false, nil
+		return nil, nil
 	}
+	return nodeClaim, nil
+}
+
+// commitReboot hands the candidate to the reboot controller by patching the NodeClaim re-read by rebootTarget. The
+// patches use optimistic locking, so a NodeClaim that changed since that read fails with a conflict.
+func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate, nodeClaim *v1.NodeClaim) error {
 	// Fall back to the NodeClaim TGP; no TGP means an unbounded drain.
 	tgp := candidate.TerminationGracePeriod
 	if tgp == nil && nodeClaim.Spec.TerminationGracePeriod != nil {
@@ -290,7 +301,7 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 	}
 	if !equality.Semantic.DeepEqual(stored.Annotations, nodeClaim.Annotations) {
 		if err := r.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-			return false, err
+			return err
 		}
 	}
 	stored = nodeClaim.DeepCopy()
@@ -299,13 +310,13 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 	nodeClaim.StatusConditions(status.WithClock(r.clock)).SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested,
 		fmt.Sprintf("rebooting for %s/%s", candidate.RepairPolicyResult.Condition, candidate.RepairPolicyResult.Reason))
 	if err := r.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-		return false, err
+		return err
 	}
 	// Make the reboot visible before the informer catches up.
 	r.cluster.UpdateNodeClaim(nodeClaim)
 	r.rebootHistory.RecordCommittedReboot(nodeClaim.UID)
 	log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)).Info("committed node reboot")
-	return true, nil
+	return nil
 }
 
 // breakerTrippedPools returns the NodePools whose unhealthy-node fraction exceeds repairUnhealthyThreshold. A node

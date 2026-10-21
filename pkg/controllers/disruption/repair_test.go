@@ -29,11 +29,14 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -47,6 +50,36 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
+
+// rebootPatchConflictClient fails the patches that commit a reboot with an optimistic-lock conflict.
+type rebootPatchConflictClient struct {
+	client.Client
+	failAnnotationPatch bool
+	failStatusPatch     bool
+}
+
+func (c *rebootPatchConflictClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*v1.NodeClaim); ok && c.failAnnotationPatch {
+		return apierrors.NewConflict(schema.GroupResource{Group: apis.Group, Resource: "nodeclaims"}, obj.GetName(), errors.New("injected conflict"))
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func (c *rebootPatchConflictClient) Status() client.SubResourceWriter {
+	return &rebootStatusConflictWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type rebootStatusConflictWriter struct {
+	client.SubResourceWriter
+	client *rebootPatchConflictClient
+}
+
+func (w *rebootStatusConflictWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if _, ok := obj.(*v1.NodeClaim); ok && w.client.failStatusPatch {
+		return apierrors.NewConflict(schema.GroupResource{Group: apis.Group, Resource: "nodeclaims"}, obj.GetName(), errors.New("injected conflict"))
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
 
 type terminationTimestampPatchErrorClient struct {
 	client.Client
@@ -323,6 +356,153 @@ var _ = Describe("Repair", func() {
 		Expect(nodeClaim.Annotations).ToNot(HaveKey(v1.RebootTerminationGracePeriodAnnotationKey))
 	})
 
+	Context("reboot commit", func() {
+		var conflictClient *rebootPatchConflictClient
+
+		BeforeEach(func() {
+			useRepairPolicies([]cloudprovider.RepairPolicy{
+				{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "RebootMe", TolerationDuration: 10 * time.Minute, Action: cloudprovider.RebootNode, TerminationGracePeriod: lo.ToPtr(5 * time.Minute)},
+				// Required default fallback; its toleration outlasts these specs so only history escalates to replace.
+				{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 48 * time.Hour, Action: cloudprovider.ReplaceNode},
+			})
+			// Only repair writes through the conflicting client, so the controller's own sweep is unaffected.
+			conflictClient = &rebootPatchConflictClient{Client: env.Client}
+			repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, conflictClient, prov, cloudProvider, recorder, queue))
+			repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(repair))
+		})
+
+		expectRebootCommitted := func(nc *v1.NodeClaim) {
+			GinkgoHelper()
+			nc = ExpectExists(ctx, env.Client, nc)
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue()).To(BeTrue())
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+			Expect(nc.Annotations).To(HaveKeyWithValue(v1.RebootTerminationGracePeriodAnnotationKey, "5m0s"))
+		}
+		expectRebootNotCommitted := func(nc *v1.NodeClaim) {
+			GinkgoHelper()
+			nc = ExpectExists(ctx, env.Client, nc)
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue()).To(BeFalse())
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeFalse())
+		}
+
+		It("should requeue without committing when the reboot status patch conflicts, and not consume reboot history", func() {
+			initNode(nodeClaim, node)
+			markUnhealthyWithReason(node, "BadNode", "RebootMe")
+			env.Clock.Step(11 * time.Minute)
+			conflictClient.failStatusPatch = true
+
+			// More conflicts than rebootsBeforeReplacement: a conflict that consumed history would escalate to replace.
+			for range 3 {
+				result, err := repairController.Reconcile(ctx)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Requeue).To(BeTrue())
+				Expect(queue.GetCommands()).To(BeEmpty())
+				expectRebootNotCommitted(nodeClaim)
+				// The annotation patch ahead of the status patch already landed.
+				Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(HaveKeyWithValue(v1.RebootTerminationGracePeriodAnnotationKey, "5m0s"))
+			}
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_decisions_total", map[string]string{"decision": string(disruption.RebootDecision)})
+			Expect(found).To(BeFalse())
+
+			conflictClient.failStatusPatch = false
+			result := ExpectSingletonReconciled(ctx, repairController)
+			Expect(result.RequeueAfter).To(Equal(singleton.RequeueImmediately))
+			Expect(queue.GetCommands()).To(BeEmpty())
+			expectRebootCommitted(nodeClaim)
+		})
+
+		It("should requeue without committing when the reboot TGP annotation patch conflicts", func() {
+			initNode(nodeClaim, node)
+			markUnhealthyWithReason(node, "BadNode", "RebootMe")
+			env.Clock.Step(11 * time.Minute)
+			conflictClient.failAnnotationPatch = true
+
+			result, err := repairController.Reconcile(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Requeue).To(BeTrue())
+			Expect(queue.GetCommands()).To(BeEmpty())
+			expectRebootNotCommitted(nodeClaim)
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.RebootTerminationGracePeriodAnnotationKey))
+
+			conflictClient.failAnnotationPatch = false
+			ExpectSingletonReconciled(ctx, repairController)
+			expectRebootCommitted(nodeClaim)
+		})
+
+		It("should compute a reboot command without writing to the API server, and commit it when the command starts", func() {
+			initNode(nodeClaim, node)
+			markUnhealthyWithReason(node, "BadNode", "RebootMe")
+			env.Clock.Step(11 * time.Minute)
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(candidates).To(HaveLen(1))
+
+			cmds, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.RebootDecision))
+			expectRebootNotCommitted(nodeClaim)
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.RebootTerminationGracePeriodAnnotationKey))
+
+			cmds[0].Method = repair
+			Expect(queue.StartCommand(ctx, &cmds[0])).To(Succeed())
+			expectRebootCommitted(nodeClaim)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 1, map[string]string{
+				"decision":          string(disruption.RebootDecision),
+				metrics.ReasonLabel: strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
+			})
+		})
+
+		// Cluster state can lag the API server, so the commit re-reads the NodeClaim; a candidate the API server already
+		// shows as rebooting, deleting, or gone is skipped and the next candidate is rebooted in the same pass.
+		DescribeTable("should skip a candidate the API server already shows as unavailable for reboot",
+			func(mutate func(*v1.NodeClaim), firstRebooted bool) {
+				first, firstNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+				initNode(first, firstNode)
+				initNode(nodeClaim, node)
+				// Healthy nodes keep two unhealthy nodes under the NodePool's repair circuit breaker.
+				healthyNodeClaims, healthyNodes := test.NodeClaimsAndNodes(4, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+				for i := range healthyNodes {
+					initNode(healthyNodeClaims[i], healthyNodes[i])
+				}
+				// The first node's condition is older, so it scores higher and is tried first.
+				markUnhealthyWithReason(firstNode, "BadNode", "RebootMe")
+				env.Clock.Step(time.Minute)
+				markUnhealthyWithReason(node, "BadNode", "RebootMe")
+				env.Clock.Step(11 * time.Minute)
+				// Change only the API server; cluster state still shows the first NodeClaim as rebootable.
+				mutate(first.DeepCopy())
+
+				result := ExpectSingletonReconciled(ctx, repairController)
+				Expect(result.RequeueAfter).To(Equal(singleton.RequeueImmediately))
+				Expect(queue.GetCommands()).To(BeEmpty())
+				ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 1, map[string]string{
+					"decision":          string(disruption.RebootDecision),
+					metrics.ReasonLabel: strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
+				})
+				if firstRebooted {
+					expectRebootCommitted(first)
+					expectRebootNotCommitted(nodeClaim)
+					return
+				}
+				expectRebootCommitted(nodeClaim)
+			},
+			Entry("reboots the higher-scoring candidate when nothing changed", func(*v1.NodeClaim) {}, true),
+			Entry("already rebooting", func(nc *v1.NodeClaim) {
+				nc = ExpectExists(ctx, env.Client, nc)
+				nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "rebooting")
+				Expect(env.Client.Status().Update(ctx, nc)).To(Succeed())
+			}, false),
+			Entry("deleting", func(nc *v1.NodeClaim) { ExpectDeletionTimestampSet(ctx, env.Client, nc) }, false),
+			Entry("gone", func(nc *v1.NodeClaim) {
+				ExpectFinalizersRemoved(ctx, env.Client, nc)
+				ExpectDeleted(ctx, env.Client, nc)
+			}, false),
+		)
+	})
 	Context("reboot history", func() {
 		BeforeEach(func() {
 			useRepairPolicies([]cloudprovider.RepairPolicy{
