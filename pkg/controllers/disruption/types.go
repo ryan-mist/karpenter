@@ -146,9 +146,21 @@ func (c *Candidate) IsEmpty() bool {
 	return c.RescheduleDisruptionCost <= disruptionutils.PerNodeBaseDisruptionCost
 }
 
-//nolint:gocyclo // Candidate validation is clearer as one linear workflow.
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
+) (*Candidate, error) {
+	return newCandidate(ctx, recorder, clk, node, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass, func() ([]*corev1.Pod, error) {
+		return node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder)
+	})
+}
+
+// newCandidate is NewCandidate with the pod list and pod checks (StateNode.ValidatePodsDisruptable) behind validatePods.
+// They are the only class-independent API work, so a CandidateSnapshot runs them once per node for every class.
+//
+//nolint:gocyclo // Candidate validation is clearer as one linear workflow.
+func newCandidate(ctx context.Context, recorder events.Recorder, clk clock.Clock, node *state.StateNode,
+	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
+	validatePods func() ([]*corev1.Pod, error),
 ) (*Candidate, error) {
 	// If the orchestration queue is already considering a candidate we want to disrupt, don't consider it a candidate.
 	if queue.HasAny(node.ProviderID()) {
@@ -191,7 +203,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	pods, err := node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder)
+	pods, err := validatePods()
 	hasPodBlockers := false
 	if err != nil {
 		// Repair resolves its policy deadline after candidate construction, so retain whether pod blockers were ignored

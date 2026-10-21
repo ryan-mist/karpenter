@@ -177,9 +177,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 
 	// Attempt different disruption methods. We'll only let one method perform an action
+	// Consecutive methods share one candidate snapshot, until one of them has candidates (see methodCandidates).
+	var snapshot *CandidateSnapshot
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m)
+		success, err := c.disrupt(ctx, m, &snapshot)
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
@@ -195,12 +197,14 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **CandidateSnapshot) (bool, error) {
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
-	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	candidates, allCandidates, s, err := methodCandidates(ctx, disruption, snapshot, func() (*CandidateSnapshot, error) {
+		return NewCandidateSnapshot(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, c.queue)
+	})
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
@@ -214,7 +218,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
-		setter.SetNodePoolTotals(nodePoolTotals)
+		setter.SetNodePoolTotals(s.NodePoolTotals(ctx, allCandidates, c.clusterCost))
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 	if err != nil {
@@ -248,6 +252,27 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("disrupting candidates, %w", err)
 	}
 	return true, nil
+}
+
+// methodCandidates returns m's candidates, and all candidates of m's class (for NodePoolTotals), from *snapshot. It
+// builds *snapshot first if it is nil. A method with no candidates only runs ShouldDisrupt, which writes nothing but its
+// own Candidates, so the next method may reuse the snapshot. A method with candidates goes on to ComputeCommands, which
+// can take minutes (simulations, validation waits) and modifies candidate pods (scheduling injects topology spread
+// constraints and relaxes preferences in place), so *snapshot is cleared and the next method builds a fresh one, as
+// every method did before snapshots were shared.
+func methodCandidates(ctx context.Context, m Method, snapshot **CandidateSnapshot, build func() (*CandidateSnapshot, error)) (candidates, allCandidates []*Candidate, s *CandidateSnapshot, err error) {
+	if *snapshot == nil {
+		if *snapshot, err = build(); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	s = *snapshot
+	allCandidates = s.Candidates(ctx, m.Class())
+	candidates = lo.Filter(allCandidates, func(cn *Candidate, _ int) bool { return m.ShouldDisrupt(ctx, cn) })
+	if len(candidates) > 0 {
+		*snapshot = nil
+	}
+	return candidates, allCandidates, s, nil
 }
 
 func (c *Controller) recordRun(s string) {
