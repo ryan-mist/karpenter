@@ -104,6 +104,8 @@ type options struct {
 	creditReservationCapacity map[string]int
 	// topologySeed seeds the tie-breaking between topology domains with equal counts. It's random if unset.
 	topologySeed *uint64
+	// topologyEngine selects the topology implementation: topologyEngineLegacy (the default) or topologyEngineOverlay
+	topologyEngine string
 	// domainOrder, if set, orders each legacy topology group's domains wherever the group picks between tied domains,
 	// given the group's topology key and hash, and whether it's an inverse group. It's only used by tests.
 	domainOrder func(key string, hash uint64, inverse bool) func(domains []string)
@@ -647,6 +649,9 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if err := s.cachedPodData[pod.UID].ResourceClaimErr; err != nil {
 		return err
 	}
+
+	// the candidates below are tried in parallel, so the topology prepares what doesn't depend on the candidate first
+	s.topology.BeginPod(pod, s.cachedPodData[pod.UID].StrictRequirements)
 
 	// determine the volumes that will be mounted if the pod schedules
 	volumes, err := scheduling.GetVolumes(ctx, s.kubeClient, pod)

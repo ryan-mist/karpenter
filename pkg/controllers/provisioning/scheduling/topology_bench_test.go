@@ -234,31 +234,45 @@ func benchmarkForEachDomain(b *testing.B, domains, taintGroupsPerDomain int, tol
 // placement (Record) as the number of topology groups grows. Each Deployment has a zone spread and every 4th also has
 // hostname self anti-affinity, so the groups include owned, selecting and inverse anti-affinity groups.
 func BenchmarkTopologyGroups(b *testing.B) {
-	for _, deployments := range []int{10, 100, 500} {
-		topology, pods := benchTopologyGroups(b, deployments)
-		podRequirements := pscheduling.NewRequirements()
-		nodeRequirements := pscheduling.NewRequirements(
-			pscheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "test-zone-1"),
-			pscheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpIn, "bench-host"),
-		)
-		b.Run(fmt.Sprintf("op=AddRequirements/deployments=%d", deployments), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; b.Loop(); i++ {
-				if _, err := topology.AddRequirements(pods[i%len(pods)], nil, podRequirements, nodeRequirements); err != nil {
-					b.Fatalf("adding requirements: %s", err)
+	for _, engine := range []string{"legacy", "overlay"} {
+		for _, deployments := range []int{10, 100, 500} {
+			topology, pods := benchTopologyGroups(b, deployments, scheduling.TopologyEngine(engine))
+			podRequirements := pscheduling.NewRequirements()
+			nodeRequirements := pscheduling.NewRequirements(
+				pscheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "test-zone-1"),
+				pscheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpIn, "bench-host"),
+			)
+			b.Run(fmt.Sprintf("engine=%s/op=AddRequirements/deployments=%d", engine, deployments), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; b.Loop(); i++ {
+					if _, err := topology.AddRequirements(pods[i%len(pods)], nil, podRequirements, nodeRequirements); err != nil {
+						b.Fatalf("adding requirements: %s", err)
+					}
 				}
-			}
-		})
-		b.Run(fmt.Sprintf("op=Record/deployments=%d", deployments), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; b.Loop(); i++ {
-				topology.Record(pods[i%len(pods)], nil, nodeRequirements)
-			}
-		})
+			})
+			// the scheduler plans each pod once, then tries it on every candidate
+			b.Run(fmt.Sprintf("engine=%s/op=AddRequirementsPlanned/deployments=%d", engine, deployments), func(b *testing.B) {
+				for _, p := range pods {
+					topology.BeginPod(p, podRequirements)
+				}
+				b.ReportAllocs()
+				for i := 0; b.Loop(); i++ {
+					if _, err := topology.AddRequirements(pods[i%len(pods)], nil, podRequirements, nodeRequirements); err != nil {
+						b.Fatalf("adding requirements: %s", err)
+					}
+				}
+			})
+			b.Run(fmt.Sprintf("engine=%s/op=Record/deployments=%d", engine, deployments), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; b.Loop(); i++ {
+					topology.Record(pods[i%len(pods)], nil, nodeRequirements)
+				}
+			})
+		}
 	}
 }
 
-func benchTopologyGroups(b *testing.B, deployments int) (*scheduling.Topology, []*corev1.Pod) {
+func benchTopologyGroups(b *testing.B, deployments int, opts ...scheduling.Options) (*scheduling.Topology, []*corev1.Pod) {
 	ctx := benchCtx()
 	cp := fake.NewCloudProvider()
 	client := fakecr.NewFakeClient()
@@ -286,7 +300,7 @@ func benchTopologyGroups(b *testing.B, deployments int) (*scheduling.Topology, [
 		}
 		pods = append(pods, test.Pod(opts))
 	}
-	topology, err := scheduling.NewTopology(ctx, client, cl, nil, nodePools, itsByNP, pods)
+	topology, err := scheduling.NewTopology(ctx, client, cl, nil, nodePools, itsByNP, pods, opts...)
 	if err != nil {
 		b.Fatalf("creating topology: %s", err)
 	}

@@ -297,6 +297,9 @@ func (t *legacyTopology) Register(topologyKey string, domain string) {
 	}
 }
 
+// BeginPod does nothing; the legacy topology has no per-pod plan.
+func (t *legacyTopology) BeginPod(*corev1.Pod, scheduling.Requirements) {}
+
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *legacyTopology) Unregister(topologyKey string, domain string) {
 	for _, topology := range t.topologyGroups {

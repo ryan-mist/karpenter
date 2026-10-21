@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"reflect"
 	"slices"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -28,6 +29,7 @@ import (
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -60,6 +62,18 @@ type overlayTopology struct {
 	domainSources []domainSource
 	presence      *presenceIndex
 	hosts         *hostLog
+	// plans hold each pod's candidate-independent part of AddRequirements, built by BeginPod. version counts the
+	// changes to the groups, so that a plan built before one isn't used.
+	plans   map[types.UID]*podPlan
+	version uint64
+}
+
+// podPlan is the part of AddRequirements for a pod that doesn't depend on the candidate node: the groups that
+// constrain the pod and their plan entries.
+type podPlan struct {
+	version         uint64
+	podRequirements scheduling.Requirements
+	entries         []planEntry
 }
 
 func newOverlayTopology(
@@ -87,6 +101,7 @@ func newOverlayTopology(
 		domainSources: newDomainSources(nodePools, instanceTypes),
 		presence:      newPresenceIndex(stateNodes),
 		hosts:         &hostLog{last: map[string]int{}},
+		plans:         map[types.UID]*podPlan{},
 	}
 	if opts.topologySeed != nil {
 		t.seed = *opts.topologySeed
@@ -142,6 +157,8 @@ func (t overlayTopologyError) Error() string {
 // relaxation of a preference to properly break the topology <-> owner relationship so that the preferred topology will
 // no longer influence scheduling.
 func (t *overlayTopology) Update(ctx context.Context, p *corev1.Pod) error {
+	t.version++
+	delete(t.plans, p.UID)
 	t.index.removeOwner(p.UID)
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
@@ -219,6 +236,7 @@ func (t *overlayTopology) newInverseGroup(id *TopologyGroupIdentity) *TopologyGr
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
 func (t *overlayTopology) Record(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) {
+	t.version++
 	// once we've committed to a domain, we record the usage in every topology that cares about it
 	t.index.forEachCandidate(p, func(tg *TopologyGroup) {
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
@@ -241,26 +259,68 @@ func (t *overlayTopology) Record(p *corev1.Pod, taints []corev1.Taint, requireme
 	}
 }
 
+// BeginPod computes the part of AddRequirements for the pod that doesn't depend on the candidate node, before the
+// scheduler tries the candidates in parallel. It must be called serially. AddRequirements uses the plan as long as it
+// gets the same pod requirements and no group changed since.
+func (t *overlayTopology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements) {
+	t.plans[p.UID] = &podPlan{version: t.version, podRequirements: podRequirements, entries: t.planEntries(p, podRequirements)}
+}
+
+// planEntries returns the entries of the groups that either control the scheduling of the pod, or that select the pod
+// so that its scheduling affects their counts: the groups it owns, then the inverse groups that select it. Inverse
+// groups have no node filter, so which of them select the pod doesn't depend on the node.
+func (t *overlayTopology) planEntries(p *corev1.Pod, podRequirements scheduling.Requirements) []planEntry {
+	owned := t.index.ownedBy(p.UID)
+	entries := make([]planEntry, 0, len(owned))
+	add := func(tg *TopologyGroup) {
+		podDomains := scheduling.NewRequirement(tg.Key, corev1.NodeSelectorOpExists)
+		if podRequirements.Has(tg.Key) {
+			podDomains = podRequirements.Get(tg.Key)
+		}
+		entries = append(entries, tg.newPlanEntry(p, podDomains))
+	}
+	for _, tg := range owned {
+		add(tg)
+	}
+	t.inverseIndex.forEachCandidate(p, func(tg *TopologyGroup) {
+		if tg.selects(p) {
+			add(tg)
+		}
+	})
+	return entries
+}
+
+// plan returns the pod's plan if it's current for the pod requirements
+func (t *overlayTopology) plan(p *corev1.Pod, podRequirements scheduling.Requirements) []planEntry {
+	if plan, ok := t.plans[p.UID]; ok && plan.version == t.version && sameRequirements(plan.podRequirements, podRequirements) {
+		return plan.entries
+	}
+	return t.planEntries(p, podRequirements)
+}
+
+// sameRequirements reports whether a and b are the same requirements (not just equal ones)
+func sameRequirements(a, b scheduling.Requirements) bool {
+	return reflect.ValueOf(a).UnsafePointer() == reflect.ValueOf(b).UnsafePointer()
+}
+
 // AddRequirements tightens the input requirements by adding additional requirements that are being enforced by topology spreads
 // affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
 // cannot be satisfied.
-func (t *overlayTopology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+func (t *overlayTopology) AddRequirements(p *corev1.Pod, _ []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, _ ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
-	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
-		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		if podRequirements.Has(topology.Key) {
-			podDomains = podRequirements.Get(topology.Key)
+	entries := t.plan(p, podRequirements)
+	for i := range entries {
+		e := &entries[i]
+		nodeDomains := scheduling.NewRequirement(e.tg.Key, corev1.NodeSelectorOpExists)
+		if nodeRequirements.Has(e.tg.Key) {
+			nodeDomains = nodeRequirements.Get(e.tg.Key)
 		}
-		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		if nodeRequirements.Has(topology.Key) {
-			nodeDomains = nodeRequirements.Get(topology.Key)
-		}
-		domains, _ := topology.Get(p, podDomains, nodeDomains)
+		domains := e.tg.next(e, nodeDomains, nil)
 		if domains.Len() == 0 {
 			return nil, overlayTopologyError{
-				topology:    topology,
-				podDomains:  podDomains,
+				topology:    e.tg,
+				podDomains:  e.podDomains,
 				nodeDomains: nodeDomains,
 			}
 		}
@@ -305,6 +365,7 @@ func (t *overlayTopology) GetTopologyZoneConstraints(p *corev1.Pod, podRequireme
 // Register is used to register a domain as available across topologies for the given topology key. Hostnames are
 // logged once for all groups instead (hostLog).
 func (t *overlayTopology) Register(topologyKey string, domain string) {
+	t.version++
 	if topologyKey == corev1.LabelHostname {
 		t.hosts.register(domain)
 		return
@@ -320,6 +381,7 @@ func (t *overlayTopology) Register(topologyKey string, domain string) {
 
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *overlayTopology) Unregister(topologyKey string, domain string) {
+	t.version++
 	for _, groups := range []map[uint64]*TopologyGroup{t.groups, t.inverseGroups} {
 		for _, tg := range groups {
 			if tg.Key == topologyKey {
@@ -485,19 +547,6 @@ func (t *overlayTopology) buildNamespaceList(ctx context.Context, namespace stri
 	}
 	selected.Insert(namespaces...)
 	return selected, nil
-}
-
-// getMatchingTopologies returns a sorted list of topologies that either control the scheduling of pod p, or for which
-// the topology selects pod p and the scheduling of p affects the count per topology domain
-func (t *overlayTopology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*TopologyGroup {
-	// clone so that appending can't write into the index's backing array, which is shared by concurrent callers
-	matchingTopologies := slices.Clone(t.index.ownedBy(p.UID))
-	t.inverseIndex.forEachCandidate(p, func(tg *TopologyGroup) {
-		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
-			matchingTopologies = append(matchingTopologies, tg)
-		}
-	})
-	return matchingTopologies
 }
 
 // sortDomains sorts the domains into the order in which the group with the hash breaks ties. The shadow topology uses

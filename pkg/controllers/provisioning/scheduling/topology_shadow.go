@@ -193,6 +193,11 @@ func (s *shadowTopology) GetTopologyZoneConstraints(p *corev1.Pod, podRequiremen
 	return overlay, overlayOK
 }
 
+func (s *shadowTopology) BeginPod(p *corev1.Pod, podRequirements scheduling.Requirements) {
+	s.overlay.BeginPod(p, podRequirements)
+	s.legacy.BeginPod(p, podRequirements)
+}
+
 func (s *shadowTopology) Register(topologyKey string, domain string) {
 	s.overlay.Register(topologyKey, domain)
 	s.legacy.Register(topologyKey, domain)

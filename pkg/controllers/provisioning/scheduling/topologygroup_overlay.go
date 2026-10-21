@@ -459,16 +459,52 @@ func (t *TopologyGroup) mask(r *scheduling.Requirement) topology.Mask {
 	return m
 }
 
+// planEntry is the part of a group's decision for a pod that doesn't depend on the node the pod is placed on, so it's
+// computed once per pod (see overlayTopology.BeginPod) instead of once per candidate node.
+type planEntry struct {
+	tg         *TopologyGroup
+	podDomains *scheduling.Requirement
+	// podMask has the group's present domains that podDomains allows, for dense keys
+	podMask       topology.Mask
+	selfSelecting bool
+	// min is the global min count of a topology spread constraint's domains that the pod supports
+	min int32
+}
+
+// newPlanEntry returns the group's entry for the pod and its domains
+func (t *TopologyGroup) newPlanEntry(pod *corev1.Pod, podDomains *scheduling.Requirement) planEntry {
+	e := planEntry{tg: t, podDomains: podDomains, selfSelecting: t.selects(pod)}
+	if t.dense != nil {
+		e.podMask = t.mask(podDomains)
+	}
+	if t.Type == TopologyTypeSpread {
+		e.min = t.domainMinCount(&e)
+	}
+	return e
+}
+
+// Get returns the domains the pod can schedule to, along with the domains that are valid for a topology spread
+// constraint, given the pod's and the node's domains.
 func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
+	e := t.newPlanEntry(pod, podDomains)
+	validDomains := sets.New[string]()
+	req := t.next(&e, nodeDomains, validDomains)
+	if t.Type != TopologyTypeSpread {
+		validDomains.Insert(req.Values()...)
+	}
+	return req, validDomains
+}
+
+// next returns the domains the pod of the entry can schedule to on a node with the domains. For a topology spread
+// constraint, validDomains, if not nil, receives the domains that satisfy its max skew.
+func (t *TopologyGroup) next(e *planEntry, nodeDomains *scheduling.Requirement, validDomains sets.Set[string]) *scheduling.Requirement {
 	switch t.Type {
 	case TopologyTypeSpread:
-		return t.nextDomainTopologySpread(pod, podDomains, nodeDomains)
+		return t.nextDomainTopologySpread(e, nodeDomains, validDomains)
 	case TopologyTypePodAffinity:
-		req := t.nextDomainAffinity(pod, podDomains, nodeDomains)
-		return req, sets.New[string](req.Values()...)
+		return t.nextDomainAffinity(e, nodeDomains)
 	case TopologyTypePodAntiAffinity:
-		req := t.nextDomainAntiAffinity(podDomains, nodeDomains)
-		return req, sets.New[string](req.Values()...)
+		return t.nextDomainAntiAffinity(e, nodeDomains)
 	default:
 		panic(fmt.Sprintf("Unrecognized topology group type: %s", t.Type))
 	}
@@ -479,42 +515,41 @@ func (t *TopologyGroup) isHostnameFastPath(nodeDomains *scheduling.Requirement) 
 	return t.Key == corev1.LabelHostname && nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1
 }
 
-// nextDomainTopologySpread returns a scheduling.Requirement that includes a node domain that a pod should be scheduled to,
-// along with the domains that satisfied the maxSkew constraint. If there are multiple eligible domains, it returns the
-// first with the lowest count in the group's order. If there are no eligible domains, it returns a `DoesNotExist`
-// requirement, implying that we could not satisfy the topologySpread requirement.
-func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
-	selfSelecting := t.selects(pod)
-	validDomains := sets.New[string]()
-
+// nextDomainTopologySpread returns a scheduling.Requirement that includes a node domain that a pod should be scheduled to.
+// If there are multiple eligible domains, it returns the first with the lowest count in the group's order. If there
+// are no eligible domains, it returns a `DoesNotExist` requirement, implying that we could not satisfy the
+// topologySpread requirement.
+func (t *TopologyGroup) nextDomainTopologySpread(e *planEntry, nodeDomains *scheduling.Requirement, validDomains sets.Set[string]) *scheduling.Requirement {
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
 	if t.isHostnameFastPath(nodeDomains) {
 		hostName := nodeDomains.Values()[0]
 		count := t.count(hostName) // produces a 0 value for new NodeClaims
-		if selfSelecting {
+		if e.selfSelecting {
 			count++
 		}
 		// Because Karpenter can always create a new domain for hostname, we assume the global miniumum is always zero
 		// This means we can just check whether our current count is less than or equal to the skew to check if the domain is valid
 		if count <= t.MaxSkew {
-			validDomains.Insert(hostName)
-			return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpIn, hostName), validDomains
+			if validDomains != nil {
+				validDomains.Insert(hostName)
+			}
+			return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpIn, hostName)
 		}
-		return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist), validDomains
+		return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 	}
 
-	// min count is calculated across all domains
-	min := t.domainMinCount(podDomains)
 	minDomain := ""
 	minCount := int32(math.MaxInt32)
 	// comment from kube-scheduler regarding the viable choices to schedule to based on skew is:
 	// 'existing matching num' + 'if self-match (1 or 0)' - 'global min matching num' <= 'maxSkew'
 	consider := func(domain string, count int32) {
-		if selfSelecting {
+		if e.selfSelecting {
 			count++
 		}
-		if count-min <= t.MaxSkew {
-			validDomains.Insert(domain)
+		if count-e.min <= t.MaxSkew {
+			if validDomains != nil {
+				validDomains.Insert(domain)
+			}
 			if count < minCount {
 				minDomain = domain
 				minCount = count
@@ -538,12 +573,14 @@ func (t *TopologyGroup) nextDomainTopologySpread(pod *corev1.Pod, podDomains, no
 	}
 	if minDomain == "" {
 		// avoids an error message about 'zone in [""]', preferring 'zone in []'
-		return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist), validDomains
+		return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 	}
-	return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpIn, minDomain), validDomains
+	return scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpIn, minDomain)
 }
 
-func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
+// domainMinCount returns the global min count over the domains the entry's pod supports, or 0 if those are fewer than
+// min domains
+func (t *TopologyGroup) domainMinCount(e *planEntry) int32 {
 	// hostname based topologies always have a min pod count of zero since we can create one
 	if t.Key == corev1.LabelHostname {
 		return 0
@@ -553,15 +590,14 @@ func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
 	var numPodSupportedDomains int32
 	// determine our current min count
 	if d := t.dense; d != nil {
-		supported := t.mask(domains)
-		numPodSupportedDomains = int32(supported.Count())
-		supported.ForEach(func(id topology.DomainID) bool {
+		numPodSupportedDomains = int32(e.podMask.Count())
+		e.podMask.ForEach(func(id topology.DomainID) bool {
 			min = minInt32(min, d.counts[id])
 			return true
 		})
 	} else {
 		for _, domain := range t.sparse.domains() {
-			if domains.Has(domain) {
+			if e.podDomains.Has(domain) {
 				numPodSupportedDomains++
 				min = minInt32(min, t.sparse.count(domain))
 			}
@@ -581,8 +617,9 @@ func minInt32(a, b int32) int32 {
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *TopologyGroup) nextDomainAffinity(e *planEntry, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
+	podDomains := e.podDomains
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
 	if t.isHostnameFastPath(nodeDomains) {
@@ -594,7 +631,7 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 			options.Insert(hostName)
 			return options
 		}
-		if t.selects(pod) && !t.anyCompatiblePodDomain(podDomains) {
+		if e.selfSelecting && !t.anyCompatiblePodDomain(e) {
 			options.Insert(hostName)
 			return options
 		}
@@ -604,8 +641,8 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 	// the domains with a matching pod that both the pod and node allow
 	if d := t.dense; d != nil {
 		view := d.dict.View()
-		podMask, nodeMask := t.mask(podDomains), t.mask(nodeDomains)
-		matching := podMask.And(&nodeMask)
+		nodeMask := t.mask(nodeDomains)
+		matching := e.podMask.And(&nodeMask)
 		matching = matching.And(&d.nonzero)
 		matching.ForEach(func(id topology.DomainID) bool {
 			options.Insert(view.Name(id))
@@ -624,7 +661,7 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 
 	// If pod is self-selecting and no pod has been scheduled yet OR the pods that have scheduled are
 	// incompatible with our podDomains, we can pick a domain to bootstrap scheduling.
-	if t.selects(pod) && !t.anyCompatiblePodDomain(podDomains) {
+	if e.selfSelecting && !t.anyCompatiblePodDomain(e) {
 		// First try to find a domain that is within the intersection of pod/node domains. In the case of an in-flight node
 		// this causes us to pick the domain that the existing in-flight node is already in if possible instead of picking
 		// any viable domain.
@@ -667,23 +704,22 @@ func (t *TopologyGroup) firstDomain(f func(domain string) bool) (string, bool) {
 // This is only useful in affinity checking because it tells us whether we can schedule the pod
 // to the current node since it is the first pod that exists in the TopologyGroup OR all other domains
 // in the TopologyGroup are incompatible with the podDomains
-func (t *TopologyGroup) anyCompatiblePodDomain(podDomains *scheduling.Requirement) bool {
+func (t *TopologyGroup) anyCompatiblePodDomain(e *planEntry) bool {
 	if d := t.dense; d != nil {
-		podMask := t.mask(podDomains)
-		return podMask.Intersects(&d.nonzero)
+		return e.podMask.Intersects(&d.nonzero)
 	}
 	if t.sparse.nonzero == 0 {
 		return false
 	}
 	found := false
 	t.sparse.forEachNonZero(func(domain string) bool {
-		found = podDomains.Has(domain)
+		found = e.podDomains.Has(domain)
 		return !found
 	})
 	return found
 }
 
-func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *TopologyGroup) nextDomainAntiAffinity(e *planEntry, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 	// pods with anti-affinity must schedule to a domain where there are currently none of those pods (an empty
 	// domain). If there are none of those domains, then the pod can't schedule.
@@ -699,9 +735,8 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 
 	if d := t.dense; d != nil {
 		view := d.dict.View()
-		empty := d.present.AndNot(&d.nonzero)
-		podMask, nodeMask := t.mask(podDomains), t.mask(nodeDomains)
-		empty = empty.And(&podMask)
+		empty := e.podMask.AndNot(&d.nonzero)
+		nodeMask := t.mask(nodeDomains)
 		empty = empty.And(&nodeMask)
 		empty.ForEach(func(id topology.DomainID) bool {
 			options.Insert(view.Name(id))
@@ -710,7 +745,7 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 		return options
 	}
 	for _, domain := range t.sparse.domains() {
-		if t.sparse.count(domain) == 0 && nodeDomains.Has(domain) && podDomains.Has(domain) {
+		if t.sparse.count(domain) == 0 && nodeDomains.Has(domain) && e.podDomains.Has(domain) {
 			options.Insert(domain)
 		}
 	}
