@@ -41,7 +41,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -51,11 +50,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
-	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
 type Controller struct {
 	queue         *Queue
+	sweeper       *MarkSweeper
 	kubeClient    client.Client
 	cluster       *state.Cluster
 	provisioner   *provisioning.Provisioner
@@ -93,6 +92,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	}
 	return &Controller{
 		queue:         queue,
+		sweeper:       NewMarkSweeper(kubeClient, cluster, clk),
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cluster:       cluster,
@@ -165,20 +165,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
 	// Reboot bypasses the queue, so preserve its DisruptionReason during drain.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || s.RebootInProgress()
-	})
-	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
+	if err := c.sweeper.Sweep(ctx, c.keepDisruptionMarks); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
-	}
-	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
-		if errors.IsConflict(err) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
+		return reconciler.Result{}, err
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !c.provisioner.PredictionStoreHydrated(ctx) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
@@ -283,7 +274,11 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	if len(toStart) == 0 {
 		return nil, nil
 	}
+	startCmds := lo.Map(toStart, func(i int, _ int) Command { return cmds[i] })
 
+	// StartCommand marks candidates through the API server before cluster state can observe it, so a failed start can
+	// leave marks that the next sweep must read from the API server.
+	c.sweeper.Recheck(candidateProviderIDs(startCmds)...)
 	phaseStart = time.Now()
 	defer func() { observePhase(StartPhase, labels, time.Since(phaseStart)) }()
 	errs := make([]error, len(toStart))
@@ -304,7 +299,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	if err = multierr.Combine(errs...); err != nil {
 		return nil, fmt.Errorf("disrupting candidates, %w", err)
 	}
-	return lo.Map(toStart, func(i int, _ int) Command { return cmds[i] }), nil
+	return startCmds, nil
 }
 
 // recordGated counts a pass that stopped at the cluster state sync gate and starts the gate period if it is new.
