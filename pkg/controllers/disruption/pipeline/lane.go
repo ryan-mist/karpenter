@@ -130,7 +130,7 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateUnresolved)
 			continue
 		}
-		if !l.hasBudget(p) {
+		if !l.hasBudget(ctx, p) {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateBudgetZero)
 			continue
 		}
@@ -160,7 +160,7 @@ func (l *lane) gate(ctx context.Context) types.GateReason {
 	if l.deps.Hydrated != nil && !l.deps.Hydrated(ctx) {
 		return types.GateHydrating
 	}
-	if !lo.SomeBy(l.spec.Planners, func(p Planner) bool { return l.hasBudget(p) }) {
+	if !lo.SomeBy(l.spec.Planners, func(p Planner) bool { return l.hasBudget(ctx, p) }) {
 		return types.GateBudgetZero
 	}
 	if l.spec.SkipWhileUnsynced && !l.deps.Cluster.Synced(ctx) {
@@ -171,8 +171,8 @@ func (l *lane) gate(ctx context.Context) types.GateReason {
 
 // hasBudget reports whether the planner may plan: some NodePool has budget left for its reason, or the planner can plan
 // disruptions that no budget counts (BudgetFree).
-func (l *lane) hasBudget(p Planner) bool {
-	if l.deps.Budgets == nil || l.deps.Budgets.AnyRemaining(p.Reason()) {
+func (l *lane) hasBudget(ctx context.Context, p Planner) bool {
+	if l.deps.Budgets == nil || l.deps.Budgets.AnyRemaining(ctx, p.Reason()) {
 		return true
 	}
 	bf, ok := p.(BudgetFree)
