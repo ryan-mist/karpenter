@@ -68,7 +68,7 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 // state for Dedup, and its 15 s validator, run inline.
 func (e *Emptiness) LegacyOptions() CoreOptions {
 	return CoreOptions{
-		Effects:   InlineEffects{Recorder: e.recorder},
+		Effects:   InlineEffects{Recorder: e.recorder, Cluster: e.cluster},
 		Dedup:     consolidatedState{c: &e.consolidation},
 		Validator: e.validator,
 	}
