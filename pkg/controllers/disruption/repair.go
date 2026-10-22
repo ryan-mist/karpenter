@@ -108,23 +108,76 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 }
 
 // ComputeCommands orders eligible candidates by the repair score and returns one command for the highest-scoring
-// candidate whose NodePool has budget. Workload-bearing candidates verify rescheduling capacity and pre-spin any
-// required replacement; empty candidates may produce a delete-only command. Reboot candidates produce a Reboot command
-// whose handoff to the reboot controller runs when the command starts. Only one command per pass, mirroring drift.
-//
-// It logs the resolved repair decision for each candidate it acts on, which records why that policy and drain bound won.
+// candidate whose NodePool has budget: the repair core with the controller's options. Workload-bearing candidates
+// verify rescheduling capacity and pre-spin any required replacement; empty candidates may produce a delete-only
+// command. Reboot candidates produce a Reboot command whose handoff to the reboot controller runs when the command
+// starts. Only one command per pass, mirroring drift.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	cmds, err := r.computeCommands(ctx, disruptionBudgetMapping, candidates...)
-	for _, cmd := range cmds {
+	res, err := r.Compute(ctx, disruptionBudgetMapping, r.LegacyOptions(), candidates...)
+	return orEmpty(res.Commands), err
+}
+
+// LegacyOptions are the options the disruption controller computes repair with: one candidate per pass, simulated and
+// reported exactly as before the repair core existed, with the reboot target re-read from the API server.
+func (r *Repair) LegacyOptions() CoreOptions {
+	return CoreOptions{
+		Batch:   1,
+		Effects: InlineEffects{Recorder: r.recorder, Cluster: r.cluster},
+		Sim:     NewLegacySimulator(r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder),
+		Pending: KeepOnFirst,
+	}
+}
+
+// Compute is the repair core. It orders the candidates (opts.Order, or by repair score). With opts.Batch above 1 it
+// first plans replacements for a batch of candidates from one joint simulation (computeBatch); when that plans
+// nothing, or with Batch 1, it walks the candidates one at a time and returns the first command. It logs the resolved
+// repair decision for each candidate it acts on, which records why that policy and drain bound won.
+func (r *Repair) Compute(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates ...*Candidate) (CoreResult, error) {
+	res, err := r.compute(ctx, disruptionBudgetMapping, opts, candidates...)
+	for _, cmd := range res.Commands {
 		for _, c := range cmd.Candidates {
 			log.FromContext(ctx).WithValues(append([]any{"Node", klog.KObj(c.Node)}, c.RepairPolicyResult.LogValues()...)...).Info("selected repair policy")
 		}
 	}
-	return cmds, err
+	return res, err
 }
 
-//nolint:gocyclo // Static and dynamic replacement flows are intentionally kept inline.
-func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+func (r *Repair) compute(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates ...*Candidate) (CoreResult, error) {
+	if opts.Order != nil {
+		opts.Order(candidates)
+	} else {
+		r.sortByScore(candidates)
+	}
+	trippedPools, err := r.breakerTrippedPools(ctx)
+	if err != nil {
+		return CoreResult{}, err
+	}
+	var res CoreResult
+	if opts.Batch > 1 || opts.batchMinSize() == 1 {
+		// Candidates the batch leaves out that rank ahead of it are planned first, one at a time, and one that ranks
+		// inside it ends it (batchWindow); when the batch plans nothing, the walk resumes at its first candidate.
+		first, window := r.batchWindow(ctx, disruptionBudgetMapping, candidates, trippedPools)
+		cmd, err := r.computeSingle(ctx, disruptionBudgetMapping, opts, candidates[:first], trippedPools)
+		if err != nil || cmd != nil {
+			return lo.Ternary(cmd != nil, CoreResult{Commands: []Command{lo.FromPtr(cmd)}}, CoreResult{}), err
+		}
+		if res, err = r.computeBatch(ctx, disruptionBudgetMapping, opts, window); err != nil || len(res.Commands) > 0 {
+			return res, err
+		}
+		candidates = candidates[first:]
+	}
+	cmd, err := r.computeSingle(ctx, disruptionBudgetMapping, opts, candidates, trippedPools)
+	if err != nil {
+		return CoreResult{Batch: res.Batch}, err
+	}
+	if cmd != nil {
+		res.Commands, res.Deferred = []Command{*cmd}, nil
+	}
+	return res, nil
+}
+
+// sortByScore orders candidates by repair score, highest first.
+func (r *Repair) sortByScore(candidates []*Candidate) {
 	// We use a fixed value for now so all candidates get the same value
 	// This is important for repair since it scores candidates based on their current age (calculated as now - eligibleAt).
 	// We don't want the order in which candidates are evaluated to affect their age.
@@ -140,13 +193,15 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}
 		return candidates[i].Name() < candidates[j].Name()
 	})
-	trippedPools, err := r.breakerTrippedPools(ctx)
-	if err != nil {
-		return []Command{}, err
-	}
+}
+
+// computeSingle returns a command for the first candidate, in order, that repair can act on.
+//
+//nolint:gocyclo // Static and dynamic replacement flows are intentionally kept inline.
+func (r *Repair) computeSingle(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates []*Candidate, trippedPools map[string]bool) (*Command, error) {
 	for _, candidate := range candidates {
 		if trippedPools[candidate.NodePool.Name] {
-			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
+			opts.Effects.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
 				fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", repairUnhealthyThreshold, candidate.NodePool.Name))...)
 			continue
 		}
@@ -160,21 +215,19 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		candidate.TerminationGracePeriod = effectiveDrainBound(candidate, candidate.RepairPolicyResult)
 		// Reboot is in-place, so skip replacement and termination paths.
 		if candidate.RepairPolicyResult.Action == cloudprovider.RebootNode {
-			nodeClaim, err := r.rebootTarget(ctx, candidate)
-			if err != nil {
-				return []Command{}, err
-			}
-			if nodeClaim == nil {
-				continue
-			}
-			return []Command{{
+			cmd := &Command{
 				Candidates:          []*Candidate{candidate},
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 				Reboot:              true,
-				commitReboot: func(ctx context.Context) error {
-					return r.commitReboot(ctx, candidate, nodeClaim)
-				},
-			}}, nil
+			}
+			ok, err := r.prepareReboot(ctx, cmd, opts.CachedReboot)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			return cmd, nil
 		}
 		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
 
@@ -201,7 +254,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 					continue
 				}
 				if full && !holdsOfferedReservation(candidate, offered) {
-					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool's capacity reservations are full and cannot stage a replacement")...)
+					opts.Effects.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool's capacity reservations are full and cannot stage a replacement")...)
 					continue
 				}
 				reservationsFull = full
@@ -212,60 +265,114 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			// past limits.nodes when commands race. A zero result reserves nothing, so the delete-only path leaks no
 			// reservation; a non-zero result's slot is consumed by the replacement staged below. Full reservations are
 			// checked first so the delete-only path never takes a slot.
-			if reservationsFull || r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
+			if reservationsFull || opts.Effects.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
 				// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand
 				// the workload with no replacement.
 				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
 				if !terminateFirstEnabled || !refillable {
-					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, lo.Ternary(reservationsFull,
+					opts.Effects.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, lo.Ternary(reservationsFull,
 						"static NodePool's capacity reservations are full and cannot stage a replacement",
 						"static NodePool is at its node limit and cannot stage a replacement"))...)
 					continue
 				}
-				return []Command{{
+				return &Command{
 					Candidates:           []*Candidate{candidate},
 					PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{candidate}),
 					TerminateFirstReason: lo.Ternary(reservationsFull, TerminateFirstNoReservedCapacity, TerminateFirstStaticAtLimit),
-				}}, nil
+				}, nil
 			}
 			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct}}}
-			return []Command{{
+			return &Command{
 				Candidates:          []*Candidate{candidate},
 				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
 				Results:             result,
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-			}}, nil
+			}, nil
 		}
 		// Repair pre-spins for all reschedulable workload, including pods whose eviction is currently blocked.
-		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, candidate,
-			terminateFirstEnabled, SimulationOptions{IncludeBlockedCandidatePods: true})
+		out, err := opts.Sim.Simulate(ctx, SimOptions{ReservedFallback: true, TerminateFirst: terminateFirstEnabled, IncludeBlockedCandidatePods: true}, candidate)
 		if err != nil {
 			if errors.Is(err, errCandidateDeleting) {
 				continue
 			}
-			return []Command{}, err
+			return nil, err
 		}
-		if terminateFirst {
+		results := out.Results
+		if out.TerminateFirst {
 			// Carry the Results (no Replacements) so nodes that can absorb the freed pods get nominated.
-			return []Command{{
+			return &Command{
 				Candidates:           []*Candidate{candidate},
 				Results:              results,
 				PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{candidate}),
 				TerminateFirstReason: TerminateFirstNoReservedCapacity,
-			}}, nil
+			}, nil
 		}
 		if !results.AllNonPendingPodsScheduled() {
-			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			opts.Effects.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		return []Command{{
+		if opts.Pending == DropPendingOnly {
+			results = Split([]*Candidate{candidate}, results, DropPendingOnly)[0].Results
+		}
+		return &Command{
 			Candidates:          []*Candidate{candidate},
 			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-		}}, nil
+		}, nil
 	}
-	return []Command{}, nil
+	return nil, nil
+}
+
+// batchWindow picks the candidates repair can replace from one joint simulation (see the core's batchWindow):
+// candidates of tripped NodePools are passed over (the single-candidate path reports them when it runs), only
+// initialized candidates count against budgets, and reboots, static NodePools and candidates that may need
+// terminate-first can only be planned on their own.
+func (r *Repair) batchWindow(ctx context.Context, disruptionBudgetMapping map[string]int, ordered []*Candidate, trippedPools map[string]bool) (int, []*Candidate) {
+	terminateFirst := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
+	return batchWindow(ordered, disruptionBudgetMapping,
+		func(c *Candidate) bool { return trippedPools[c.NodePool.Name] },
+		func(c *Candidate) bool {
+			return c.RepairPolicyResult.Action == cloudprovider.RebootNode || c.OwnedByStaticNodePool() ||
+				(terminateFirst && c.capacityType == v1.CapacityTypeReserved)
+		},
+		(*Candidate).Initialized)
+}
+
+// computeBatch plans replacements for the window's candidates from one joint simulation (planBatch) that schedules
+// all their reschedulable pods, blocked ones included, and stamps each planned candidate's drain bound.
+func (r *Repair) computeBatch(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, window []*Candidate) (CoreResult, error) {
+	res, err := planBatch(ctx, disruptionBudgetMapping, opts, SimOptions{IncludeBlockedCandidatePods: true}, window, (*Candidate).Initialized)
+	for _, cmd := range res.Commands {
+		for _, c := range cmd.Candidates {
+			c.TerminationGracePeriod = effectiveDrainBound(c, c.RepairPolicyResult)
+		}
+	}
+	return res, err
+}
+
+// prepareReboot gives a Reboot command its handoff to the reboot controller, which patches the candidate's NodeClaim
+// when the command starts. Unless cached, the NodeClaim is re-read first (rebootTarget); with cached, the candidate's
+// own NodeClaim is used, and the caller re-reads it and rebuilds the handoff right before starting the command (the
+// pipeline's Starter does). It returns false when the NodeClaim is already rebooting, deleting, or gone.
+func (r *Repair) prepareReboot(ctx context.Context, cmd *Command, cached bool) (bool, error) {
+	candidate := cmd.Candidates[0]
+	nodeClaim := candidate.NodeClaim
+	if cached {
+		if nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).IsTrue() || !nodeClaim.DeletionTimestamp.IsZero() {
+			return false, nil
+		}
+		nodeClaim = nodeClaim.DeepCopy()
+	} else {
+		var err error
+		if nodeClaim, err = r.rebootTarget(ctx, candidate); err != nil || nodeClaim == nil {
+			return false, err
+		}
+	}
+	cmd.commitReboot = func(ctx context.Context) error {
+		return r.commitReboot(ctx, candidate, nodeClaim)
+	}
+	return true, nil
 }
 
 // rebootTarget re-reads the candidate's NodeClaim for a reboot, returning nil if it is already rebooting, deleting, or
