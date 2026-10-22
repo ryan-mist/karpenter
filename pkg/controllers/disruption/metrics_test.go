@@ -86,7 +86,7 @@ var _ = Describe("Evaluation Metrics", func() {
 		})
 		nodeClaims[0].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 	})
-	It("should record every phase of the method that acts and the starvation of the methods after it", func() {
+	It("should record every phase of the method that acts, and not count the methods after a delete-only command as skipped", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0])
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
@@ -107,15 +107,13 @@ var _ = Describe("Evaluation Metrics", func() {
 		Expect(found).To(BeFalse())
 		ExpectMetricHistogramSampleCountValue(simulationsMetric, 2, driftLabels)
 
-		// Multi- and single-node consolidation were starved by Emptiness and never evaluated.
-		ExpectMetricCounterValue(disruption.SkippedEvaluationsTotal, 1, multiLabels)
-		ExpectMetricCounterValue(disruption.SkippedEvaluationsTotal, 1, singleLabels)
-		ExpectMetricCounterValue(disruption.SkippedEvaluationsTotal, 0, emptyLabels)
-		ExpectMetricCounterValue(disruption.SkippedEvaluationsTotal, 0, driftLabels)
-		ExpectMetricGaugeValue(disruption.LastEvaluationTimestampSeconds, float64(env.Clock.Now().Unix()), emptyLabels)
-		ExpectMetricGaugeValue(disruption.LastEvaluationTimestampSeconds, float64(env.Clock.Now().Unix()), driftLabels)
-		_, found = FindMetricWithLabelValues("karpenter_voluntary_disruption_last_evaluation_timestamp_seconds", multiLabels)
-		Expect(found).To(BeFalse())
+		// Emptiness's command only deletes, so the pass went on to multi- and single-node consolidation, which were
+		// evaluated (and found the node already marked for deletion). Nothing was skipped. The drift spec below covers
+		// a command that ends the pass.
+		for _, labels := range []map[string]string{emptyLabels, driftLabels, multiLabels, singleLabels} {
+			ExpectMetricCounterValue(disruption.SkippedEvaluationsTotal, 0, labels)
+			ExpectMetricGaugeValue(disruption.LastEvaluationTimestampSeconds, float64(env.Clock.Now().Unix()), labels)
+		}
 	})
 	It("should count the scheduling simulations of an evaluation", func() {
 		nodeClaims[0].StatusConditions().SetTrue(v1.ConditionTypeDrifted)

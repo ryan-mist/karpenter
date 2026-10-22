@@ -309,7 +309,8 @@ var _ = Describe("Continue After Delete-Only Commands", func() {
 				return disruption.Command{Candidates: []*disruption.Candidate{c}, TerminateFirstReason: disruption.TerminateFirstNoReservedCapacity}
 			}, false),
 			Entry("reboot: pass ends (unchanged)", func(c *disruption.Candidate) disruption.Command {
-				return disruption.Command{Candidates: []*disruption.Candidate{c}, Reboot: true}
+				// The handoff (the reboot controller's annotation and condition) doesn't matter here, only the decision.
+				return disruption.WithRebootHandoff(disruption.Command{Candidates: []*disruption.Candidate{c}, Reboot: true}, func(context.Context) error { return nil })
 			}, false),
 		)
 		It("should end the pass after a delete if cluster state stopped being synced", func() {
