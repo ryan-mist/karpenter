@@ -71,7 +71,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 func (d *Drift) LegacyOptions() CoreOptions {
 	return CoreOptions{
 		Batch:   1,
-		Effects: InlineEffects{Recorder: d.recorder},
+		Effects: InlineEffects{Recorder: d.recorder, Cluster: d.cluster},
 		Sim:     NewLegacySimulator(d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder),
 		Pending: KeepOnFirst,
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
@@ -85,6 +86,9 @@ const (
 type Effects interface {
 	// Publish publishes events about candidates (for example DisruptionBlocked).
 	Publish(evts ...events.Event)
+	// ReserveNodeCount reserves up to n of a static NodePool's limits.nodes slots for replacements and returns how many
+	// it got (state.NodePoolState.ReserveNodeCount).
+	ReserveNodeCount(nodePool string, limit, n int64) int64
 }
 
 // Dedup remembers that a consolidation method found nothing to do in the current cluster state.
@@ -97,9 +101,14 @@ type Dedup interface {
 // InlineEffects performs every effect immediately, as the disruption controller always has.
 type InlineEffects struct {
 	Recorder events.Recorder
+	Cluster  *state.Cluster
 }
 
 func (e InlineEffects) Publish(evts ...events.Event) { e.Recorder.Publish(evts...) }
+
+func (e InlineEffects) ReserveNodeCount(nodePool string, limit, n int64) int64 {
+	return e.Cluster.NodePoolState.ReserveNodeCount(nodePool, limit, n)
+}
 
 // CoreResult is what a method core planned.
 type CoreResult struct {
