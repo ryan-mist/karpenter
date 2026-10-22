@@ -62,28 +62,28 @@ func TestCatalogVersionChangesWithEveryOfferingInput(t *testing.T) {
 	}
 }
 
-type stubPlanner struct {
+type scopePlanner struct {
 	name, class string
 	totals      bool
 }
 
-func (p stubPlanner) Name() string                { return p.name }
-func (p stubPlanner) Reason() v1.DisruptionReason { return v1.DisruptionReasonDrifted }
-func (p stubPlanner) Class() string               { return p.class }
-func (p stubPlanner) Shape() types.Shape          { return types.ShapeReplacing }
-func (p stubPlanner) NeedsTotals() bool           { return p.totals }
-func (p stubPlanner) Filter(context.Context, *disruption.Candidate, time.Time) (bool, *types.Verdict) {
+func (p scopePlanner) Name() string                { return p.name }
+func (p scopePlanner) Reason() v1.DisruptionReason { return v1.DisruptionReasonDrifted }
+func (p scopePlanner) Class() string               { return p.class }
+func (p scopePlanner) Shape() types.Shape          { return types.ShapeReplacing }
+func (p scopePlanner) NeedsTotals() bool           { return p.totals }
+func (p scopePlanner) Filter(context.Context, *disruption.Candidate, time.Time) (bool, *types.Verdict) {
 	return true, nil
 }
-func (p stubPlanner) Plan(context.Context, pipeline.PlanInput) (pipeline.PlanOutput, error) {
+func (p scopePlanner) Plan(context.Context, pipeline.PlanInput) (pipeline.PlanOutput, error) {
 	return pipeline.PlanOutput{}, nil
 }
 
 func TestScopeForCollectsClassesAndTotals(t *testing.T) {
 	s := pipeline.ScopeFor(types.LaneBackground,
-		stubPlanner{name: "a", class: disruption.GracefulDisruptionClass, totals: true},
-		stubPlanner{name: "b", class: disruption.GracefulDisruptionClass, totals: true},
-		stubPlanner{name: "c", class: disruption.EventualDisruptionClass},
+		scopePlanner{name: "a", class: disruption.GracefulDisruptionClass, totals: true},
+		scopePlanner{name: "b", class: disruption.GracefulDisruptionClass, totals: true},
+		scopePlanner{name: "c", class: disruption.EventualDisruptionClass},
 	)
 	if s.Lane != types.LaneBackground {
 		t.Errorf("lane: got %s", s.Lane)

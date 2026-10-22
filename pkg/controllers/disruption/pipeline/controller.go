@@ -25,7 +25,12 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"github.com/awslabs/operatorpkg/option"
+	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/awslabs/operatorpkg/reconciler"
 	"github.com/awslabs/operatorpkg/singleton"
@@ -39,6 +44,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 )
 
@@ -46,31 +53,79 @@ import (
 // own polling period.
 const pollingPeriod = 10 * time.Second
 
-// Controller is the pipeline disruption controller. It shares the disruption.Queue with the disruption package, so
-// started commands are executed exactly as the disruption controller's are.
-type Controller struct {
-	clock         clock.Clock
-	kubeClient    client.Client
-	cluster       *state.Cluster
-	provisioner   *provisioning.Provisioner
-	cloudProvider cloudprovider.CloudProvider
-	recorder      events.Recorder
-	queue         *disruption.Queue
-	clusterCost   *cost.ClusterCost
+// Options are the pipeline's parts. Every part is injectable; NewController fills in the defaults.
+type Options struct {
+	// Lanes run in this order every Reconcile.
+	Lanes     []LaneSpec
+	Snapshots SnapshotBuilder
+	Executor  Executor
+	Budgets   BudgetView
+	Reserved  ReservationView
+	Observers []Observer
 }
 
-func NewController(_ context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *disruption.Queue, clusterCost *cost.ClusterCost,
+func WithLanes(lanes ...LaneSpec) option.Function[Options] {
+	return func(o *Options) { o.Lanes = lanes }
+}
+
+func WithExecutor(e Executor) option.Function[Options] {
+	return func(o *Options) { o.Executor = e }
+}
+
+func WithSnapshots(b SnapshotBuilder) option.Function[Options] {
+	return func(o *Options) { o.Snapshots = b }
+}
+
+func WithBudgets(b BudgetView) option.Function[Options] {
+	return func(o *Options) { o.Budgets = b }
+}
+
+func WithReservations(r ReservationView) option.Function[Options] {
+	return func(o *Options) { o.Reserved = r }
+}
+
+func WithObservers(obs ...Observer) option.Function[Options] {
+	return func(o *Options) { o.Observers = append(o.Observers, obs...) }
+}
+
+// Controller is the pipeline disruption controller. It shares the disruption.Queue with the disruption package, so
+// started commands are executed exactly as the disruption controller's are.
+//
+// Reconcile is the synchronous runner: every lane runs one round in order, and after each round the commit loop
+// runs until no plan is ready, waiting on the clock for a plan's ValidateAt as the disruption controller waits for its
+// validation period. That keeps singleton-reconciled tests deterministic.
+type Controller struct {
+	clock    clock.Clock
+	cluster  *state.Cluster
+	lanes    []Lane
+	executor Executor
+}
+
+func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
+	cp cloudprovider.CloudProvider, _ events.Recorder, cluster *state.Cluster, queue *disruption.Queue, clusterCost *cost.ClusterCost,
+	opts ...option.Function[Options],
 ) *Controller {
+	o := option.Resolve(opts...)
+	if o.Snapshots == nil {
+		o.Snapshots = NewSnapshotBuilder(kubeClient, cluster, clk, cp, queue, clusterCost, o.Reserved)
+	}
+	deps := LaneDeps{
+		Clock:     clk,
+		Cluster:   cluster,
+		Snapshots: o.Snapshots,
+		Executor:  o.Executor,
+		Budgets:   o.Budgets,
+		Reserved:  o.Reserved,
+		Hydrated: func(ctx context.Context) bool {
+			return !options.FromContext(ctx).FeatureGates.PredictionEnabled || provisioner.PredictionStoreHydrated(ctx)
+		},
+		Observer: observers(o.Observers),
+	}
 	return &Controller{
-		clock:         clk,
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		provisioner:   provisioner,
-		cloudProvider: cp,
-		recorder:      recorder,
-		queue:         queue,
-		clusterCost:   clusterCost,
+		clock:    clk,
+		cluster:  cluster,
+		lanes:    lo.Map(o.Lanes, func(spec LaneSpec, _ int) Lane { return NewLane(spec, deps) }),
+		executor: o.Executor,
 	}
 }
 
@@ -85,7 +140,53 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-// Reconcile runs one round. The pipeline has no lanes yet, so a round does nothing.
-func (c *Controller) Reconcile(_ context.Context) (reconciler.Result, error) {
-	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
+// Reconcile runs one round of every lane, each followed by the commit loop. It requeues immediately if a plan started,
+// after a second if plans wait for a gate (as the disruption controller waits for cluster state to sync), and after
+// the polling period otherwise.
+func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
+	ctx = injection.WithControllerName(ctx, c.Name())
+	started, waiting := 0, 0
+	for _, l := range c.lanes {
+		r := l.Step(ctx)
+		if r.Err != nil {
+			if errors.IsConflict(r.Err) {
+				return reconciler.Result{Requeue: true}, nil
+			}
+			return reconciler.Result{}, fmt.Errorf("planning in lane %s, %w", r.Lane, r.Err)
+		}
+		n, w, err := c.drain(ctx)
+		started += n
+		waiting = w
+		if err != nil {
+			return reconciler.Result{}, err
+		}
+	}
+	switch {
+	case started > 0:
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	case waiting > 0:
+		return reconciler.Result{RequeueAfter: time.Second}, nil
+	default:
+		return reconciler.Result{RequeueAfter: pollingPeriod}, nil
+	}
+}
+
+// drain runs commit steps until no plan is ready, waiting for a waiting plan's ValidateAt. It returns how many plans
+// started and how many still wait for a gate.
+func (c *Controller) drain(ctx context.Context) (started, waiting int, err error) {
+	if c.executor == nil {
+		return 0, 0, nil
+	}
+	for {
+		r := c.executor.Step(ctx)
+		started += r.Admitted
+		if r.Waiting == 0 || r.NextReady.IsZero() {
+			return started, r.Waiting, nil
+		}
+		select {
+		case <-c.clock.After(r.NextReady.Sub(c.clock.Now())):
+		case <-ctx.Done():
+			return started, r.Waiting, ctx.Err()
+		}
+	}
 }
