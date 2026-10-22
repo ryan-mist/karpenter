@@ -102,6 +102,10 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// limitsUsed counts resources against NodePool limits on top of the nodes the scheduler is given: capacity that
+	// a simulation doesn't model as a node but that will exist (for example replacements other disruption commands
+	// planned). Keyed by NodePool name.
+	limitsUsed map[string]corev1.ResourceList
 }
 
 type Options = option.Function[options]
@@ -118,6 +122,16 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 			opts.creditReservationCapacity = map[string]int{}
 		}
 		opts.creditReservationCapacity[reservationID] += count
+	}
+}
+
+// CountAgainstLimits counts resources against a NodePool's limits before scheduling. See options.limitsUsed.
+var CountAgainstLimits = func(nodePool string, used corev1.ResourceList) Options {
+	return func(opts *options) {
+		if opts.limitsUsed == nil {
+			opts.limitsUsed = map[string]corev1.ResourceList{}
+		}
+		opts.limitsUsed[nodePool] = resources.Merge(opts.limitsUsed[nodePool], used)
 	}
 }
 
@@ -242,6 +256,7 @@ func NewScheduler(
 	}
 	s.deletingNodeNames = deletingNodeNames
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
+	s.countAgainstLimits(resolved.limitsUsed)
 	return s
 }
 
@@ -874,6 +889,15 @@ func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1
 		return false
 	}
 	return true
+}
+
+// countAgainstLimits subtracts used, by NodePool, from the remaining resources of NodePools with limits.
+func (s *Scheduler) countAgainstLimits(used map[string]corev1.ResourceList) {
+	for np, rl := range used {
+		if remaining, ok := s.remainingResources[np]; ok {
+			s.remainingResources[np] = resources.Subtract(remaining, rl)
+		}
+	}
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
