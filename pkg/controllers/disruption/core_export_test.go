@@ -23,10 +23,12 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -116,4 +118,81 @@ func LegacyDriftComputeCommands(ctx context.Context, d *Drift, disruptionBudgetM
 // BatchWindow exposes batchWindow.
 func BatchWindow(ordered []*Candidate, budgets map[string]int, skip, single, charge func(*Candidate) bool) (int, []*Candidate) {
 	return batchWindow(ordered, budgets, skip, single, charge)
+}
+
+// ResetConsolidated forgets that the consolidation method m last found nothing to do.
+func ResetConsolidated(m Method) {
+	switch t := m.(type) {
+	case *Emptiness:
+		t.lastConsolidationState = time.Time{}
+	case *MultiNodeConsolidation:
+		t.lastConsolidationState = time.Time{}
+	case *SingleNodeConsolidation:
+		t.lastConsolidationState = time.Time{}
+	}
+}
+
+// MarkedConsolidated returns the consolidation state the method m last found nothing to do in (zero: never).
+func MarkedConsolidated(m Method) time.Time {
+	switch t := m.(type) {
+	case *Emptiness:
+		return t.lastConsolidationState
+	case *MultiNodeConsolidation:
+		return t.lastConsolidationState
+	case *SingleNodeConsolidation:
+		return t.lastConsolidationState
+	}
+	return time.Time{}
+}
+
+// LegacyEmptinessComputeCommands is a verbatim copy of Emptiness.ComputeCommands at the parent of the emptiness core
+// (disr/a01-drift-core; emptiness.go as on disr/99-integration). It is the reference of the emptiness differential.
+//
+//nolint:gocyclo
+func LegacyEmptinessComputeCommands(ctx context.Context, e *Emptiness, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	if e.IsConsolidated() {
+		return []Command{}, nil
+	}
+	candidates = e.sortCandidates(ctx, candidates)
+
+	empty := make([]*Candidate, 0, len(candidates))
+	constrainedByBudgets := false
+	for _, candidate := range candidates {
+		if !candidate.IsEmpty() {
+			continue
+		}
+		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
+			constrainedByBudgets = true
+			continue
+		}
+		// If there's disruptions allowed for the candidate's nodepool,
+		// add it to the list of candidates, and decrement the budget.
+		empty = append(empty, candidate)
+		disruptionBudgetMapping[candidate.NodePool.Name]--
+	}
+	// none empty, so do nothing
+	if len(empty) == 0 {
+		// if there are no candidates, but a nodepool had a fully blocking budget,
+		// don't mark the cluster as consolidated, as it's possible this nodepool
+		// should be consolidated the next time we try to disrupt.
+		if !constrainedByBudgets {
+			e.markConsolidated()
+		}
+		return []Command{}, nil
+	}
+
+	cmd := Command{
+		Candidates:          empty,
+		PoolDisruptionCosts: computePoolDisruptionCosts(empty),
+	}
+	validCmd, err := validate(ctx, e.validator, cmd, commandValidationDelay)
+	if err != nil {
+		if IsValidationError(err) {
+			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning empty node consolidation attempt due to pod churn, command is no longer valid")
+			return []Command{}, nil
+		}
+		return []Command{}, err
+	}
+	return []Command{validCmd}, nil
 }

@@ -96,6 +96,13 @@ func (c *consolidation) markConsolidated() {
 	c.lastConsolidationState = c.cluster.ConsolidationState()
 }
 
+// consolidatedState is the Dedup of the disruption controller: the consolidation state the method last found nothing
+// to do in.
+type consolidatedState struct{ c *consolidation }
+
+func (d consolidatedState) IsConsolidated() bool { return d.c.IsConsolidated() }
+func (d consolidatedState) MarkConsolidated()    { d.c.markConsolidated() }
+
 // ShouldDisrupt is a predicate used to filter candidates
 func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	// Disable consolidation for static NodePool
