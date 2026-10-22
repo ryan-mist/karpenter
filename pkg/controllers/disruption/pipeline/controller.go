@@ -35,7 +35,6 @@ import (
 	"github.com/awslabs/operatorpkg/reconciler"
 	"github.com/awslabs/operatorpkg/singleton"
 	"k8s.io/utils/clock"
-	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -174,11 +173,15 @@ func (c *Controller) Name() string {
 	return "disruption.pipeline"
 }
 
+// Register runs the pipeline asynchronously on the leader: one goroutine per lane, paced by the lane's trigger, and
+// one for the commit loop. Reconcile (the synchronous runner) is for tests.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
-	return controllerruntime.NewControllerManagedBy(m).
-		Named("disruption.pipeline").
-		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+	for _, l := range c.lanes {
+		if err := m.Add(&laneRunner{lane: l, trigger: lo.Ternary[Trigger](l.Spec().Trigger != nil, l.Spec().Trigger, PollTrigger{}), clock: c.clock}); err != nil {
+			return err
+		}
+	}
+	return m.Add(&commitRunner{executor: c.executor, clock: c.clock})
 }
 
 // Reconcile runs one round of every lane, each followed by the commit loop (which also runs once with no lanes, for
