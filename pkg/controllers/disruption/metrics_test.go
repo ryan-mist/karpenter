@@ -87,6 +87,7 @@ var _ = Describe("Evaluation Metrics", func() {
 		nodeClaims[0].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 	})
 	It("should record every phase of the method that acts, and not count the methods after a delete-only command as skipped", func() {
+		pipelineDifference("R84", "PR 01's phase, simulation, skipped and gated-pass metrics (and R61's decision_evaluation_duration_seconds) are not emitted with the gate on")
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0])
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
@@ -116,6 +117,7 @@ var _ = Describe("Evaluation Metrics", func() {
 		}
 	})
 	It("should count the scheduling simulations of an evaluation", func() {
+		pipelineDifference("R84", "PR 01's phase, simulation, skipped and gated-pass metrics (and R61's decision_evaluation_duration_seconds) are not emitted with the gate on")
 		nodeClaims[0].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 		Expect(nodeClaims[0].StatusConditions().Clear(v1.ConditionTypeConsolidatable)).To(Succeed())
 		pods := test.Pods(2, test.PodOptions{})
@@ -149,6 +151,7 @@ var _ = Describe("Evaluation Metrics", func() {
 		ExpectMetricGaugeValue(disruption.QueueCommands, 0, nil)
 	})
 	It("should measure how long the loop is gated on cluster state sync", func() {
+		pipelineDifference("R84", "PR 01's phase, simulation, skipped and gated-pass metrics (and R61's decision_evaluation_duration_seconds) are not emitted with the gate on")
 		// The NodeClaim exists in the API server but not yet in cluster state, so state is not synced.
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0])
 		ExpectSingletonReconciled(ctx, disruptionController)

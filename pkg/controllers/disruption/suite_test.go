@@ -36,6 +36,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 
+	"github.com/awslabs/operatorpkg/singleton"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -73,7 +74,7 @@ var ctx context.Context
 var env *test.Environment
 var clusterCost *cost.ClusterCost
 var cluster *state.Cluster
-var disruptionController *disruption.Controller
+var disruptionController singleton.Reconciler // the disruption controller, or the pipeline in the twin run (pipelineTwin)
 var pricingController *informer.PricingController
 var prov *provisioning.Provisioner
 var draController *deviceallocation.Controller
@@ -149,10 +150,16 @@ var _ = BeforeEach(func() {
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store)
 
 	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	if !pipelineTwin {
+		disruptionController = newSuiteDisruptionController()
+	}
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
 	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+	// The pipeline registers completion hooks on the queue, so it's built on the reset queue.
+	if pipelineTwin {
+		disruptionController = newSuiteDisruptionController()
+	}
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -360,6 +367,21 @@ var _ = Describe("Simulate Scheduling", func() {
 		// Get a set of the node claim names so that it's easy to check if a new one is made
 		nodeClaimNames := sets.New(lo.Map(nodeClaims, func(nc *v1.NodeClaim, _ int) string { return nc.Name })...)
 		ExpectSingletonReconciled(ctx, disruptionController)
+		if pipelineTwin {
+			// Batched drift (BRIEF #12): the pipeline plans the 3 replacements the budget allows in one round, and no
+			// more after they launch.
+			ExpectTaintedNodeCount(ctx, env.Client, 3)
+			ncs := ExpectNodeClaims(ctx, env.Client)
+			Expect(ncs).To(HaveLen(13))
+			for _, nc := range ncs {
+				if !nodeClaimNames.Has(nc.Name) {
+					ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, nc)
+				}
+			}
+			ExpectSingletonReconciled(ctx, disruptionController)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(13))
+			return
+		}
 
 		// Expect a replace action
 		ExpectTaintedNodeCount(ctx, env.Client, 1)
