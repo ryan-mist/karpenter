@@ -53,6 +53,8 @@ type Resolution struct {
 	Reason types.RejectReason
 	// Replanned reports that the plan started as part of a sibling re-plan.
 	Replanned bool
+	// AtSubmit reports that the plan was rejected at Submit, before it was reserved.
+	AtSubmit bool
 }
 
 // CommitStepResult is what one commit step did.
