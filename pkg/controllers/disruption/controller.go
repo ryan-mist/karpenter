@@ -51,6 +51,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
+	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
@@ -136,6 +137,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 //nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	// PDBs are listed again by every NewLimits call in this Reconcile, but only the ones that changed are parsed again.
+	ctx = pdb.WithIndex(ctx, pdb.NewIndex())
 
 	// this won't catch if the reconciler loop hangs forever, but it will catch other issues
 	c.logAbnormalRuns(ctx)
