@@ -56,6 +56,16 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 type SimulationOptions struct {
 	// IncludeBlockedCandidatePods includes candidate pods even when they cannot currently be evicted.
 	IncludeBlockedCandidatePods bool
+	// ExcludeDestinations are providerIDs of nodes that may not receive pods in this simulation. Their own pods are not
+	// moved. Batched drift uses it so each chunk of a split batch plans around the capacity earlier chunks rely on.
+	// Empty for every single-candidate simulation.
+	ExcludeDestinations sets.Set[string]
+	// LimitsUsed counts resources against NodePool limits on top of the cluster's nodes, by NodePool name: excluded
+	// destinations that stay, and replacements that other commands planned but haven't launched.
+	LimitsUsed map[string]corev1.ResourceList
+	// SkipDeletingNodePods leaves out the pods of nodes that are already being disrupted, for a simulation whose plan
+	// already placed them in an earlier simulation.
+	SkipDeletingNodePods bool
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
@@ -69,7 +79,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name())
+		return !candidateNames.Has(n.Name()) && !simulationOpts.ExcludeDestinations.Has(n.ProviderID())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
@@ -114,9 +124,11 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidatePods = lo.Map(candidatePods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })
 	pods = append(pods, candidatePods...)
 
-	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
+	var deletingNodePods []*corev1.Pod
+	if !simulationOpts.SkipDeletingNodePods {
+		if deletingNodePods, err = deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder); err != nil {
+			return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
+		}
 	}
 	pods = append(pods, deletingNodePods...)
 
@@ -126,6 +138,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
 	opts = append(opts, schedulerOpts...)
+	for np, used := range simulationOpts.LimitsUsed {
+		opts = append(opts, scheduling.CountAgainstLimits(np, used))
+	}
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)

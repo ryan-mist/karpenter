@@ -258,6 +258,8 @@ type Command struct {
 
 	CreationTimestamp time.Time
 	ID                uuid.UUID
+	// BatchID is shared by the commands planned from one joint simulation, and zero for a command planned alone.
+	BatchID uuid.UUID
 
 	Results             pscheduling.Results
 	Candidates          []*Candidate
