@@ -105,8 +105,9 @@ func NewDefaultTopologySpreadInjector(kubeClient client.Client) *DefaultTopology
 // today's behavior.
 //
 // The injected constraints exist only on these scheduling-time copies and are never written back to the API server.
-// NOTE: mutating the pods in place is safe because every pod reaching the scheduler is obtained from a cache-backed
-// List, which deep-copies. Callers passing pods from another source must copy them first.
+// NOTE: mutating the pods in place is safe because every pod reaching the scheduler is a private copy: it is obtained
+// from a cache-backed List, which deep-copies, or copied by the caller (disruption's SimulateScheduling copies its
+// candidates' pods, which it lists without a deep copy). Callers passing pods from another source must copy them first.
 func (d *DefaultTopologySpreadInjector) Inject(ctx context.Context, pods []*corev1.Pod) {
 	cfg := karpopts.FromContext(ctx).SchedulerConfig
 	if cfg == nil || cfg.PodTopologySpread == nil || len(cfg.PodTopologySpread.DefaultConstraints) == 0 {

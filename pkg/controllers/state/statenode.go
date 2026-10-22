@@ -323,10 +323,16 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 // ValidatePodDisruptable returns an error if the StateNode contains a pod that cannot be disrupted
 // This checks associated PDBs and do-not-disrupt annotations for each pod on the node.
 // ValidatePodDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
+// The returned pods are listed without a deep copy (nodeutils.GetPodsReadOnly): they share their contents with the
+// informer cache and MUST NOT be modified. DeepCopy a pod before changing it, e.g. before handing it to the scheduler.
 //
 //nolint:gocyclo
 func (in *StateNode) ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder) ([]*corev1.Pod, error) {
-	pods, err := in.Pods(ctx, kubeClient)
+	var pods []*corev1.Pod
+	var err error
+	if in.Node != nil {
+		pods, err = nodeutils.GetPodsReadOnly(ctx, kubeClient, in.Node.Name)
+	}
 	if err != nil {
 		return nil, err
 	}

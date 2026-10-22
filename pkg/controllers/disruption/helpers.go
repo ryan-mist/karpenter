@@ -108,6 +108,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 			})
 		})
 	}
+	// Candidates hold the informer cache's pods (StateNode.ValidatePodsDisruptable lists them without a deep copy), and
+	// the scheduler modifies the pods it is given in place (DefaultTopologySpreadInjector.Inject). Give it copies.
+	candidatePods = lo.Map(candidatePods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })
 	pods = append(pods, candidatePods...)
 
 	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder)
@@ -350,7 +353,7 @@ func newCandidateSnapshot(ctx context.Context, deepCopyNodes func() state.StateN
 // same events NewCandidate does. Every call returns new Candidates, each with its own shallow copy of the StateNode,
 // that the caller owns: methods and the queue write to them (Repair sets RepairPolicyResult, RebootEscalated and
 // TerminationGracePeriod; the queue replaces NodeClaim). The objects those copies point to (Node, NodeClaim, pod
-// requests) and the pods are shared by all callers and must not be modified.
+// requests) and the pods (the informer cache's own) are shared by all callers and must not be modified.
 func (s *CandidateSnapshot) Candidates(ctx context.Context, disruptionClass string) []*Candidate {
 	return lo.FilterMap(s.nodes, func(_ *state.StateNode, i int) (*Candidate, bool) {
 		cn, err := s.candidate(ctx, i, disruptionClass)
