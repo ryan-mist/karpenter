@@ -31,6 +31,16 @@ const (
 	CandidatesIneligible         = "candidates_ineligible"
 	policyLabel                  = "policy"
 	terminateFirstReasonLabel    = "terminate_first_reason"
+	phaseLabel                   = "phase"
+)
+
+// Phase names for the `phase` dimension of PhaseDurationSeconds.
+const (
+	candidatesPhase = "candidates"
+	budgetsPhase    = "budgets"
+	computePhase    = "compute"
+	validatePhase   = "validate"
+	startPhase      = "start"
 )
 
 var (
@@ -49,6 +59,35 @@ var (
 )
 
 var (
+	CandidatesPhase = opmetrics.Value{
+		Name: candidatesPhase,
+		Help: "Building the method's disruption candidates from cluster state.",
+	}
+	BudgetsPhase = opmetrics.Value{
+		Name: budgetsPhase,
+		Help: "Building the per-NodePool disruption budget mapping for the method's reason.",
+	}
+	ComputePhase = opmetrics.Value{
+		Name: computePhase,
+		Help: "Computing the method's commands, including scheduling simulations and excluding validation.",
+	}
+	ValidatePhase = opmetrics.Value{
+		Name: validatePhase,
+		Help: "Validating a computed command: the validation delay plus the candidate and scheduling re-check.",
+	}
+	StartPhase = opmetrics.Value{
+		Name: startPhase,
+		Help: "Handing the method's commands to the orchestration queue.",
+	}
+)
+
+var (
+	// Phase is the `phase` dimension of PhaseDurationSeconds: the step of a single method evaluation.
+	Phase = opmetrics.Label{
+		Name:   phaseLabel,
+		Help:   "The step of a disruption method evaluation.",
+		Values: []opmetrics.Value{CandidatesPhase, BudgetsPhase, ComputePhase, ValidatePhase, StartPhase},
+	}
 	ConsolidationType = opmetrics.Label{
 		Name:   ConsolidationTypeLabel,
 		Help:   "The consolidation algorithm that produced the decision.",
@@ -140,6 +179,89 @@ var (
 		},
 		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
 		opmetrics.Beta,
+	)
+	// PhaseDurationSeconds splits a method evaluation into its steps. The phases don't overlap: compute excludes the
+	// time spent in validate, so per evaluation their sum is approximately decision_evaluation_duration_seconds. A phase
+	// is only observed when the evaluation reaches it.
+	PhaseDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "decision_evaluation_phase_duration_seconds",
+			Help:      "Duration of each phase of a disruption method evaluation in seconds. Compute excludes validation. Labeled by phase, method, and consolidation type.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{Phase, metrics.DisruptionReason, ConsolidationType},
+		opmetrics.Alpha,
+	)
+	SchedulingSimulationsPerEvaluation = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "decision_evaluation_scheduling_simulations",
+			Help:      "Number of scheduling simulations run by a single disruption method evaluation, including validation re-simulations. Labeled by method and consolidation type.",
+			Buckets:   []float64{0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+		},
+		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
+		opmetrics.Alpha,
+	)
+	LastEvaluationTimestampSeconds = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "last_evaluation_timestamp_seconds",
+			Help:      "Unix time at which a disruption method was last evaluated. Labeled by method and consolidation type.",
+		},
+		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
+		opmetrics.Alpha,
+	)
+	SkippedEvaluationsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "skipped_evaluations_total",
+			Help:      "Number of times a disruption method was not evaluated because an earlier method in the same pass started commands. Labeled by method and consolidation type.",
+		},
+		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
+		opmetrics.Alpha,
+	)
+	ClusterStateGatedPassesTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "cluster_state_gated_passes_total",
+			Help:      "Number of disruption passes that evaluated no method because cluster state was not synced.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	ClusterStateGateDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "cluster_state_gate_duration_seconds",
+			Help:      "Duration in seconds of each period in which the disruption loop waited for cluster state to sync, observed when the loop resumes.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	QueueCommands = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "queue_commands",
+			Help:      "Number of disruption commands in flight in the orchestration queue.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
 	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,

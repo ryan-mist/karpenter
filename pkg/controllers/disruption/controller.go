@@ -66,6 +66,8 @@ type Controller struct {
 	methods       []Method
 	mu            sync.Mutex
 	lastRun       map[string]time.Time
+	// unsyncedSince is when the loop first found cluster state unsynced; zero while it is synced.
+	unsyncedSince time.Time
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
@@ -85,6 +87,10 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
 	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(ctx, clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
+	// Initialize the skipped series to 0 so a method that is never starved still reports a rate.
+	for _, m := range o.methods {
+		SkippedEvaluationsTotal.Add(0, methodLabels(m))
+	}
 	return &Controller{
 		queue:         queue,
 		clock:         clk,
@@ -150,8 +156,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
 	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
 	if !c.cluster.Synced(ctx) {
+		c.recordGated()
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	c.recordUngated()
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
@@ -177,7 +185,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 
 	// Attempt different disruption methods. We'll only let one method perform an action
-	for _, m := range c.methods {
+	for i, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
 		success, err := c.disrupt(ctx, m)
 		if err != nil {
@@ -187,6 +195,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
 		}
 		if success {
+			// The methods after this one are not evaluated this pass; a steady rate here is a starvation signal.
+			for _, skipped := range c.methods[i+1:] {
+				SkippedEvaluationsTotal.Inc(methodLabels(skipped))
+			}
 			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 		}
 	}
@@ -196,11 +208,16 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
-	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
-		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
-		ConsolidationTypeLabel: disruption.ConsolidationType(),
-	})()
+	labels := methodLabels(disruption)
+	defer metrics.Measure(EvaluationDurationSeconds, labels)()
+	LastEvaluationTimestampSeconds.Set(float64(c.clock.Now().Unix()), labels)
+	stats := &evaluationStats{}
+	ctx = withEvaluationStats(ctx, stats)
+	defer func() { SchedulingSimulationsPerEvaluation.Observe(float64(stats.simulations.Load()), labels) }()
+
+	phaseStart := time.Now()
 	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	observePhase(CandidatesPhase, labels, time.Since(phaseStart))
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
@@ -216,12 +233,20 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
+	phaseStart = time.Now()
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
+	observePhase(BudgetsPhase, labels, time.Since(phaseStart))
 	if err != nil {
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
+	phaseStart = time.Now()
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
+	validating := time.Duration(stats.validating.Load())
+	observePhase(ComputePhase, labels, max(time.Since(phaseStart)-validating, 0))
+	if stats.validations.Load() > 0 {
+		observePhase(ValidatePhase, labels, validating)
+	}
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
@@ -230,6 +255,8 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, nil
 	}
 
+	phaseStart = time.Now()
+	defer func() { observePhase(StartPhase, labels, time.Since(phaseStart)) }()
 	errs := make([]error, len(cmds))
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
@@ -248,6 +275,23 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("disrupting candidates, %w", err)
 	}
 	return true, nil
+}
+
+// recordGated counts a pass that stopped at the cluster state sync gate and starts the gate period if it is new.
+func (c *Controller) recordGated() {
+	ClusterStateGatedPassesTotal.Inc(nil)
+	if c.unsyncedSince.IsZero() {
+		c.unsyncedSince = c.clock.Now()
+	}
+}
+
+// recordUngated ends the current gate period, if any, and observes how long the loop waited.
+func (c *Controller) recordUngated() {
+	if c.unsyncedSince.IsZero() {
+		return
+	}
+	ClusterStateGateDurationSeconds.Observe(c.clock.Since(c.unsyncedSince).Seconds(), nil)
+	c.unsyncedSince = time.Time{}
 }
 
 func (c *Controller) recordRun(s string) {

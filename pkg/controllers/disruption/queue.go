@@ -443,6 +443,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// We are adding the first nodeclaim in the list of candidates into the reconciliation queue
 	// This invariant SHOULD NOT be relied on anywhere else besides within this file.
 	q.source <- event.TypedGenericEvent[*v1.NodeClaim]{Object: cmd.Candidates[0].NodeClaim}
+	q.recordQueueCommandsLocked()
 	q.Unlock()
 
 	// An action is only performed and pods/nodes are only disrupted after a successful add to the queue
@@ -511,6 +512,16 @@ func (q *Queue) CompleteCommand(cmd *Command) {
 	for _, c := range cmd.Candidates {
 		delete(q.ProviderIDToCommand, c.ProviderID())
 	}
+	q.recordQueueCommandsLocked()
+}
+
+// recordQueueCommandsLocked publishes the number of distinct in-flight commands. Callers must hold the write lock.
+func (q *Queue) recordQueueCommandsLocked() {
+	cmds := make(map[*Command]struct{}, len(q.ProviderIDToCommand))
+	for _, cmd := range q.ProviderIDToCommand {
+		cmds[cmd] = struct{}{}
+	}
+	QueueCommands.Set(float64(len(cmds)), nil)
 }
 
 func (q *Queue) IsEmpty() bool {
