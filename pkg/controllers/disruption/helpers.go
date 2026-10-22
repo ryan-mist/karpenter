@@ -273,30 +273,119 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *cost.ClusterCost,
 ) ([]*Candidate, map[string]NodePoolTotals, error) {
-	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
+	snapshot, err := NewCandidateSnapshot(ctx, cluster, kubeClient, recorder, clk, cloudProvider, queue)
 	if err != nil {
 		return nil, nil, err
 	}
+	allCandidates := snapshot.Candidates(ctx, disruptionClass)
+	nodePoolTotals := snapshot.NodePoolTotals(ctx, allCandidates, clusterCost)
+	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
+	return filtered, nodePoolTotals, nil
+}
+
+// CandidateSnapshot holds the class-independent inputs of candidate construction: the NodePools and their instance
+// types, the PDBs, a deep copy of the state nodes, one fixed now, and each node's pod list and pod checks. These are
+// nearly all of the cost of GetCandidatesWithTotals, so consecutive disruption methods share one snapshot, and each
+// method applies its own class's NewCandidate rules to it (Candidates).
+type CandidateSnapshot struct {
+	kubeClient                 client.Client
+	recorder                   events.Recorder
+	clk                        clock.Clock
+	queue                      *Queue
+	nodePoolMap                map[string]*v1.NodePool
+	nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType
+	pdbs                       pdb.Limits
+	nodes                      state.StateNodes
+	// pods[i] memoizes nodes[i]'s StateNode.ValidatePodsDisruptable. It is filled the first time a class gets that
+	// far for the node, which is when NewCandidate would have run it.
+	pods []*validatedPods
+}
+
+// validatedPods is the result of StateNode.ValidatePodsDisruptable, and the events it published, so every later class
+// publishes them again exactly as if it had run the checks itself.
+type validatedPods struct {
+	pods   []*corev1.Pod
+	err    error
+	events []events.Event
+}
+
+// NewCandidateSnapshot does the class-independent work of GetCandidatesWithTotals, in the same order.
+func NewCandidateSnapshot(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+	cloudProvider cloudprovider.CloudProvider, queue *Queue,
+) (*CandidateSnapshot, error) {
+	return newCandidateSnapshot(ctx, cluster.DeepCopyNodes, kubeClient, recorder, clk, cloudProvider, queue)
+}
+
+func newCandidateSnapshot(ctx context.Context, deepCopyNodes func() state.StateNodes, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+	cloudProvider cloudprovider.CloudProvider, queue *Queue,
+) (*CandidateSnapshot, error) {
+	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
+	if err != nil {
+		return nil, err
+	}
 	pdbs, err := pdb.NewLimits(ctx, kubeClient)
 	if err != nil {
-		return nil, nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
 	}
 	// We use a clock which has a fixed value for now so all candidates get the same value.
 	// now is used in the calculation of DisruptionCost.
 	// Using a fixed value is important for repair which tie-breaks candidates based on their DisruptionCost.
 	// We don't want the order in which candidates are evaluated to affect their DisruptionCost.
 	var fixedNowClk clock.Clock = fixedNowClock{Clock: clk, now: clk.Now()}
-	allNodes := cluster.DeepCopyNodes()
-	allCandidates := lo.FilterMap(allNodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
-		cn, e := NewCandidate(ctx, kubeClient, recorder, fixedNowClk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
-		return cn, e == nil
+	nodes := deepCopyNodes()
+	return &CandidateSnapshot{
+		kubeClient:                 kubeClient,
+		recorder:                   recorder,
+		clk:                        fixedNowClk,
+		queue:                      queue,
+		nodePoolMap:                nodePoolMap,
+		nodePoolToInstanceTypesMap: nodePoolToInstanceTypesMap,
+		pdbs:                       pdbs,
+		nodes:                      nodes,
+		pods:                       make([]*validatedPods, len(nodes)),
+	}, nil
+}
+
+// Candidates returns the snapshot's nodes that are candidates for disruptionClass, in snapshot order, publishing the
+// same events NewCandidate does. Every call returns new Candidates, each with its own shallow copy of the StateNode,
+// that the caller owns: methods and the queue write to them (Repair sets RepairPolicyResult, RebootEscalated and
+// TerminationGracePeriod; the queue replaces NodeClaim). The objects those copies point to (Node, NodeClaim, pod
+// requests) and the pods are shared by all callers and must not be modified.
+func (s *CandidateSnapshot) Candidates(ctx context.Context, disruptionClass string) []*Candidate {
+	return lo.FilterMap(s.nodes, func(_ *state.StateNode, i int) (*Candidate, bool) {
+		cn, err := s.candidate(ctx, i, disruptionClass)
+		return cn, err == nil
 	})
+}
+
+// NodePoolTotals is the NodePoolTotals of GetCandidatesWithTotals for allCandidates, which Candidates returned.
+func (s *CandidateSnapshot) NodePoolTotals(ctx context.Context, allCandidates []*Candidate, clusterCost *cost.ClusterCost) map[string]NodePoolTotals {
 	// Compute totals using ALL nodes for disruption cost denominator (RFC requirement:
 	// "Non-candidate nodes still contribute to the denominators").
-	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, []*state.StateNode(allNodes), clusterCost)
-	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
-	return filtered, nodePoolTotals, nil
+	return computeNodePoolTotals(ctx, allCandidates, []*state.StateNode(s.nodes), clusterCost)
 }
+
+func (s *CandidateSnapshot) candidate(ctx context.Context, i int, disruptionClass string) (*Candidate, error) {
+	node := lo.ToPtr(*s.nodes[i])
+	return newCandidate(ctx, s.recorder, s.clk, node, s.nodePoolMap, s.nodePoolToInstanceTypesMap, s.queue, disruptionClass, func() ([]*corev1.Pod, error) {
+		if s.pods[i] == nil {
+			rec := &bufferedRecorder{}
+			pods, err := s.nodes[i].ValidatePodsDisruptable(ctx, s.kubeClient, s.pdbs, s.clk, rec)
+			s.pods[i] = &validatedPods{pods: pods, err: err, events: rec.events}
+		}
+		if len(s.pods[i].events) > 0 {
+			s.recorder.Publish(s.pods[i].events...)
+		}
+		return s.pods[i].pods, s.pods[i].err
+	})
+}
+
+// bufferedRecorder holds published events instead of publishing them.
+type bufferedRecorder struct {
+	events []events.Event
+}
+
+func (r *bufferedRecorder) Publish(evts ...events.Event) { r.events = append(r.events, evts...) }
 
 // fixedNowClock is a clock that has a fixed value for now.
 type fixedNowClock struct {
