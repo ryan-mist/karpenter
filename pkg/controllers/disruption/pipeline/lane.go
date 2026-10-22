@@ -36,6 +36,8 @@ type LaneSpec struct {
 	// SkipWhileUnsynced skips the whole lane while cluster state is unsynced. Otherwise, while unsynced, planners
 	// whose Shape is not ShapePodFree get only pod-free candidates.
 	SkipWhileUnsynced bool
+	// Trigger paces the lane's rounds when the pipeline runs asynchronously; nil is PollTrigger{}.
+	Trigger Trigger
 }
 
 // Lane plans for its planners, one round per Step. Step never sleeps.

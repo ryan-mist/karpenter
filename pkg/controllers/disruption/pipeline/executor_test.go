@@ -143,6 +143,14 @@ var _ = Describe("Executor", func() {
 		exec.Step(ctx)
 		Expect(planner.inputs[0].Causes).To(ContainElement(types.ResimSibling))
 	})
+	It("reserves nothing once the lease is lost", func() {
+		lost, cancel := context.WithCancel(ctx)
+		cancel()
+		p := newPlan(ids[0])
+		Expect(drain(exec.Submit(lost, p))).To(Equal([]pipeline.Resolution{{PlanID: p.ID, Kind: pipeline.Rejected, Reason: types.ReasonCanceled}}))
+		Expect(l.View().IsReserved(ids[0])).To(BeFalse())
+		Expect(exec.Step(ctx).Waiting).To(BeZero())
+	})
 	It("returns every plan of a planner with unresolved plans", func() {
 		a := newPlan(ids[0])
 		a.ValidateAt = env.Clock.Now().Add(15 * time.Second)
