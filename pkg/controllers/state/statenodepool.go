@@ -156,6 +156,19 @@ func (n *NodePoolState) ReserveNodeCount(np string, limit int64, wantedLimit int
 	}
 }
 
+// Headroom is how many more nodes ReserveNodeCount would grant for a NodePool under limit right now, without reserving
+// them.
+func (n *NodePoolState) Headroom(np string, limit int64) int64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	active, deleting, pendingdisruption := n.nodeCounts(np)
+	var reserved int64
+	if r, ok := n.nodePoolNameToNodePoolLimit[np]; ok {
+		reserved = r.Load()
+	}
+	return max(limit-int64(active+deleting+pendingdisruption)-reserved, 0)
+}
+
 // ReleaseNodeCount releases the NodePoolTracker ReservedNodeLimit
 func (n *NodePoolState) ReleaseNodeCount(npName string, count int64) {
 	n.mu.Lock()

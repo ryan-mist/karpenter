@@ -132,3 +132,7 @@ func (q *Queue) WithCompletionHook(hook func(*Command)) {
 	defer q.Unlock()
 	q.completionHooks = append(q.completionHooks, hook)
 }
+
+// CommandValidationDelay is how long a consolidation command waits before it is validated and started, so pods that
+// just landed on its candidates are seen.
+const CommandValidationDelay = commandValidationDelay

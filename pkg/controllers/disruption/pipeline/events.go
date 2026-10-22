@@ -56,6 +56,15 @@ func (r *RoundEvents) Record(vs ...types.Verdict) {
 	r.verdicts = append(r.verdicts, vs...)
 }
 
+// Drain returns the events published since the last Drain and forgets them.
+func (r *RoundEvents) Drain() []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.events
+	r.events = nil
+	return out
+}
+
 // Events returns the round's events in the order they were published.
 func (r *RoundEvents) Events() []events.Event {
 	r.mu.Lock()

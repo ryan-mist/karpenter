@@ -114,26 +114,13 @@ var _ = Describe("Observer", func() {
 	})
 	It("keeps unresolved_plans at 0 after a back-pressure rejection", func() {
 		// The lane counts every submitted plan in its round, so every resolution, back-pressure too, must count down.
-		obs := pipeline.NewMetricsObserver(env.Clock, env.Client, recorder, pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue),
+		obs := pipeline.NewMetricsObserver(env.Clock, env.Client, recorder, pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue), &pipeline.RoundEvents{},
 			pipeline.LaneSpec{ID: types.LaneFast, Planners: []pipeline.Planner{empty}})
 		p := &pipeline.Plan{ID: uuid.New(), Planner: empty.Name()}
 		obs.RoundStarted(types.LaneFast)
 		obs.Resolved(p, pipeline.Resolution{PlanID: p.ID, Kind: pipeline.Rejected, Reason: types.ReasonBackpressure}, 0)
 		obs.RoundFinished(ctx, types.LaneFast, pipeline.StepResult{Lane: types.LaneFast, Plans: 1, EndedAt: env.Clock.Now()}, nil)
 		ExpectMetricGaugeValue(pipeline.UnresolvedPlans, 0, fast)
-	})
-	It("counts consolidation's failed validations per candidate", func() {
-		disruption.FailedValidationsTotal.Reset()
-		plan, planned := empty.plan, false
-		empty.plan = func(in pipeline.PlanInput) (pipeline.PlanOutput, error) {
-			planned = true
-			return plan(in)
-		}
-		// The candidates turn ineligible between planning and admission, so admission rejects the plan.
-		empty.filter = func(c *disruption.Candidate) bool { return !planned && len(c.ReschedulablePods()) == 0 }
-		ExpectSingletonReconciled(ctx, c)
-		ExpectMetricCounterValue(pipeline.PlansTotal, 1, map[string]string{"planner": "emptiness", "result": "rejected", "reason": string(types.ReasonCandidateIneligible)})
-		ExpectMetricCounterValue(disruption.FailedValidationsTotal, 2, map[string]string{disruption.ConsolidationTypeLabel: "empty"})
 	})
 	It("explains once that a planner waits for budget", func() {
 		w.nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}

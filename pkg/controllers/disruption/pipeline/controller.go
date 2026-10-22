@@ -124,8 +124,13 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	if o.Budgets == nil {
 		o.Budgets = o.Ledger.Budgets()
 	}
+	// The disruption methods' own events (filters, validators) are buffered and published by the Observer.
+	methodEvents := &RoundEvents{}
+	if o.Lanes == nil {
+		o.Lanes = DefaultLanes(DefaultPlanners(ctx, clk, cluster, kubeClient, provisioner, cp, queue, methodEvents, o.Ledger.View()))
+	}
 	wakes := NewWakeHub()
-	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, o.Lanes...), newWakeObserver(wakes, o.Lanes...)}, o.Observers...)
+	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, methodEvents, o.Lanes...), newWakeObserver(wakes, o.Lanes...)}, o.Observers...)
 	// A completed command frees its nodes' budget slots.
 	queue.WithCompletionHook(func(*disruption.Command) { wakes.Publish("", types.WakeLedgerRelease) })
 	if o.Reserved == nil {

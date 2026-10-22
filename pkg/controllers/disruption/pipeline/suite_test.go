@@ -116,11 +116,17 @@ type world struct {
 // reschedulable pod each.
 func newWorld(n int, withPods ...int) *world {
 	GinkgoHelper()
-	w := &world{nodePool: test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+	return newWorldIn(test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
 		ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
 		ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
 		Budgets:             []v1.Budget{{Nodes: "100%"}},
-	}}})}
+	}}}), n, withPods...)
+}
+
+// newWorldIn is newWorld in the given NodePool.
+func newWorldIn(nodePool *v1.NodePool, n int, withPods ...int) *world {
+	GinkgoHelper()
+	w := &world{nodePool: nodePool}
 	it := fake.InstanceTypesAssorted()[0]
 	cloudProvider.InstanceTypes = append(cloudProvider.InstanceTypes, it)
 	of := it.Offerings[0]
