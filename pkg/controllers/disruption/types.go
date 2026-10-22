@@ -266,8 +266,12 @@ type Command struct {
 	// TerminateFirstReason marks a delete-only terminate-first command (RFC #3203) with why its replacement couldn't be
 	// staged first; Decision() surfaces it as TerminateFirstDecision.
 	TerminateFirstReason TerminateFirstReason
-	// Reboot is already handed off to its controller, so the queue only records the decision.
+	// Reboot is an in-place repair: StartCommand hands the candidate to the reboot controller through commitReboot
+	// instead of tainting, replacing, or queueing it, and only records the decision.
 	Reboot bool
+	// commitReboot performs a Reboot command's handoff. Computing the command only decides; the handoff writes to the
+	// API server, so it runs when the command starts.
+	commitReboot func(context.Context) error
 }
 
 // Reason returns the disruption reason for this command.

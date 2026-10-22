@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -580,6 +581,82 @@ var _ = Describe("StaticDrift", func() {
 				})
 			}
 		})
+		// limitedDriftedPool is a static NodePool of 5 drifted replicas whose limits.nodes of 7 leaves room to stage 2
+		// replacements.
+		limitedDriftedPool := func() {
+			GinkgoHelper()
+			nodePool.Spec.Replicas = new(int64(5))
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("7")}
+			nodeClaims, nodes = test.NodeClaimsAndNodes(5, v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("100"),
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool)
+			for i := range 5 {
+				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+			}
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		}
+		It("should hold the node-count slots of computed commands against static scale-up until they start", func() {
+			limitedDriftedPool()
+			staticDrift := disruption.NewStaticDrift(cluster, prov, cloudProvider, recorder)
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, staticDrift.ShouldDisrupt, staticDrift.Class(), queue)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(candidates).To(HaveLen(5))
+
+			cmds, err := staticDrift.ComputeCommands(ctx, map[string]int{nodePool.Name: 5}, candidates...)
+			Expect(err).NotTo(HaveOccurred())
+			// Only 2 replacements fit under limits.nodes, and computing them reserved both slots, so static scale-up of
+			// the NodePool (which reserves from the same counter) is capped until the commands start.
+			Expect(cmds).To(HaveLen(2))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 7, 1)).To(BeEquivalentTo(0))
+
+			// A command that loses the admission race releases its slot.
+			cmds[0].Method = staticDrift
+			queue.Lock()
+			queue.ProviderIDToCommand[cmds[0].Candidates[0].ProviderID()] = &cmds[0]
+			queue.Unlock()
+			Expect(queue.StartCommand(ctx, &cmds[0])).To(MatchError("candidate is being disrupted"))
+			queue.Lock()
+			delete(queue.ProviderIDToCommand, cmds[0].Candidates[0].ProviderID())
+			queue.Unlock()
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 7, 2)).To(BeEquivalentTo(1))
+			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+
+			// A started command hands its slot to the provisioner, which releases it once the replacement exists.
+			cmds[1].Method = staticDrift
+			Expect(queue.StartCommand(ctx, &cmds[1])).To(Succeed())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 5, 1, 0)
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 7, 2)).To(BeEquivalentTo(1))
+		})
+		It("should release the node-count slots of computed commands that never start", func() {
+			limitedDriftedPool()
+			// Cancelling the reconcile context right after computing makes the controller skip starting every command.
+			cancelCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			controller := disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(cancelAfterCompute{Method: disruption.NewStaticDrift(cluster, prov, cloudProvider, recorder), cancel: cancel}))
+
+			ExpectSingletonReconciled(cancelCtx, controller)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
+			// Both slots computing reserved are free again for static scale-up.
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 7, 2)).To(BeEquivalentTo(2))
+		})
 		It("should wait until nodes are deprovisioned when we are overscaled", func() {
 			nodePool.Spec.Replicas = new(int64(1)) // Target 1, but have 2
 			numNodes = 2
@@ -929,3 +1006,16 @@ var _ = Describe("StaticDrift", func() {
 		})
 	})
 })
+
+// cancelAfterCompute cancels the reconcile context once the wrapped method has computed its commands, so the controller
+// never starts them.
+type cancelAfterCompute struct {
+	disruption.Method
+	cancel context.CancelFunc
+}
+
+func (m cancelAfterCompute) ComputeCommands(ctx context.Context, budgets map[string]int, candidates ...*disruption.Candidate) ([]disruption.Command, error) {
+	cmds, err := m.Method.ComputeCommands(ctx, budgets, candidates...)
+	m.cancel()
+	return cmds, err
+}

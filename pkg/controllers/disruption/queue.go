@@ -365,16 +365,8 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	queueOwnsStaticReservation := true
 	defer func() {
-		if !queueOwnsStaticReservation {
-			return
-		}
-		staticReplacements := lo.Filter(cmd.Replacements, func(replacement *Replacement, _ int) bool {
-			return replacement.IsStaticNodeClaim
-		})
-		for nodePoolName, replacements := range lo.GroupBy(staticReplacements, func(replacement *Replacement) string {
-			return replacement.NodePoolName
-		}) {
-			q.cluster.NodePoolState.ReleaseNodeCount(nodePoolName, int64(len(replacements)))
+		if queueOwnsStaticReservation {
+			q.releaseStaticReservations(cmd)
 		}
 	}()
 	// First check if we can add the command.
@@ -385,18 +377,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		return fmt.Errorf("candidate is being disrupted")
 	}
 
-	log.FromContext(ctx).WithValues(append([]any{
-		"command", cmd.String(),
-	}, cmd.LogValues()...)...).Info("disrupting node(s)")
-
-	// Reboot is already handed off to its controller, so only record metrics here.
+	// Reboot is in-place, so it is handed to the reboot controller instead of tainting, replacing, or queueing it.
 	if cmd.Decision() == RebootDecision {
-		for _, candidate := range cmd.Candidates {
-			recordCandidateDisrupted(cmd, candidate)
-		}
-		q.recordDecisionPerformed(cmd)
-		return nil
+		return q.startReboot(ctx, cmd)
 	}
+	logDisrupting(ctx, cmd)
 
 	// Cordon the old nodes before we launch the replacements to prevent new pods from scheduling to the old nodes
 	markedCandidates, markDisruptedErr := q.markDisrupted(ctx, cmd)
@@ -449,6 +434,42 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// An action is only performed and pods/nodes are only disrupted after a successful add to the queue
 	q.recordDecisionPerformed(cmd)
 	return nil
+}
+
+// startReboot hands the Reboot command's candidate to the reboot controller, which then owns the reboot, so only the
+// decision is recorded.
+func (q *Queue) startReboot(ctx context.Context, cmd *Command) error {
+	if cmd.commitReboot == nil {
+		return fmt.Errorf("reboot command has no handoff")
+	}
+	if err := cmd.commitReboot(ctx); err != nil {
+		return err
+	}
+	logDisrupting(ctx, cmd)
+	for _, candidate := range cmd.Candidates {
+		recordCandidateDisrupted(cmd, candidate)
+	}
+	q.recordDecisionPerformed(cmd)
+	return nil
+}
+
+func logDisrupting(ctx context.Context, cmd *Command) {
+	log.FromContext(ctx).WithValues(append([]any{
+		"command", cmd.String(),
+	}, cmd.LogValues()...)...).Info("disrupting node(s)")
+}
+
+// releaseStaticReservations releases the static NodePool node-count slots that computing the command reserved for its
+// static replacements.
+func (q *Queue) releaseStaticReservations(cmd *Command) {
+	staticReplacements := lo.Filter(cmd.Replacements, func(replacement *Replacement, _ int) bool {
+		return replacement.IsStaticNodeClaim
+	})
+	for nodePoolName, replacements := range lo.GroupBy(staticReplacements, func(replacement *Replacement) string {
+		return replacement.NodePoolName
+	}) {
+		q.cluster.NodePoolState.ReleaseNodeCount(nodePoolName, int64(len(replacements)))
+	}
 }
 
 func (q *Queue) recordDecisionPerformed(cmd *Command) {

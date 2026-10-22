@@ -251,19 +251,31 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	if stats.validations.Load() > 0 {
 		observePhase(ValidatePhase, labels, validating)
 	}
+	// Computing a command with a static replacement reserves a node-count slot that StartCommand releases. Release the
+	// slot of any command that never reaches StartCommand (ParallelizeUntil skips the rest once ctx is cancelled), or
+	// static scale-up of its NodePool stays capped.
+	started := make([]bool, len(cmds))
+	defer func() {
+		for i := range cmds {
+			if !started[i] {
+				c.queue.releaseStaticReservations(&cmds[i])
+			}
+		}
+	}()
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
-	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
-	if len(cmds) == 0 {
+	toStart := lo.Filter(lo.Range(len(cmds)), func(i int, _ int) bool { return cmds[i].Decision() != NoOpDecision })
+	if len(toStart) == 0 {
 		return false, nil
 	}
 
 	phaseStart = time.Now()
 	defer func() { observePhase(StartPhase, labels, time.Since(phaseStart)) }()
-	errs := make([]error, len(cmds))
-	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
-		cmd := cmds[i]
+	errs := make([]error, len(toStart))
+	workqueue.ParallelizeUntil(ctx, len(toStart), len(toStart), func(i int) {
+		started[toStart[i]] = true
+		cmd := cmds[toStart[i]]
 
 		// Assign common fields
 		cmd.CreationTimestamp = c.clock.Now()
