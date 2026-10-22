@@ -294,5 +294,7 @@ func (v *fakeView) ReservationsHeld(string) int            { return 0 }
 // fakeBudgets has no budget for the reasons in zero.
 type fakeBudgets struct{ zero sets.Set[v1.DisruptionReason] }
 
-func (b fakeBudgets) Remaining(string, v1.DisruptionReason) int { return 0 }
-func (b fakeBudgets) AnyRemaining(r v1.DisruptionReason) bool   { return !b.zero.Has(r) }
+func (b fakeBudgets) Remaining(context.Context, string, v1.DisruptionReason) int { return 0 }
+func (b fakeBudgets) AnyRemaining(_ context.Context, r v1.DisruptionReason) bool {
+	return !b.zero.Has(r)
+}
