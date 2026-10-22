@@ -40,6 +40,8 @@ const (
 	dutyFactor = 3
 	// gatePoll is how often a lane, or the commit loop, polls a gate that has no event yet (cluster state sync).
 	gatePoll = time.Second
+	// failureBackoff is how long a planner doesn't plan after none of its last plans started.
+	failureBackoff = pollingPeriod
 )
 
 // PollTrigger is the alpha trigger: it never wakes a lane early, and paces it like the disruption controller polls.

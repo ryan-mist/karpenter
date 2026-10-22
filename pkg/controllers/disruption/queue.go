@@ -102,6 +102,8 @@ type Queue struct {
 	cluster             *state.Cluster
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
+	// completionHooks run after a command is removed from the queue (pipeline_seams.go).
+	completionHooks []func(*Command)
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
@@ -529,11 +531,15 @@ func (q *Queue) CompleteCommand(cmd *Command) {
 	}
 	// Remove all candidates linked to the command
 	q.Lock()
-	defer q.Unlock()
 	for _, c := range cmd.Candidates {
 		delete(q.ProviderIDToCommand, c.ProviderID())
 	}
 	q.recordQueueCommandsLocked()
+	hooks := q.completionHooks
+	q.Unlock()
+	for _, hook := range hooks {
+		hook(cmd)
+	}
 }
 
 // recordQueueCommandsLocked publishes the number of distinct in-flight commands. Callers must hold the write lock.

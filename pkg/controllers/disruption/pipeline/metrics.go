@@ -99,7 +99,7 @@ var (
 			{Name: string(types.GateBudgetZero), Help: "No NodePool has budget left for the lane's reasons."},
 			{Name: string(types.GateBreaker), Help: "The repair breaker tripped."},
 			{Name: string(types.GateUnresolved), Help: "The planner's last plans are unresolved."},
-			{Name: string(types.GatePaced), Help: "The lane is paced."},
+			{Name: string(types.GatePaced), Help: "The lane is paced, or the planner backs off because none of its last plans started."},
 			{Name: string(types.GateHydrating), Help: "The prediction store is hydrating."},
 		},
 	}

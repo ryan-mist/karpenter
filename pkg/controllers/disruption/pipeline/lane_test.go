@@ -100,13 +100,36 @@ var _ = Describe("Lane", func() {
 		Expect(obs.gated).To(Equal([]string{"busy/" + string(types.GateUnresolved)}))
 		// The other planner isn't held back by busy's unresolved plan.
 		Expect(other.planned()).To(HaveLen(2))
-		exec.resolveAll(pipeline.Rejected)
+		exec.resolveAll(pipeline.Started)
 		r := l.Step(ctx)
-		Expect(r.Admitted).To(Equal(0))
+		Expect(r.Admitted).To(Equal(1))
 		Expect(r.Plans).To(Equal(1))
 		Expect(busy.planned()).To(HaveLen(2))
+	})
+	It("backs a planner off for the polling period when none of its last plans started", func() {
+		w := newWorld(2)
+		busy, other := newStubPlanner("busy"), newStubPlanner("other")
+		busy.filter = func(c *disruption.Candidate) bool { return c.ProviderID() == w.providerIDs()[0] }
+		other.plan = func(pipeline.PlanInput) (pipeline.PlanOutput, error) { return pipeline.PlanOutput{}, nil }
+		obs := &recordingObserver{finished: func(*pipeline.RoundEvents) {}}
+		l := newLane(pipeline.LaneSpec{ID: types.LaneFast, Planners: []pipeline.Planner{busy, other}}, func(d *pipeline.LaneDeps) {
+			d.Snapshots = pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, nil)
+			d.Observer = obs
+		})
+		Expect(l.Step(ctx).Plans).To(Equal(1))
+		exec.resolveAll(pipeline.Rejected)
+		r := l.Step(ctx)
+		Expect(r.Plans).To(BeZero())
+		Expect(r.NextTimer).To(Equal(env.Clock.Now().Add(10 * time.Second)))
+		Expect(obs.gated).To(Equal([]string{"busy/" + string(types.GatePaced)}))
+		Expect(other.planned()).To(HaveLen(2)) // the back-off is the planner's, not the lane's
+		env.Clock.Step(10 * time.Second)
+		Expect(l.Step(ctx).Plans).To(Equal(1))
+		Expect(busy.planned()).To(HaveLen(2))
+		// A Submit with a plan that started doesn't back off.
 		exec.resolveAll(pipeline.Started)
-		Expect(l.Step(ctx).Admitted).To(Equal(1))
+		Expect(l.Step(ctx).Plans).To(Equal(1))
+		Expect(busy.planned()).To(HaveLen(3))
 	})
 	It("gives planners that move pods only pod-free candidates while cluster state is unsynced", func() {
 		w := newWorld(3, 1)
