@@ -55,6 +55,13 @@ type TotalsConsumer interface {
 	NeedsTotals() bool
 }
 
+// BudgetFree is implemented by planners that can plan disruptions no budget counts, so they plan even when no NodePool
+// has budget left for their reason. Repair is one: it repairs nodes that never initialized, which count against no
+// budget, as the disruption controller does.
+type BudgetFree interface {
+	BudgetFree() bool
+}
+
 // PlanInput is everything a planner may read. The Candidates are the planner's own; everything else is shared and
 // read-only.
 type PlanInput struct {
