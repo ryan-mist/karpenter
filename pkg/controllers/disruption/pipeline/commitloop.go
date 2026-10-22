@@ -55,7 +55,12 @@ type commitLoop struct {
 	unresolved map[string]int
 	// nextSweep is when the next sweep runs; zero means at the next step.
 	nextSweep time.Time
+	// ready is signalled (coalesced) when a plan is submitted.
+	submitted chan struct{}
 }
+
+// Ready is signalled when a plan was submitted since the last signal.
+func (e *commitLoop) Ready() <-chan struct{} { return e.submitted }
 
 type waitingPlan struct {
 	*Pending
@@ -100,6 +105,7 @@ func NewExecutor(deps ExecutorDeps) Executor {
 		scorer:     lo.Ternary[Scorer](deps.Scorer != nil, deps.Scorer, NewScorer()),
 		observer:   lo.Ternary[Observer](deps.Observer != nil, deps.Observer, NopObserver{}),
 		unresolved: map[string]int{},
+		submitted:  make(chan struct{}, 1),
 	}
 }
 
@@ -113,6 +119,14 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// After the lease is lost nothing is reserved: the commit runner's final drop may already have run. The check is
+	// under the lock the drop takes, so a plan is either rejected here or dropped there.
+	if ctx.Err() != nil {
+		for _, p := range plans {
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonCanceled}, false, e.clock.Now())
+		}
+		return sub.ch
+	}
 	if lo.SomeBy(plans, func(p *Plan) bool { return e.unresolved[p.Planner] > 0 }) {
 		for _, p := range plans {
 			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonBackpressure}, false, e.clock.Now())
@@ -134,6 +148,10 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 			continue
 		}
 		e.waiting = append(e.waiting, &waitingPlan{Pending: &Pending{Plan: p, SubmittedAt: now, SiblingRejected: rejectedBatch[p.BatchID]}, sub: sub})
+	}
+	select {
+	case e.submitted <- struct{}{}:
+	default:
 	}
 	return sub.ch
 }
