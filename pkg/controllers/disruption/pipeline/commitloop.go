@@ -115,7 +115,7 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 	defer e.mu.Unlock()
 	if lo.SomeBy(plans, func(p *Plan) bool { return e.unresolved[p.Planner] > 0 }) {
 		for _, p := range plans {
-			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonBackpressure}, false)
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonBackpressure}, false, e.clock.Now())
 		}
 		return sub.ch
 	}
@@ -130,7 +130,7 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 	for i, p := range plans {
 		e.unresolved[p.Planner]++
 		if errs[i] != nil {
-			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: rejectReason(ctx, errs[i])}, true)
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: rejectReason(ctx, errs[i])}, true, now)
 			continue
 		}
 		e.waiting = append(e.waiting, &waitingPlan{Pending: &Pending{Plan: p, SubmittedAt: now, SiblingRejected: rejectedBatch[p.BatchID]}, sub: sub})
@@ -139,10 +139,11 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 }
 
 // resolveLocked delivers a plan's resolution. counted is whether the plan counts as unresolved for its planner.
-func (e *commitLoop) resolveLocked(sub *submission, p *Plan, r Resolution, counted bool) {
+func (e *commitLoop) resolveLocked(sub *submission, p *Plan, r Resolution, counted bool, submittedAt time.Time) {
 	if counted {
 		e.unresolved[p.Planner]--
 	}
+	e.observer.Resolved(p, r, e.clock.Since(submittedAt))
 	sub.resolve(r)
 }
 
@@ -161,11 +162,14 @@ func (e *commitLoop) Step(ctx context.Context) (res CommitStepResult) {
 		res.Swept = e.sweep(ctx)
 	}
 	step := &CommitStep{Now: now, Synced: e.cluster.Synced(ctx)}
+	defer func() { e.observer.CommitStepFinished(res, step.Synced, e.clock.Since(now)) }()
 	var toStart []*Plan
 	// owners maps a plan to start to the submitted plans whose resolution it decides.
 	owners := map[uuid.UUID][]*owner{}
 	for _, group := range e.ready(now) {
+		admitStart := e.clock.Now()
 		r := e.admitter.Admit(ctx, group, step)
+		e.observer.Admitted(group, r, e.clock.Since(admitStart))
 		e.mu.Lock()
 		for _, p := range group {
 			wp := e.find(p.Plan.ID)
@@ -241,7 +245,7 @@ func (e *commitLoop) done(o *owner, started bool, reason types.RejectReason) {
 	if !o.started {
 		r.Kind, r.Reason = Rejected, o.reason
 	}
-	e.resolveLocked(o.sub, o.Plan, r, true)
+	e.resolveLocked(o.sub, o.Plan, r, true, o.SubmittedAt)
 }
 
 // cancel drops admitted plans that won't start because the lease was lost, and every waiting plan.
@@ -251,7 +255,7 @@ func (e *commitLoop) cancel(plans []*Plan, owners map[uuid.UUID][]*owner) {
 		e.ledger.Release(p.ID, types.ReasonCanceled)
 		for _, o := range owners[p.ID] {
 			if o.remaining--; o.remaining == 0 {
-				e.resolveLocked(o.sub, o.Plan, Resolution{PlanID: o.Plan.ID, Kind: Dropped, Reason: types.ReasonCanceled, Replanned: o.replanned}, true)
+				e.resolveLocked(o.sub, o.Plan, Resolution{PlanID: o.Plan.ID, Kind: Dropped, Reason: types.ReasonCanceled, Replanned: o.replanned}, true, o.SubmittedAt)
 			}
 		}
 	}
@@ -328,7 +332,7 @@ func (e *commitLoop) release(wp *waitingPlan, r Resolution) {
 	}
 	e.remove(wp)
 	e.ledger.Release(wp.Plan.ID, r.Reason)
-	e.resolveLocked(wp.sub, wp.Plan, r, true)
+	e.resolveLocked(wp.sub, wp.Plan, r, true, wp.SubmittedAt)
 }
 
 func (e *commitLoop) dropAll(reason types.RejectReason) {
@@ -350,9 +354,11 @@ func (e *commitLoop) sweepDue(now time.Time) bool {
 // step after a start failed.
 func (e *commitLoop) sweep(ctx context.Context) bool {
 	reserved := e.ledger.View()
+	start := e.clock.Now()
 	err := e.sweeper.Sweep(ctx, func(n *state.StateNode) bool {
 		return e.queue.HasAny(n.ProviderID()) || n.MarkedForDeletion() || n.RebootInProgress() || reserved.IsReserved(n.ProviderID())
 	})
+	e.observer.Swept(e.clock.Since(start), err)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err != nil {

@@ -273,7 +273,7 @@ type budgetFreePlanner struct{ *stubPlanner }
 
 func (budgetFreePlanner) BudgetFree() bool { return true }
 
-func (o *recordingObserver) RoundFinished(_ types.LaneID, _ pipeline.StepResult, ev *pipeline.RoundEvents) {
+func (o *recordingObserver) RoundFinished(_ context.Context, _ types.LaneID, _ pipeline.StepResult, ev *pipeline.RoundEvents) {
 	o.finished(ev)
 }
 
