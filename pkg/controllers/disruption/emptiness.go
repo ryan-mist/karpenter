@@ -58,14 +58,36 @@ func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	return c.IsEmpty() && c.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
-// ComputeCommand generates a disruption command given candidates
+// ComputeCommands generates a disruption command given candidates: the emptiness core with the controller's options.
+func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	res, err := e.Compute(ctx, disruptionBudgetMapping, e.LegacyOptions(), candidates...)
+	return orEmpty(res.Commands), err
+}
+
+// LegacyOptions are the options the disruption controller computes emptiness with: the method's own consolidation
+// state for Dedup, and its 15 s validator, run inline.
+func (e *Emptiness) LegacyOptions() CoreOptions {
+	return CoreOptions{
+		Effects:   InlineEffects{Recorder: e.recorder},
+		Dedup:     consolidatedState{c: &e.consolidation},
+		Validator: e.validator,
+	}
+}
+
+// Compute is the emptiness core. It deletes every empty candidate the budgets allow, in one command, ordered by
+// opts.Order (or by savings ratio). With opts.Validator the command is validated before it is returned; a command
+// that fails validation because pods arrived is dropped.
 //
 //nolint:gocyclo
-func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	if e.IsConsolidated() {
-		return []Command{}, nil
+func (e *Emptiness) Compute(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates ...*Candidate) (CoreResult, error) {
+	if opts.Dedup != nil && opts.Dedup.IsConsolidated() {
+		return CoreResult{}, nil
 	}
-	candidates = e.sortCandidates(ctx, candidates)
+	if opts.Order != nil {
+		opts.Order(candidates)
+	} else {
+		candidates = e.sortCandidates(ctx, candidates)
+	}
 
 	empty := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
@@ -88,26 +110,32 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 		// if there are no candidates, but a nodepool had a fully blocking budget,
 		// don't mark the cluster as consolidated, as it's possible this nodepool
 		// should be consolidated the next time we try to disrupt.
-		if !constrainedByBudgets {
-			e.markConsolidated()
+		if !constrainedByBudgets && opts.Dedup != nil {
+			opts.Dedup.MarkConsolidated()
 		}
-		return []Command{}, nil
+		return CoreResult{}, nil
 	}
 
 	cmd := Command{
 		Candidates:          empty,
 		PoolDisruptionCosts: computePoolDisruptionCosts(empty),
 	}
-	validCmd, err := validate(ctx, e.validator, cmd, commandValidationDelay)
+	if opts.Validator == nil {
+		return CoreResult{Commands: []Command{cmd}}, nil
+	}
+	validCmd, err := validate(ctx, opts.Validator, cmd, commandValidationDelay)
 	if err != nil {
 		if IsValidationError(err) {
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning empty node consolidation attempt due to pod churn, command is no longer valid")
-			return []Command{}, nil
+			return CoreResult{}, nil
 		}
-		return []Command{}, err
+		return CoreResult{}, err
 	}
-	return []Command{validCmd}, nil
+	return CoreResult{Commands: []Command{validCmd}}, nil
 }
+
+// Validator is the validator emptiness commands are checked with before they start.
+func (e *Emptiness) Validator() Validator { return e.validator }
 
 func (e *Emptiness) Reason() v1.DisruptionReason {
 	return v1.DisruptionReasonEmpty
