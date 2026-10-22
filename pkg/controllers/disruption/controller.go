@@ -176,33 +176,47 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// Attempt different disruption methods. We'll only let one method perform an action
+	// Attempt different disruption methods in order. A method whose commands only delete nodes lets the later methods
+	// run in the same pass; any other command ends the pass.
+	disrupted := false
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m)
+		cmds, err := c.disrupt(ctx, m)
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
 			}
 			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
 		}
-		if success {
+		if len(cmds) == 0 {
+			continue
+		}
+		disrupted = true
+		// StartCommand marks delete-only candidates for deletion and adds them to the queue before it returns, so the
+		// candidates and budgets that later methods build already account for them. Replacements are different: a
+		// launching NodeClaim is not yet a StateNode, so later simulations can't see it until cluster state syncs.
+		// Terminate-first and reboot also lead to capacity that isn't in cluster state yet, so they end the pass too.
+		if !lo.EveryBy(cmds, func(cmd Command) bool { return cmd.Decision() == DeleteDecision }) || !c.cluster.Synced(ctx) {
 			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 		}
+	}
+	if disrupted {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
 
 	// All methods did nothing, so return nothing to do
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+// disrupt runs one method and starts its commands. It returns the commands it started.
+func (c *Controller) disrupt(ctx context.Context, disruption Method) ([]Command, error) {
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
 	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
 	if err != nil {
-		return false, fmt.Errorf("determining candidates, %w", err)
+		return nil, fmt.Errorf("determining candidates, %w", err)
 	}
 	EligibleNodes.Set(float64(len(candidates)), map[string]string{
 		metrics.ReasonLabel: strings.ToLower(string(disruption.Reason())),
@@ -210,7 +224,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
@@ -218,16 +232,16 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 	if err != nil {
-		return false, fmt.Errorf("building disruption budgets, %w", err)
+		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	if err != nil {
-		return false, fmt.Errorf("computing disruption decision, %w", err)
+		return nil, fmt.Errorf("computing disruption decision, %w", err)
 	}
 	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
 	if len(cmds) == 0 {
-		return false, nil
+		return nil, nil
 	}
 
 	errs := make([]error, len(cmds))
@@ -245,9 +259,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		}
 	})
 	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
+		return nil, fmt.Errorf("disrupting candidates, %w", err)
 	}
-	return true, nil
+	return cmds, nil
 }
 
 func (c *Controller) recordRun(s string) {
