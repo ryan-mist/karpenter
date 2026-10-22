@@ -18,12 +18,16 @@ package pdb
 
 import (
 	"context"
+	"sort"
+	"sync"
 
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,24 +44,132 @@ const (
 )
 
 // Limits is used to evaluate if evicting a list of pods is possible.
-type Limits []*pdbItem
+type Limits struct {
+	byNamespace map[string]*namespacePDBs
+}
 
+// namespacePDBs are one namespace's PDBs in list order, indexed by label so that a pod is only matched against the
+// PDBs whose selector it can satisfy.
+type namespacePDBs struct {
+	pdbs []*pdbItem
+	// byLabel[key][value] are the positions in pdbs of the PDBs indexed by the requirement that label key is value.
+	// Each PDB is indexed by at most one requirement (its first Equals or In requirement), which a matching pod must
+	// satisfy.
+	byLabel map[string]map[string][]int
+	// unindexed are the positions in pdbs of the PDBs with no Equals or In requirement. They are matched against
+	// every pod in the namespace.
+	unindexed []int
+}
+
+// NewLimits lists the PDBs and builds Limits from them. If ctx carries an Index (WithIndex), PDBs whose UID and
+// resourceVersion haven't changed since the Index last saw them aren't parsed again. Limits are the same either way:
+// the PDBs are listed on every call, and a PDB is reused only if neither its spec nor its status changed.
 func NewLimits(ctx context.Context, kubeClient client.Client) (Limits, error) {
-	pdbs := []*pdbItem{}
-
 	var pdbList policyv1.PodDisruptionBudgetList
 	if err := kubeClient.List(ctx, &pdbList); err != nil {
-		return nil, err
+		return Limits{}, err
 	}
-	for _, pdb := range pdbList.Items {
-		pi, err := newPdb(pdb)
-		if err != nil {
-			return nil, err
-		}
-		pdbs = append(pdbs, pi)
+	idx, _ := ctx.Value(indexKey{}).(*Index)
+	pdbs, err := idx.items(pdbList.Items)
+	if err != nil {
+		return Limits{}, err
 	}
+	return newLimits(pdbs), nil
+}
 
-	return pdbs, nil
+func newLimits(pdbs []*pdbItem) Limits {
+	l := Limits{byNamespace: map[string]*namespacePDBs{}}
+	for _, pdb := range pdbs {
+		ns, ok := l.byNamespace[pdb.key.Namespace]
+		if !ok {
+			ns = &namespacePDBs{byLabel: map[string]map[string][]int{}}
+			l.byNamespace[pdb.key.Namespace] = ns
+		}
+		pos := len(ns.pdbs)
+		ns.pdbs = append(ns.pdbs, pdb)
+		if pdb.indexKey == "" {
+			ns.unindexed = append(ns.unindexed, pos)
+			continue
+		}
+		values, ok := ns.byLabel[pdb.indexKey]
+		if !ok {
+			values = map[string][]int{}
+			ns.byLabel[pdb.indexKey] = values
+		}
+		for _, v := range pdb.indexValues {
+			values[v] = append(values[v], pos)
+		}
+	}
+	return l
+}
+
+// matching returns the PDBs that select pod, in list order.
+func (l Limits) matching(pod *v1.Pod) []*pdbItem {
+	ns, ok := l.byNamespace[pod.Namespace]
+	if !ok {
+		return nil
+	}
+	var buf [8]int
+	positions := append(buf[:0], ns.unindexed...)
+	for k, v := range pod.Labels {
+		positions = append(positions, ns.byLabel[k][v]...)
+	}
+	if len(positions) > 1 {
+		sort.Ints(positions)
+	}
+	podLabels := labels.Set(pod.Labels)
+	var matched []*pdbItem
+	for _, pos := range positions {
+		if ns.pdbs[pos].selector.Matches(podLabels) {
+			matched = append(matched, ns.pdbs[pos])
+		}
+	}
+	return matched
+}
+
+type indexKey struct{}
+
+// WithIndex returns a context in which NewLimits uses idx.
+func WithIndex(ctx context.Context, idx *Index) context.Context {
+	return context.WithValue(ctx, indexKey{}, idx)
+}
+
+// Index keeps the parsed form of the PDBs it has seen by UID and resourceVersion, so that building Limits again
+// doesn't parse unchanged PDBs again. It keeps only the PDBs of the latest list.
+type Index struct {
+	mu      sync.Mutex
+	entries map[types.UID]*pdbItem
+}
+
+func NewIndex() *Index {
+	return &Index{entries: map[types.UID]*pdbItem{}}
+}
+
+// items parses pdbs, reusing the Index's items for PDBs whose UID and resourceVersion it has seen. A nil Index parses
+// every PDB.
+func (i *Index) items(pdbs []policyv1.PodDisruptionBudget) ([]*pdbItem, error) {
+	if i == nil {
+		return lo.MapErr(pdbs, func(pdb policyv1.PodDisruptionBudget, _ int) (*pdbItem, error) { return newPdb(pdb) })
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	entries := make(map[types.UID]*pdbItem, len(pdbs))
+	items := make([]*pdbItem, 0, len(pdbs))
+	for _, pdb := range pdbs {
+		pi, ok := i.entries[pdb.UID]
+		if !ok || pdb.ResourceVersion == "" || pi.resourceVersion != pdb.ResourceVersion {
+			var err error
+			if pi, err = newPdb(pdb); err != nil {
+				return nil, err
+			}
+		}
+		if pdb.ResourceVersion != "" {
+			entries[pdb.UID] = pi
+		}
+		items = append(items, pi)
+	}
+	i.entries = entries
+	return items, nil
 }
 
 // CanEvictPods returns true if every pod in the list is evictable. They may not all be evictable simultaneously, but
@@ -92,9 +204,7 @@ func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Record
 		return []client.ObjectKey{}, true
 	}
 
-	matchingPDBs := lo.Filter(l, func(pdb *pdbItem, _ int) bool {
-		return pdb.key.Namespace == pod.Namespace && pdb.selector.Matches(labels.Set(pod.Labels))
-	})
+	matchingPDBs := l.matching(pod)
 
 	// Regardless of whether the PDBs allow disruptions, Kubernetes doesn't support multiple PDBs on a single pod:
 	// https://github.com/kubernetes/kubernetes/blob/84cacae7046df93c1f6f8ea97c912d948e1ad06a/pkg/registry/core/pod/storage/eviction.go#L226
@@ -146,8 +256,13 @@ func (l Limits) IsCurrentlyReschedulable(pod *v1.Pod, clk clock.Clock, recorder 
 }
 
 type pdbItem struct {
-	key                         client.ObjectKey
-	selector                    labels.Selector
+	key             client.ObjectKey
+	resourceVersion string
+	selector        labels.Selector
+	// indexKey and indexValues are the selector's first Equals or In requirement: a pod the selector matches has label
+	// indexKey set to one of indexValues. indexKey is empty if the selector has no such requirement.
+	indexKey                    string
+	indexValues                 []string
 	disruptionsAllowed          int32
 	isFullyBlocking             bool
 	canAlwaysEvictUnhealthyPods bool
@@ -160,10 +275,21 @@ func newPdb(pdb policyv1.PodDisruptionBudget) (*pdbItem, error) {
 		return nil, err
 	}
 	canAlwaysEvictUnhealthyPods := pdb.Spec.UnhealthyPodEvictionPolicy != nil && *pdb.Spec.UnhealthyPodEvictionPolicy == policyv1.AlwaysAllow
+	var indexKey string
+	var indexValues []string
+	requirements, _ := selector.Requirements()
+	if r, ok := lo.Find(requirements, func(r labels.Requirement) bool {
+		return r.Operator() == selection.Equals || r.Operator() == selection.DoubleEquals || r.Operator() == selection.In
+	}); ok {
+		indexKey, indexValues = r.Key(), lo.Uniq(r.ValuesUnsorted())
+	}
 
 	return &pdbItem{
 		key:                client.ObjectKeyFromObject(&pdb),
+		resourceVersion:    pdb.ResourceVersion,
 		selector:           selector,
+		indexKey:           indexKey,
+		indexValues:        indexValues,
 		disruptionsAllowed: pdb.Status.DisruptionsAllowed,
 		isFullyBlocking: (pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.Int && pdb.Spec.MaxUnavailable.IntVal == 0) ||
 			(pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.String && pdb.Spec.MaxUnavailable.StrVal == "0%") ||
