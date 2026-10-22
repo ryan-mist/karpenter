@@ -78,13 +78,18 @@ func Relate(a, b types.Footprint) Relation {
 	if intersects(a.Devices, b.Devices) {
 		r.Coupled = append(r.Coupled, SharedDevice)
 	}
-	if intersects(a.TopologyGroups, b.TopologyGroups) {
+	if intersects(a.TopologyGroups, b.TopologyGroups) || anyNamespace(a.TopologyGroups, b.TopologyGroups) || anyNamespace(b.TopologyGroups, a.TopologyGroups) {
 		r.Coupled = append(r.Coupled, SharedTopology)
 	}
 	if intersects(a.PendingPods, b.PendingPods) {
 		r.Coupled = append(r.Coupled, SharedPending)
 	}
 	return r
+}
+
+// anyNamespace reports whether a has a pod whose term selects any namespace and b moves pods.
+func anyNamespace(a, b sets.Set[uint64]) bool {
+	return a.Has(AnyNamespace) && b.Len() > 0
 }
 
 func intersects[T comparable](a, b sets.Set[T]) bool {
