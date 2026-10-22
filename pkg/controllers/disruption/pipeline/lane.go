@@ -91,13 +91,18 @@ type lane struct {
 	// unresolved holds, per planner, the resolutions of its last Submit until all have arrived. A planner with an
 	// unresolved Submit doesn't plan (per-planner back-pressure).
 	unresolved map[string]<-chan Resolution
+	// started counts, per planner, the plans of its unresolved Submit that started so far.
+	started map[string]int
+	// backoff holds, per planner, until when it doesn't plan because none of its last Submit's plans started.
+	backoff map[string]time.Time
 }
 
 func NewLane(spec LaneSpec, deps LaneDeps) Lane {
 	if deps.Observer == nil {
 		deps.Observer = NopObserver{}
 	}
-	return &lane{spec: spec, scope: ScopeFor(spec.ID, spec.Planners...), deps: deps, unresolved: map[string]<-chan Resolution{}}
+	return &lane{spec: spec, scope: ScopeFor(spec.ID, spec.Planners...), deps: deps, unresolved: map[string]<-chan Resolution{},
+		started: map[string]int{}, backoff: map[string]time.Time{}}
 }
 
 func (l *lane) Spec() LaneSpec { return l.spec }
@@ -135,6 +140,16 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 		if _, ok := l.unresolved[p.Name()]; ok {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateUnresolved)
 			continue
+		}
+		if until, ok := l.backoff[p.Name()]; ok {
+			if snapshot.BuiltAt.Before(until) {
+				l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GatePaced)
+				if r.NextTimer.IsZero() || until.Before(r.NextTimer) {
+					r.NextTimer = until
+				}
+				continue
+			}
+			delete(l.backoff, p.Name())
 		}
 		if !l.hasBudget(ctx, p) {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateBudgetZero)
@@ -232,6 +247,9 @@ func (l *lane) complete(p Planner, plan *Plan, now time.Time) {
 }
 
 // collect takes the resolutions that have arrived for the planner's last Submit, and returns how many of them started.
+// A planner none of whose plans started (rejected at Submit or admission, failed to start, dropped) backs off for the
+// polling period, as the disruption controller retries such a command at its next pass. Without it, the wake-up the
+// resolution sends (or the 1 s poll) would re-plan the same candidates at once, in a loop.
 func (l *lane) collect(planner string) int {
 	ch, ok := l.unresolved[planner]
 	if !ok {
@@ -243,10 +261,15 @@ func (l *lane) collect(planner string) int {
 		case res, open := <-ch:
 			if !open {
 				delete(l.unresolved, planner)
+				if l.started[planner] == 0 {
+					l.backoff[planner] = l.deps.Clock.Now().Add(failureBackoff)
+				}
+				delete(l.started, planner)
 				return started
 			}
 			if res.Kind == Started {
 				started++
+				l.started[planner]++
 			}
 		default:
 			return started

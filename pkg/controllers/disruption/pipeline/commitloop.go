@@ -123,13 +123,13 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 	// under the lock the drop takes, so a plan is either rejected here or dropped there.
 	if ctx.Err() != nil {
 		for _, p := range plans {
-			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonCanceled}, false, e.clock.Now())
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonCanceled, AtSubmit: true}, false, e.clock.Now())
 		}
 		return sub.ch
 	}
 	if lo.SomeBy(plans, func(p *Plan) bool { return e.unresolved[p.Planner] > 0 }) {
 		for _, p := range plans {
-			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonBackpressure}, false, e.clock.Now())
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: types.ReasonBackpressure, AtSubmit: true}, false, e.clock.Now())
 		}
 		return sub.ch
 	}
@@ -144,7 +144,7 @@ func (e *commitLoop) Submit(ctx context.Context, plans ...*Plan) <-chan Resoluti
 	for i, p := range plans {
 		e.unresolved[p.Planner]++
 		if errs[i] != nil {
-			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: rejectReason(ctx, errs[i])}, true, now)
+			e.resolveLocked(sub, p, Resolution{PlanID: p.ID, Kind: Rejected, Reason: rejectReason(ctx, errs[i]), AtSubmit: true}, true, now)
 			continue
 		}
 		e.waiting = append(e.waiting, &waitingPlan{Pending: &Pending{Plan: p, SubmittedAt: now, SiblingRejected: rejectedBatch[p.BatchID]}, sub: sub})

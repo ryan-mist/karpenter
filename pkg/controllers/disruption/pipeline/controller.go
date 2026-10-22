@@ -40,6 +40,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -109,6 +110,7 @@ type Controller struct {
 	cluster  *state.Cluster
 	lanes    []Lane
 	executor Executor
+	wakes    *WakeHub
 }
 
 func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
@@ -122,7 +124,10 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	if o.Budgets == nil {
 		o.Budgets = o.Ledger.Budgets()
 	}
-	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, o.Lanes...)}, o.Observers...)
+	wakes := NewWakeHub()
+	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, o.Lanes...), newWakeObserver(wakes, o.Lanes...)}, o.Observers...)
+	// A completed command frees its nodes' budget slots.
+	queue.WithCompletionHook(func(*disruption.Command) { wakes.Publish("", types.WakeLedgerRelease) })
 	if o.Reserved == nil {
 		o.Reserved = o.Ledger.View()
 	}
@@ -166,6 +171,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 		cluster:  cluster,
 		lanes:    lo.Map(o.Lanes, func(spec LaneSpec, _ int) Lane { return NewLane(spec, deps) }),
 		executor: o.Executor,
+		wakes:    wakes,
 	}
 }
 
@@ -177,11 +183,23 @@ func (c *Controller) Name() string {
 // one for the commit loop. Reconcile (the synchronous runner) is for tests.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	for _, l := range c.lanes {
-		if err := m.Add(&laneRunner{lane: l, trigger: lo.Ternary[Trigger](l.Spec().Trigger != nil, l.Spec().Trigger, PollTrigger{}), clock: c.clock}); err != nil {
+		if err := m.Add(&laneRunner{lane: l, trigger: c.trigger(l.Spec()), clock: c.clock}); err != nil {
 			return err
 		}
 	}
 	return m.Add(&commitRunner{executor: c.executor, clock: c.clock})
+}
+
+// trigger is the lane's trigger; a PollTrigger (the default) is also woken by the pipeline's wake-ups.
+func (c *Controller) trigger(spec LaneSpec) Trigger {
+	switch t := spec.Trigger.(type) {
+	case nil:
+		return wakeTrigger{wake: c.wakes.Subscribe(spec.ID)}
+	case PollTrigger:
+		return wakeTrigger{PollTrigger: t, wake: c.wakes.Subscribe(spec.ID)}
+	default:
+		return t
+	}
 }
 
 // Reconcile runs one round of every lane, each followed by the commit loop (which also runs once with no lanes, for
