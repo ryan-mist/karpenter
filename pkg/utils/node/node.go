@@ -107,13 +107,24 @@ func IgnoreDuplicateNodeClaimError(err error) error {
 // Empty node names are skipped so callers operating on un-registered NodeClaims
 // don't accidentally match unscheduled pods via the "spec.nodeName" field selector.
 func GetPods(ctx context.Context, kubeClient client.Client, nodeNames ...string) ([]*corev1.Pod, error) {
+	return getPods(ctx, kubeClient, nil, nodeNames...)
+}
+
+// GetPodsReadOnly is GetPods without the deep copy of each pod that a cache-backed client makes. The returned pods are
+// shallow copies of the informer cache's objects: they share every map, slice and pointer field with the cache, so they
+// MUST NOT be modified. DeepCopy a pod before changing it.
+func GetPodsReadOnly(ctx context.Context, kubeClient client.Client, nodeNames ...string) ([]*corev1.Pod, error) {
+	return getPods(ctx, kubeClient, []client.ListOption{client.UnsafeDisableDeepCopy}, nodeNames...)
+}
+
+func getPods(ctx context.Context, kubeClient client.Client, opts []client.ListOption, nodeNames ...string) ([]*corev1.Pod, error) {
 	var pods []*corev1.Pod
 	for _, nodeName := range nodeNames {
 		if nodeName == "" {
 			continue
 		}
 		var podList corev1.PodList
-		if err := kubeClient.List(ctx, &podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		if err := kubeClient.List(ctx, &podList, append([]client.ListOption{client.MatchingFields{"spec.nodeName": nodeName}}, opts...)...); err != nil {
 			return nil, serrors.Wrap(fmt.Errorf("listing pods, %w", err), "Node", klog.KRef("", nodeName))
 		}
 		for i := range podList.Items {

@@ -85,7 +85,7 @@ type Candidate struct {
 	zone              string
 	capacityType      string
 	DisruptionCost    float64
-	reschedulablePods []*corev1.Pod
+	reschedulablePods []*corev1.Pod // the informer cache's pods (StateNode.ValidatePodsDisruptable): read-only
 	hasPodBlockers    bool
 
 	// Price is the cheapest compatible offering price for this candidate.

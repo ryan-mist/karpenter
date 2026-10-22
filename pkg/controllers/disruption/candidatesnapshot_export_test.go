@@ -262,3 +262,6 @@ func LegacyGetCandidatesWithTotals(ctx context.Context, deepCopyNodes func() sta
 	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
 	return filtered, nodePoolTotals, nil
 }
+
+// ReschedulablePods returns the candidate's reschedulable pods, which are shared with the informer cache.
+func (c *Candidate) ReschedulablePods() []*corev1.Pod { return c.reschedulablePods }

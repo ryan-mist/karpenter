@@ -322,8 +322,7 @@ func (c *Controller) recordUngated() {
 // methodCandidates returns m's candidates, and all candidates of m's class (for NodePoolTotals), from *snapshot. It
 // builds *snapshot first if it is nil. A method with no candidates only runs ShouldDisrupt, which writes nothing but its
 // own Candidates, so the next method may reuse the snapshot. A method with candidates goes on to ComputeCommands, which
-// can take minutes (simulations, validation waits) and modifies candidate pods (scheduling injects topology spread
-// constraints and relaxes preferences in place), so *snapshot is cleared and the next method builds a fresh one, as
+// can take minutes (simulations, validation waits), so *snapshot is cleared and the next method builds a fresh one, as
 // every method did before snapshots were shared.
 func methodCandidates(ctx context.Context, m Method, snapshot **CandidateSnapshot, build func() (*CandidateSnapshot, error)) (candidates, allCandidates []*Candidate, s *CandidateSnapshot, err error) {
 	if *snapshot == nil {
