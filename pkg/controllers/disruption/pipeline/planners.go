@@ -22,6 +22,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"k8s.io/utils/clock"
@@ -70,6 +71,9 @@ type planner struct {
 	sim     disruption.Simulator
 	// validateAt is how long after planning a plan may be admitted.
 	validateAt time.Duration
+	// nominates makes every existing node a plan places pods on (pending pods too) one of its Destinations, as the
+	// disruption controller nominates them when the command starts (reference mode).
+	nominates bool
 }
 
 func (p *planner) Name() string                { return p.name }
@@ -110,6 +114,13 @@ func (p *planner) plans(cmds []disruption.Command, version uint64, in PlanInput)
 		plan.Planner, plan.Reason = p.name, p.Reason()
 		if p.validateAt > 0 {
 			plan.ValidateAt = in.Now.Add(p.validateAt)
+		}
+		if p.nominates {
+			for _, n := range cmd.Results.ExistingNodes {
+				if len(n.Pods) > 0 {
+					plan.Footprint.Destinations.Insert(n.ProviderID())
+				}
+			}
 		}
 		if cmd.BatchID != uuid.Nil {
 			batches[cmd.BatchID] = append(batches[cmd.BatchID], plan)
@@ -239,6 +250,9 @@ type batchPlanner struct {
 	// fair, if set, orders candidates round-robin across NodePools and backs off NodePools whose commands failed
 	// (drift). Without it the core's own order applies (repair's score order).
 	fair *poolFairness
+	// reference plans one candidate at a time and keeps pending-only NodeClaims on the first command, as the
+	// disruption controller does (PlannerOptions.Reference).
+	reference bool
 }
 
 func (p *batchPlanner) BudgetFree() bool { return p.budgetFree }
@@ -252,6 +266,9 @@ func (p *batchPlanner) options(batch int) disruption.CoreOptions {
 		Sim:          p.sim,
 		Pending:      disruption.DropPendingOnly,
 		CachedReboot: p.cachedReboot,
+	}
+	if p.reference {
+		opts.Batch, opts.Sizer, opts.Deadline, opts.Pending = 1, nil, 0, disruption.KeepOnFirst
 	}
 	if p.fair != nil {
 		opts.Order = p.fair.order(byDisruptionTime(p.Reason()))
@@ -374,22 +391,38 @@ func (p *consolidationPlanner) Revalidate(ctx context.Context, in RevalidateInpu
 	return validated(ctx, p.validator, in)
 }
 
+// PlannerOptions configure DefaultPlanners.
+type PlannerOptions struct {
+	// Reference plans as the disruption controller does, for the batch=1 differential (G9) and the shadow mode's
+	// reference level: drift and repair plan one candidate at a time without a deadline, keep pending-only NodeClaims
+	// on the first command (R71 off), and walk candidates in the core's own order without NodePool round-robin or
+	// backoff (R73 off); simulations see the candidates of reserved, unstarted plans as deleting, as a pass of the
+	// disruption controller sees the commands earlier methods started (decision #9 off).
+	Reference bool
+}
+
+// WithReference makes DefaultPlanners plan as the disruption controller does (PlannerOptions.Reference).
+func WithReference() option.Function[PlannerOptions] {
+	return func(o *PlannerOptions) { o.Reference = true }
+}
+
 // DefaultPlanners are the pipeline's planners over the disruption methods (disruption.NewMethods), built with the
 // pipeline's effects and simulator. recorder receives what the methods publish; the Observer publishes it.
 func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, queue *disruption.Queue, recorder events.Recorder, reserved ReservationView,
+	cp cloudprovider.CloudProvider, queue *disruption.Queue, recorder events.Recorder, reserved ReservationView, opts ...option.Function[PlannerOptions],
 ) map[string]Planner {
+	o := option.Resolve(opts...)
 	eff := effects{recorder: recorder, cluster: cluster, reserved: reserved}
-	sim := NewSimulator(disruption.NewLegacySimulator(kubeClient, cluster, provisioner, clk, recorder), reserved)
+	sim := lo.Ternary(o.Reference, newReferenceSimulator, NewSimulator)(disruption.NewLegacySimulator(kubeClient, cluster, provisioner, clk, recorder), reserved)
 	base := func(name string, m disruption.Method, shape types.Shape) planner {
-		return planner{name: name, method: m, shape: shape, effects: eff, sim: sim}
+		return planner{name: name, method: m, shape: shape, effects: eff, sim: sim, nominates: o.Reference}
 	}
 	out := map[string]Planner{}
 	for _, m := range disruption.NewMethods(ctx, clk, cluster, kubeClient, provisioner, cp, recorder, queue) {
 		switch m := m.(type) {
 		case *disruption.Repair:
 			out[RepairPlanner] = &batchPlanner{planner: base(RepairPlanner, m, types.ShapeReplacing), compute: m.Compute,
-				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), cachedReboot: true, budgetFree: true}
+				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), cachedReboot: true, budgetFree: true, reference: o.Reference}
 		case *disruption.Emptiness:
 			p := &emptinessPlanner{planner: base(EmptinessPlanner, m, types.ShapePodFree), core: m, dedup: &stateDedup{cluster: cluster}}
 			p.validateAt = disruption.CommandValidationDelay
@@ -398,8 +431,11 @@ func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluste
 			out[StaticDriftPlanner] = &staticDriftPlanner{planner: base(StaticDriftPlanner, m, types.ShapeReplacing), core: m}
 		case *disruption.Drift:
 			p := &batchPlanner{planner: base(DriftPlanner, m, types.ShapeReplacing), compute: m.Compute,
-				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), fair: newPoolFairness(clk)}
-			queue.WithCompletionHook(p.finished)
+				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), reference: o.Reference}
+			if !o.Reference {
+				p.fair = newPoolFairness(clk)
+				queue.WithCompletionHook(p.finished)
+			}
 			out[DriftPlanner] = p
 		case *disruption.MultiNodeConsolidation:
 			p := &consolidationPlanner{planner: base(MultiNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: &stateDedup{cluster: cluster}}

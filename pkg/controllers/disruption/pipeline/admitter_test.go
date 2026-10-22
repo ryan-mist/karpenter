@@ -278,6 +278,19 @@ var _ = Describe("Admitter", func() {
 		Expect(r.Start).To(BeEmpty())
 		Expect(r.Wait).To(HaveLen(1))
 	})
+	It("makes a plan that always re-simulates wait while another plan admitted earlier in the step hasn't started", func() {
+		planner.always = true
+		p := plan(ids[0])
+		s := step()
+		// Unrelated to p: only its validator's re-simulation, which sees live state, would see it as not started.
+		s.Admitted = []*pipeline.Plan{{ID: uuid.New(), BatchID: uuid.New(), Footprint: types.Footprint{Removed: sets.New(ids[1])}}}
+		r := admitter.Admit(ctx, []*pipeline.Pending{p}, s)
+		Expect(r.Start).To(BeEmpty())
+		Expect(r.Wait).To(HaveLen(1))
+		Expect(planner.inputs).To(BeEmpty())
+		// With nothing admitted before it, it re-validates.
+		Expect(started(admitter.Admit(ctx, []*pipeline.Pending{p}, step()))).To(Equal([]string{ids[0]}))
+	})
 	Context("batches", func() {
 		batch := func(ps ...*pipeline.Pending) []*pipeline.Pending {
 			for _, p := range ps {

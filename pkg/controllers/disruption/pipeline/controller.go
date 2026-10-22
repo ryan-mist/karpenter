@@ -65,6 +65,16 @@ type Options struct {
 	Budgets   BudgetView
 	Reserved  ReservationView
 	Observers []Observer
+	// Reference plans as a pass of the disruption controller does (WithReferenceMode).
+	Reference bool
+}
+
+// WithReferenceMode makes the pipeline plan as a pass of the disruption controller does, for the batch=1
+// differential (G9), its only user: without injected lanes, ReferenceLanes over
+// DefaultPlanners(..., WithReference()); and the nodes reserved plans move pods onto aren't candidates, as the
+// disruption controller nominates a started command's destinations before its next method looks for candidates.
+func WithReferenceMode() option.Function[Options] {
+	return func(o *Options) { o.Reference = true }
 }
 
 func WithLedger(l Ledger) option.Function[Options] {
@@ -119,14 +129,18 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 ) *Controller {
 	o := option.Resolve(opts...)
 	if o.Ledger == nil {
-		o.Ledger = NewLedger(kubeClient, cluster, cp, clk, queue)
+		o.Ledger = NewLedger(kubeClient, cluster, cp, clk, queue, lo.Ternary(o.Reference, []option.Function[LedgerOptions]{withReservedCredit()}, nil)...)
 	}
 	if o.Budgets == nil {
 		o.Budgets = o.Ledger.Budgets()
 	}
 	// The disruption methods' own events (filters, validators) are buffered and published by the Observer.
 	methodEvents := &RoundEvents{}
-	if o.Lanes == nil {
+	switch {
+	case o.Lanes != nil:
+	case o.Reference:
+		o.Lanes = ReferenceLanes(DefaultPlanners(ctx, clk, cluster, kubeClient, provisioner, cp, queue, methodEvents, o.Ledger.View(), WithReference()))
+	default:
 		o.Lanes = DefaultLanes(DefaultPlanners(ctx, clk, cluster, kubeClient, provisioner, cp, queue, methodEvents, o.Ledger.View()))
 	}
 	wakes := NewWakeHub()
@@ -135,6 +149,9 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	queue.WithCompletionHook(func(*disruption.Command) { wakes.Publish("", types.WakeLedgerRelease) })
 	if o.Reserved == nil {
 		o.Reserved = o.Ledger.View()
+		if o.Reference {
+			o.Reserved = referenceView{o.Reserved}
+		}
 	}
 	if o.Admitter == nil {
 		planners := lo.FlatMap(o.Lanes, func(l LaneSpec, _ int) []Planner { return l.Planners })
@@ -255,6 +272,10 @@ func (c *Controller) drain(ctx context.Context) (started, waiting int, err error
 	for {
 		r := c.executor.Step(ctx)
 		started += r.Admitted
+		// Plans that waited for ones admitted in this step to start (rule 9) are ready now.
+		if r.Waiting > 0 && r.Admitted > 0 {
+			continue
+		}
 		if r.Waiting == 0 || r.NextReady.IsZero() {
 			return started, r.Waiting, nil
 		}

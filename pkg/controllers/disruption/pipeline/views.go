@@ -55,6 +55,18 @@ type ReservationView interface {
 	ReservationsHeld(reservationID string) int
 }
 
+// referenceView is the reference mode's ReservationView: the nodes reserved plans move pods onto count as in-flight
+// destinations, so they aren't candidates (WithReferenceMode).
+type referenceView struct{ ReservationView }
+
+func (v referenceView) InFlightDestinations() sets.Set[string] {
+	out := v.ReservationView.InFlightDestinations()
+	for _, fp := range v.Footprints() {
+		out = out.Union(fp.Destinations)
+	}
+	return out
+}
+
 // Internal constants. None of them is a user setting.
 const (
 	// StaleAfter is how old a plan may be before the Admitter re-simulates it.

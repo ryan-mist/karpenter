@@ -28,9 +28,13 @@ import (
 // lane plans capacity for another lane's pods before that lane's plan launched its own (decision #9, F26). Nodes of
 // started commands are MarkedForDeletion, and simulations re-place their pods as today. Its simulations list pending pods
 // without side effects (no scheduling decisions recorded, no events), so planning writes nothing (F29).
+//
+// In reference mode it simulates the candidates of reserved, unstarted plans as already deleting instead (their pods
+// re-placed), as the disruption controller's pass sees the commands of earlier methods, which it has started by then.
 type reservingSimulator struct {
-	inner    disruption.Simulator
-	reserved ReservationView
+	inner     disruption.Simulator
+	reserved  ReservationView
+	reference bool
 }
 
 // NewSimulator wraps inner (normally disruption.NewLegacySimulator) with the reserved-plans rule.
@@ -38,12 +42,21 @@ func NewSimulator(inner disruption.Simulator, reserved ReservationView) disrupti
 	return &reservingSimulator{inner: inner, reserved: reserved}
 }
 
+// newReferenceSimulator wraps inner for reference mode (PlannerOptions.Reference).
+func newReferenceSimulator(inner disruption.Simulator, reserved ReservationView) disruption.Simulator {
+	return &reservingSimulator{inner: inner, reserved: reserved, reference: true}
+}
+
 func (s *reservingSimulator) Simulate(ctx context.Context, opts disruption.SimOptions, candidates ...*disruption.Candidate) (disruption.Outcome, error) {
 	// Planning records nothing about pending pods; the provisioner does on its own loop.
 	opts.WithoutPendingPodSideEffects = true
 	if s.reserved != nil {
 		exclude := s.reserved.Unstarted()
-		if len(exclude) > 0 {
+		switch {
+		case len(exclude) == 0:
+		case s.reference:
+			opts.AlsoDeleting = exclude.Union(opts.AlsoDeleting)
+		default:
 			opts.ExcludeDestinations = exclude.Union(opts.ExcludeDestinations)
 		}
 	}

@@ -156,6 +156,15 @@ type Ledger interface {
 
 type LedgerOptions struct {
 	policy AllocationPolicy
+	// creditReserved credits the capacity reserved, unstarted plans free against NodePool limits (reference mode).
+	creditReserved bool
+}
+
+// withReservedCredit makes the limits check credit what reserved, unstarted plans free, as the disruption controller's
+// pass has started the commands of earlier methods by the time a later one is checked (reference mode only: R1 keeps a
+// plan from borrowing capacity another plan hasn't started freeing).
+func withReservedCredit() option.Function[LedgerOptions] {
+	return func(o *LedgerOptions) { o.creditReserved = true }
 }
 
 // WithAllocationPolicy replaces FirstComeFirstServed.
@@ -170,6 +179,8 @@ type ledger struct {
 	clock         clock.Clock
 	queue         *disruption.Queue
 	policy        AllocationPolicy
+	// creditReserved is LedgerOptions.creditReserved.
+	creditReserved bool
 
 	mu       sync.Mutex
 	version  atomic.Uint64
@@ -192,15 +203,16 @@ func NewLedger(kubeClient client.Client, cluster *state.Cluster, cp cloudprovide
 ) Ledger {
 	o := option.Resolve(opts...)
 	return &ledger{
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		cloudProvider: cp,
-		clock:         clk,
-		queue:         queue,
-		policy:        lo.Ternary[AllocationPolicy](o.policy != nil, o.policy, FirstComeFirstServed{}),
-		reserved:      map[uuid.UUID]*reservation{},
-		removed:       map[string]uuid.UUID{},
-		released:      make(chan struct{}, 1),
+		kubeClient:     kubeClient,
+		cluster:        cluster,
+		cloudProvider:  cp,
+		clock:          clk,
+		queue:          queue,
+		policy:         lo.Ternary[AllocationPolicy](o.policy != nil, o.policy, FirstComeFirstServed{}),
+		creditReserved: o.creditReserved,
+		reserved:       map[uuid.UUID]*reservation{},
+		removed:        map[string]uuid.UUID{},
+		released:       make(chan struct{}, 1),
 	}
 }
 
@@ -449,10 +461,20 @@ func (l *ledger) limits(nodePools map[string]*v1.NodePool, live liveState, fp ty
 			return out
 		}
 		for id, r := range l.reserved {
-			if id == exclude || len(r.footprint.LimitCost[name]) == 0 {
-				continue
+			switch {
+			case id == exclude:
+			case l.creditReserved:
+				// A reserved plan's nodes freed count as if it had started; LimitCost may be empty (a deletion).
+				freed := corev1.ResourceList{}
+				for id := range r.footprint.Removed {
+					if n, ok := live.nodes[id]; ok && n.nodePool == name && !n.marked {
+						freed = resources.Merge(freed, n.capacity)
+					}
+				}
+				total = resources.Subtract(resources.Merge(total, r.footprint.LimitCost[name]), freed)
+			case len(r.footprint.LimitCost[name]) > 0:
+				total = resources.Merge(total, lo.OmitBy(net(r.footprint), func(_ corev1.ResourceName, q resource.Quantity) bool { return q.Sign() <= 0 }))
 			}
-			total = resources.Merge(total, lo.OmitBy(net(r.footprint), func(_ corev1.ResourceName, q resource.Quantity) bool { return q.Sign() <= 0 }))
 		}
 		total = resources.Merge(total, net(fp))
 		if err := np.Spec.Limits.ExceededBy(total); err != nil {

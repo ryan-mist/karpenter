@@ -38,6 +38,9 @@ type LaneSpec struct {
 	SkipWhileUnsynced bool
 	// Trigger paces the lane's rounds when the pipeline runs asynchronously; nil is PollTrigger{}.
 	Trigger Trigger
+	// FirstWins ends a round after the first planner that submitted a plan that isn't a plain delete, as a pass of the
+	// disruption controller ends after the first method with a command that isn't delete-only (ReferenceLanes).
+	FirstWins bool
 }
 
 // Lane plans for its planners, one round per Step. Step never sleeps.
@@ -172,6 +175,9 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 		}
 		l.unresolved[p.Name()] = l.deps.Executor.Submit(ctx, out.Plans...)
 		r.Plans += len(out.Plans)
+		if l.spec.FirstWins && lo.SomeBy(out.Plans, func(plan *Plan) bool { return plan.Action != types.ActionDelete }) {
+			return r
+		}
 	}
 	return r
 }

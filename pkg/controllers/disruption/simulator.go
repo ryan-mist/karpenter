@@ -87,6 +87,8 @@ type SimOptions struct {
 	// WithoutPendingPodSideEffects lists the pending pods without recording scheduling decisions or publishing events
 	// about them (the disruption pipeline).
 	WithoutPendingPodSideEffects bool
+	// AlsoDeleting are nodes simulated as if they were already being disrupted (SimulationOptions.AlsoDeleting).
+	AlsoDeleting sets.Set[string]
 }
 
 // Outcome is the result of one simulation.
@@ -118,7 +120,7 @@ func (s *LegacySimulator) Simulate(ctx context.Context, opts SimOptions, candida
 	simOpts := SimulationOptions{IncludeBlockedCandidatePods: opts.IncludeBlockedCandidatePods, ExcludeDestinations: opts.ExcludeDestinations,
 		LimitsUsed: opts.LimitsUsed, SkipDeletingNodePods: opts.SkipDeletingNodePods,
 		TrackUninitialized: opts.TrackUninitialized, CandidateGroupSize: opts.CandidateGroupSize,
-		WithoutPendingPodSideEffects: opts.WithoutPendingPodSideEffects}
+		WithoutPendingPodSideEffects: opts.WithoutPendingPodSideEffects, AlsoDeleting: opts.AlsoDeleting}
 	var out Outcome
 	var err error
 	if opts.ReservedFallback && len(candidates) == 1 && len(opts.SchedulerOptions) == 0 {

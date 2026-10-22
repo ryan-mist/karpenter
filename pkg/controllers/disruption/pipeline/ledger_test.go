@@ -334,6 +334,15 @@ var _ = Describe("Ledger", func() {
 			Expect(l.Reserve(ctx, shrink)).To(Equal([]error{nil}))
 			Expect(reasonsOf(l.Reserve(ctx, limitPlan(ids[4], 2)))).To(Equal([]types.RejectReason{types.ReasonNodePoolLimit}))
 		})
+		It("credits another reserved plan's candidates in reference mode, as if it had started", func() {
+			l = pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue, pipeline.WithReservedCredit())
+			w.nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("10")}
+			ExpectApplied(ctx, env.Client, w.nodePool)
+			Expect(l.Reserve(ctx, budgetPlan(w.nodePool.Name, v1.DisruptionReasonEmpty, ids[0]))).To(Equal([]error{nil}))
+			// 10 nodes - 1 (the emptiness plan's) + 2 - 1 = 10.
+			Expect(l.Reserve(ctx, limitPlan(ids[1], 2))).To(Equal([]error{nil}))
+			Expect(reasonsOf(l.Reserve(ctx, limitPlan(ids[2], 2)))).To(Equal([]types.RejectReason{types.ReasonNodePoolLimit}))
+		})
 		It("rechecks a plan against limits that shrank", func() {
 			w.nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("10")}
 			ExpectApplied(ctx, env.Client, w.nodePool)

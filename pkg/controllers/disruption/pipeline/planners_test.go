@@ -350,6 +350,18 @@ var _ = Describe("Planners", func() {
 		}
 		Expect(failed).To(BeNumerically(">=", 1))
 	})
+	It("deletes an empty node and consolidates in one round, consolidation validating after the deletion started", func() {
+		w := newWorld(4)
+		w.only(v1.ConditionTypeConsolidatable)
+		w.withPods("100m", 1, 2, 3)
+		// One lane, so both plans are admitted in the same commit step (as with concurrent lanes): consolidation's
+		// validator, which sees only live state, waits for the deletion to start, then the sync runner steps again.
+		c = pipeline.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, pipeline.WithReferenceMode())
+		reconcileThrough(c)
+		types := lo.Map(queue.GetCommands(), func(cmd *disruption.Command, _ int) string { return cmd.ConsolidationType() })
+		Expect(types).To(ContainElement("empty"))
+		Expect(types).To(ContainElement(BeElementOf("multi", "single")))
+	})
 	It("consolidates underutilized nodes after the validation delay", func() {
 		w := newWorld(3)
 		w.only(v1.ConditionTypeConsolidatable)

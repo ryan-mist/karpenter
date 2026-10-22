@@ -17,6 +17,7 @@ limitations under the License.
 package pipeline
 
 import (
+	"github.com/awslabs/operatorpkg/option"
 	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -56,3 +57,11 @@ func (f *PoolFairness) Started(pools ...string)           { f.started(pools...) 
 func (f *PoolFairness) Finished(ok bool, pools ...string) { f.finished(ok, pools...) }
 
 func NewStateDedup(cluster *state.Cluster) disruption.Dedup { return &stateDedup{cluster: cluster} }
+
+// WithReservedCredit is the reference mode's Ledger option.
+func WithReservedCredit() option.Function[LedgerOptions] { return withReservedCredit() }
+
+// NewReferenceSimulator is the reference mode's Simulator.
+func NewReferenceSimulator(inner disruption.Simulator, reserved ReservationView) disruption.Simulator {
+	return newReferenceSimulator(inner, reserved)
+}

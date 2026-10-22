@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -249,5 +250,26 @@ var _ = Describe("Simulator", func() {
 		Expect(lo.Filter(out.Results.ExistingNodes, func(n *pscheduling.ExistingNode, _ int) bool { return len(n.Pods) > 0 })).To(BeEmpty())
 		Expect(out.Results.NewNodeClaims).To(HaveLen(1))
 		Expect(out.Results.AllNonPendingPodsScheduled()).To(BeTrue())
+	})
+	It("in reference mode, simulates the candidates of reserved plans as deleting: no destination, pods re-placed", func() {
+		w := newWorld(3)
+		w.withPods("1", 0, 2)
+		s, err := pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, nil).Build(ctx, pipeline.Scope{})
+		Expect(err).ToNot(HaveOccurred())
+		cands := lo.SliceToMap(s.CandidatesFor(ctx, newStubPlanner("drift")), func(c *disruption.Candidate) (string, *disruption.Candidate) { return c.ProviderID(), c })
+		ids := w.providerIDs()
+		inner := disruption.NewLegacySimulator(env.Client, cluster, prov, env.Clock, recorder)
+		// Node 0 is reserved by another plan: its pod is re-placed along with node 2's, and nothing goes to node 0.
+		reserved := &fakeView{reserved: sets.New(ids[0]), channels: map[*pipeline.Plan]chan pipeline.Resolution{}}
+		out, err := pipeline.NewReferenceSimulator(inner, reserved).Simulate(ctx, disruption.SimOptions{}, cands[ids[2]])
+		Expect(err).ToNot(HaveOccurred())
+		placed := lo.FlatMap(out.Results.ExistingNodes, func(n *pscheduling.ExistingNode, _ int) []string {
+			return lo.Map(n.Pods, func(p *corev1.Pod, _ int) string { return n.ProviderID() })
+		})
+		placed = append(placed, lo.FlatMap(out.Results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []string {
+			return lo.Map(nc.Pods, func(*corev1.Pod, int) string { return "new" })
+		})...)
+		Expect(placed).To(HaveLen(2))
+		Expect(placed).ToNot(ContainElement(ids[0]))
 	})
 })
