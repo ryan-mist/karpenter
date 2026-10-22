@@ -201,6 +201,14 @@ var _ = AfterEach(func() {
 	disruption.NodepoolDecisionsPerformed.Reset()
 	disruption.TerminateFirstDecisionsTotal.Reset()
 	disruption.NodeClaimsUnhealthyDisruptedTotal.Reset()
+	disruption.EvaluationDurationSeconds.Reset()
+	disruption.PhaseDurationSeconds.Reset()
+	disruption.SchedulingSimulationsPerEvaluation.Reset()
+	disruption.LastEvaluationTimestampSeconds.Reset()
+	disruption.SkippedEvaluationsTotal.Reset()
+	disruption.ClusterStateGatedPassesTotal.Reset()
+	disruption.ClusterStateGateDurationSeconds.Reset()
+	disruption.QueueCommands.Reset()
 })
 
 var _ = Describe("Simulate Scheduling", func() {
