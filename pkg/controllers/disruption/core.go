@@ -59,6 +59,9 @@ type CoreOptions struct {
 	// (the disruption controller). Without it, commands are returned unvalidated, for a caller that validates them
 	// later.
 	Validator Validator
+	// WithoutMetrics records none of the disruption controller's metrics (consolidation timeouts), for a caller that
+	// only compares (the disruption pipeline's shadow mode).
+	WithoutMetrics bool
 
 	// minBatch is the smallest batch planned jointly; 0 means 2. Tests lower it to 1 to drive the batched path with
 	// one candidate.

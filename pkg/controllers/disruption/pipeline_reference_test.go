@@ -41,18 +41,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline"
 	ptypes "sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/test"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
 // recordingStarter records the command each admitted plan would start, and marks its candidates for deletion in
@@ -260,4 +265,117 @@ func (debugObserver) Planned(lane ptypes.LaneID, p pipeline.Planner, candidates 
 	if os.Getenv("KARPENTER_PIPELINE_REF_DEBUG") != "" {
 		fmt.Fprintf(GinkgoWriter, "DEBUG planned %s candidates=%d plans=%d\n", p.Name(), candidates, len(out.Plans))
 	}
+}
+
+// The shadow mode (RFC D.3) on the same generated clusters: the disruption controller acts, the shadow compares each
+// sampled method computation, and no comparison may differ in logic (a race is a state change in between).
+var _ = Describe("Pipeline shadow mode", func() {
+	var e *coreEnv
+	AfterEach(func() {
+		if e != nil {
+			e.stop()
+			e = nil
+		}
+	})
+	budgets := func(_ int, r *rand.Rand) string { return []string{"1", "10%", "20%", "100%"}[r.Intn(4)] }
+	nodes := coreDiffNodes([]int{10, 20, 40})
+	for _, seed := range coreSeeds(4001, 6) {
+		spec := randomGenSpec(seed, nodes, budgets)
+		spec.ConsolidateAfter, spec.MixedTypes = "0s", seed%3 != 1
+		if seed%3 == 0 {
+			spec.DriftFrac, spec.Util = 0, []float64{0.3, 0.5}[seed%2]
+		}
+		It(fmt.Sprintf("seed=%d %+v", seed, spec), func() {
+			// run runs the disruption controller for up to the step limit, with or without the shadow, and returns what
+			// it did per pass: per command its decision and how many candidates and replacements (upstream picks among
+			// equivalent nodes nondeterministically, and names differ between builds), the reasons of its events, and its
+			// consolidation timeouts and moves. The exact method state is pinned by the Shadow spec "rechecks a
+			// mismatch with its own objects".
+			run := func(withShadow bool) []string {
+				for _, m := range []interface{ Reset() }{pipeline.ShadowComparisonsTotal, pipeline.ShadowMismatchesTotal,
+					disruption.ConsolidationTimeoutsTotal, disruption.ConsolidationMovesTotal} {
+					m.Reset()
+				}
+				if e != nil {
+					e.stop()
+					ExpectCleanedUp(ctx, env.Client)
+				}
+				e = newCoreEnv(ctx, genInstanceTypesOf(genZones(spec.Zones), v1.CapacityTypeOnDemand, v1.CapacityTypeSpot))
+				gc := e.buildGen(spec)
+				e.stepClock()
+				opts := []option.Function[disruption.ControllerOptions]{disruption.WithMethods(e.methods...)}
+				var shadow *pipeline.Shadow
+				if withShadow {
+					shadow = pipeline.NewShadow(e.ctx, env.Clock, e.client, e.prov, cloudProvider, e.cluster, e.queue, e.clusterCost, 1)
+					opts = append(opts, disruption.WithComputeObserver(shadow))
+				}
+				legacy := disruption.NewController(e.ctx, env.Clock, e.client, e.prov, cloudProvider, e.recorder, e.cluster, e.queue, e.clusterCost, opts...)
+				var passes []string
+				for range coreDiffEnv("KARPENTER_PIPELINE_REF_STEPS", 6) {
+					e.recorder.Reset()
+					started := e.passLegacy(legacy)
+					// Which reasons, not how many: a tie-equivalent node may hold a different number of pods (Nominated).
+					reasons := lo.Uniq(lo.Map(e.recorder.Events(), func(ev events.Event, _ int) string { return ev.Reason }))
+					sort.Strings(reasons)
+					cmds := lo.Map(started, func(c disruption.Command, _ int) string {
+						return fmt.Sprintf("%s/%d/%d", c.Decision(), len(c.Candidates), len(c.Replacements))
+					})
+					sort.Strings(cmds)
+					passes = append(passes, fmt.Sprintf("%v events=%v", cmds, reasons))
+					if len(started) == 0 {
+						break
+					}
+					e.genLaunch(gc, lo.ToSlicePtr(started))
+				}
+				// Keyed by labels without the NodePool name, which differs between builds.
+				byDecision := func(name string) map[string]float64 {
+					out := map[string]float64{}
+					for k, v := range shadowCounts(name, nil) {
+						out[regexp.MustCompile(`nodepool:\S+ `).ReplaceAllString(k, "")] += v
+					}
+					return out
+				}
+				passes = append(passes, fmt.Sprint(byDecision("karpenter_voluntary_disruption_consolidation_timeouts_total"),
+					byDecision("karpenter_voluntary_disruption_consolidation_moves_total")))
+				if withShadow {
+					compared := lo.SumBy([]string{"reference", "snapshot"}, func(level string) float64 {
+						return lo.SumBy(lo.Values(shadowCounts("karpenter_voluntary_disruption_pipeline_shadow_comparisons_total", map[string]string{"level": level})), func(v float64) float64 { return v })
+					})
+					mismatches := shadowCounts("karpenter_voluntary_disruption_pipeline_shadow_mismatches_total", nil)
+					emitCoreDiff(map[string]any{"test": "pipeline-shadow", "spec": spec, "compared": compared, "mismatches": mismatches})
+					Expect(compared).To(BeNumerically(">", 0))
+					// Single-threaded on a fake clock: no state changes between the two sides, so not even a race.
+					Expect(mismatches).To(BeEmpty())
+				}
+				return passes
+			}
+			without := []string{fmt.Sprint(run(false))}
+			with := run(true)
+			// The shadow changes nothing the disruption controller does: its run must be one the disruption controller
+			// alone produces. Upstream is nondeterministic on some states (multi-node consolidation over many equal
+			// nodes), so the run without the shadow is repeated, up to 4 times, until one matches. The exact
+			// differential on deterministic state is the Shadow differential spec in package pipeline.
+			for len(without) < 4 && !lo.Contains(without, fmt.Sprint(with)) {
+				without = append(without, fmt.Sprint(run(false)))
+			}
+			Expect(without).To(ContainElement(fmt.Sprint(with)))
+		})
+	}
+})
+
+// shadowCounts are a shadow counter's values with the given labels, by the series' other labels.
+func shadowCounts(name string, labels map[string]string) map[string]float64 {
+	out := map[string]float64{}
+	for _, mf := range lo.Must(crmetrics.Registry.Gather()) {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.Metric {
+			got := lo.SliceToMap(m.Label, func(l *dto.LabelPair) (string, string) { return l.GetName(), l.GetValue() })
+			if lo.EveryBy(lo.Keys(labels), func(k string) bool { return got[k] == labels[k] }) {
+				out[fmt.Sprint(got)] = m.GetCounter().GetValue()
+			}
+		}
+	}
+	return out
 }

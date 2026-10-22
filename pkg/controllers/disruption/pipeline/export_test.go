@@ -18,6 +18,7 @@ package pipeline
 
 import (
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/go-logr/logr"
 	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -65,3 +66,15 @@ func WithReservedCredit() option.Function[LedgerOptions] { return withReservedCr
 func NewReferenceSimulator(inner disruption.Simulator, reserved ReservationView) disruption.Simulator {
 	return newReferenceSimulator(inner, reserved)
 }
+
+// SetShadowPlanner replaces one of the shadow's planners.
+func (s *Shadow) SetShadowPlanner(name string, p Planner) { s.planners[name] = p }
+
+// ShadowPlanner is one of the shadow's planners.
+func (s *Shadow) ShadowPlanner(name string) Planner { return s.planners[name] }
+
+// SetShadowLogger replaces the shadow's root logger.
+func (s *Shadow) SetShadowLogger(l logr.Logger) { s.logger = l }
+
+// WaitIdle waits for the shadow's sample goroutines.
+func (s *Shadow) WaitIdle() { s.jobs.Wait() }

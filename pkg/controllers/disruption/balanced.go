@@ -209,11 +209,19 @@ func (noopEvaluator) EmitMultiNodeEvents(_ context.Context, _ Command, _ map[str
 type balancedEvaluator struct {
 	totals   map[string]NodePoolTotals
 	recorder events.Recorder
+	// withoutMetrics records no move or score metrics (NewBalancedEvaluatorWithoutMetrics).
+	withoutMetrics bool
 }
 
 // NewBalancedEvaluator creates an evaluator from precomputed totals.
 func NewBalancedEvaluator(totals map[string]NodePoolTotals, recorder events.Recorder) Evaluator {
 	return &balancedEvaluator{totals: totals, recorder: recorder}
+}
+
+// NewBalancedEvaluatorWithoutMetrics is NewBalancedEvaluator recording no move or score metrics, for a caller that
+// only compares (the disruption pipeline's shadow mode).
+func NewBalancedEvaluatorWithoutMetrics(totals map[string]NodePoolTotals, recorder events.Recorder) Evaluator {
+	return &balancedEvaluator{totals: totals, recorder: recorder, withoutMetrics: true}
 }
 
 // ApproveCommand scores a move. Rejections emit metrics only (not events)
@@ -233,10 +241,14 @@ func (e *balancedEvaluator) ApproveCommand(ctx context.Context, cmd Command) (bo
 		if scored && !result.Approved() {
 			moveDecision = string(RejectedDecision)
 		}
-		ConsolidationMovesTotal.Inc(map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		if !e.withoutMetrics {
+			ConsolidationMovesTotal.Inc(map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		}
 
 		if scored {
-			ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+			if !e.withoutMetrics {
+				ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+			}
 			if result.Approved() {
 				e.recorder.Publish(disruptionevents.ConsolidationApproved(
 					candidate.Node, candidate.NodeClaim,
@@ -261,7 +273,9 @@ func (e *balancedEvaluator) EmitMultiNodeEvents(ctx context.Context, cmd Command
 	for poolName, poolCandidates := range byPool {
 		nodePool := poolCandidates[0].NodePool
 		policy := string(nodePool.Spec.Disruption.ConsolidationPolicy)
-		ConsolidationMovesTotal.Inc(map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		if !e.withoutMetrics {
+			ConsolidationMovesTotal.Inc(map[string]string{decisionLabel: moveDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		}
 
 		result, scored := perPoolResults[poolName]
 		if !scored {
@@ -271,7 +285,9 @@ func (e *balancedEvaluator) EmitMultiNodeEvents(ctx context.Context, cmd Command
 		if !result.Approved() {
 			poolDecision = string(RejectedDecision)
 		}
-		ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{decisionLabel: poolDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		if !e.withoutMetrics {
+			ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{decisionLabel: poolDecision, metrics.NodePoolLabel: poolName, policyLabel: policy})
+		}
 
 		if result.Approved() {
 			e.recorder.Publish(disruptionevents.ConsolidationApprovedMultiNode(

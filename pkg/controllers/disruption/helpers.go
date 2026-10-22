@@ -85,6 +85,10 @@ type SimulationOptions struct {
 	// their pods are re-placed. Only the disruption pipeline's reference mode sets it, for the candidates of plans it
 	// reserved but hasn't started, which the disruption controller would have started by then. Empty otherwise.
 	AlsoDeleting sets.Set[string]
+	// Nodes, if set, are the state nodes the simulation runs on in place of cluster state's current ones: a copy taken
+	// earlier, for a simulation that must see the state as it was then (the disruption pipeline's shadow mode, which
+	// simulates beside the disruption controller while it starts commands). Each simulation copies them again.
+	Nodes state.StateNodes
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
@@ -95,7 +99,12 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 ) (scheduling.Results, error) {
 	recordSimulation(ctx)
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
-	nodes := cluster.DeepCopyNodes()
+	var nodes state.StateNodes
+	if simulationOpts.Nodes != nil {
+		nodes = lo.Map(simulationOpts.Nodes, func(n *state.StateNode, _ int) *state.StateNode { return n.DeepCopy() })
+	} else {
+		nodes = cluster.DeepCopyNodes()
+	}
 	deletingNodes := nodes.Deleting()
 	if len(simulationOpts.AlsoDeleting) > 0 {
 		deletingNodes = append(deletingNodes, lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {

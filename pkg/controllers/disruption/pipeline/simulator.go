@@ -20,6 +20,7 @@ import (
 	"context"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 )
 
 // reservingSimulator simulates as the disruption controller does, except that the candidates of reserved, unstarted
@@ -47,7 +48,19 @@ func newReferenceSimulator(inner disruption.Simulator, reserved ReservationView)
 	return &reservingSimulator{inner: inner, reserved: reserved, reference: true}
 }
 
+// simNodesKey carries the state nodes a shadow-mode plan simulates on (withSimNodes).
+type simNodesKey struct{}
+
+// withSimNodes makes the pipeline's simulations under ctx run on nodes, a copy of the state its caller planned on, in
+// place of cluster state's current nodes (the shadow mode, which plans beside the disruption controller).
+func withSimNodes(ctx context.Context, nodes state.StateNodes) context.Context {
+	return context.WithValue(ctx, simNodesKey{}, nodes)
+}
+
 func (s *reservingSimulator) Simulate(ctx context.Context, opts disruption.SimOptions, candidates ...*disruption.Candidate) (disruption.Outcome, error) {
+	if nodes, ok := ctx.Value(simNodesKey{}).(state.StateNodes); ok && opts.Nodes == nil {
+		opts.Nodes = nodes
+	}
 	// Planning records nothing about pending pods; the provisioner does on its own loop.
 	opts.WithoutPendingPodSideEffects = true
 	if s.reserved != nil {
