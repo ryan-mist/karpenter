@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -77,6 +78,9 @@ type SimulationOptions struct {
 	// node, so no part of the plan that one group's pods need (an existing node or a new NodeClaim) is shared with
 	// another group.
 	CandidateGroupSize int
+	// WithoutPendingPodSideEffects lists the pending pods without recording scheduling decisions or publishing events
+	// about them (provisioning.WithoutSideEffects). The disruption pipeline sets it.
+	WithoutPendingPodSideEffects bool
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
@@ -102,7 +106,11 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return scheduling.Results{}, errCandidateDeleting
 	}
 
-	pods, err := provisioner.GetPendingPods(ctx)
+	var pendingOpts []option.Function[provisioning.PendingPodsOptions]
+	if simulationOpts.WithoutPendingPodSideEffects {
+		pendingOpts = append(pendingOpts, provisioning.WithoutSideEffects)
+	}
+	pods, err := provisioner.GetPendingPods(ctx, pendingOpts...)
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}

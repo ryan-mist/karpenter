@@ -28,6 +28,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -35,6 +36,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
@@ -206,6 +209,26 @@ func (l *checkingLedger) violations() []string {
 // it would plan capacity on a node that is about to go away (and, once that plan starts and its pods are re-placed,
 // provision twice).
 var _ = Describe("Simulator", func() {
+	It("records nothing about pending pods while it plans", func() {
+		w := newWorld(1)
+		w.withPods("1", 0)
+		// A pending pod the provisioner ignores: its volume claim doesn't exist.
+		ignored := test.UnschedulablePod(test.PodOptions{PersistentVolumeClaims: []string{"missing"}})
+		ExpectApplied(ctx, env.Client, ignored)
+		s, err := pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, nil).Build(ctx, pipeline.Scope{})
+		Expect(err).ToNot(HaveOccurred())
+		cand := s.CandidatesFor(ctx, newStubPlanner("drift"))[0]
+		inner := disruption.NewLegacySimulator(env.Client, cluster, prov, env.Clock, recorder)
+		_, err = pipeline.NewSimulator(inner, nil).Simulate(ctx, disruption.SimOptions{}, cand)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(recorder.Calls(events.FailedScheduling)).To(BeZero())
+		Expect(cluster.PodSchedulingDecisionTime(client.ObjectKeyFromObject(ignored)).IsZero()).To(BeTrue())
+		// The disruption controller's simulation records both, as before.
+		_, err = inner.Simulate(ctx, disruption.SimOptions{}, cand)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(recorder.Calls(events.FailedScheduling)).To(Equal(1))
+		Expect(cluster.PodSchedulingDecisionTime(client.ObjectKeyFromObject(ignored)).IsZero()).To(BeFalse())
+	})
 	It("doesn't use the candidates of reserved plans as destinations", func() {
 		w := newWorld(2)
 		w.withPods("1", 1)

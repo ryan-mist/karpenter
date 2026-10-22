@@ -210,7 +210,18 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 	return nodeClaimNames, multierr.Combine(errs...)
 }
 
-func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error) {
+// PendingPodsOptions configures GetPendingPods.
+type PendingPodsOptions struct {
+	withoutSideEffects bool
+}
+
+// WithoutSideEffects lists the pending pods without recording anything: no scheduling decisions in cluster state, no
+// events, logs or metrics about ignored pods, no consolidation warnings. A disruption pipeline simulation uses it; the
+// provisioner records them on its own loop.
+func WithoutSideEffects(o *PendingPodsOptions) { o.withoutSideEffects = true }
+
+func (p *Provisioner) GetPendingPods(ctx context.Context, opts ...option.Function[PendingPodsOptions]) ([]*corev1.Pod, error) {
+	o := option.Resolve(opts...)
 	// filter for provisionable pods first, so we don't check for validity/PVCs on pods we won't provision anyway
 	// (e.g. those owned by daemonsets)
 	pods, err := nodeutils.GetProvisionablePods(ctx, p.kubeClient)
@@ -219,6 +230,9 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 	}
 	rejectedPods, pods := lo.FilterReject(pods, func(po *corev1.Pod, _ int) bool {
 		if err := p.Validate(ctx, po); err != nil {
+			if o.withoutSideEffects {
+				return true
+			}
 			// Mark in memory that this pod is unschedulable
 			p.cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{po: fmt.Errorf("ignoring pod, %w", err)}, nil, nil)
 			log.FromContext(ctx).WithValues("Pod", klog.KObj(po)).V(1).Info("ignoring pod", "error", err)
@@ -230,8 +244,10 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 		}
 		return false
 	})
-	scheduler.IgnoredPodCount.Set(float64(len(rejectedPods)), nil)
-	p.consolidationWarnings(ctx, pods)
+	if !o.withoutSideEffects {
+		scheduler.IgnoredPodCount.Set(float64(len(rejectedPods)), nil)
+		p.consolidationWarnings(ctx, pods)
+	}
 	// Inject CapacityBuffer virtual pods AFTER the Validate filter so we don't
 	// run PVC topology checks on synthetic pods or pollute cluster state with
 	// their "decisions". Gated by the feature flag.
