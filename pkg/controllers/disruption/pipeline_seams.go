@@ -18,8 +18,10 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/awslabs/operatorpkg/serrors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
@@ -99,4 +101,25 @@ func (q *Queue) InFlightDestinations() sets.Set[string] {
 		}
 	}
 	return out
+}
+
+// PrepareReboot gives a Reboot command the handoff that Queue.StartCommand runs, built on its NodeClaim re-read now, as
+// Repair's ComputeCommands builds it on the NodeClaim it reads. A pipeline plan can start long after it was planned, so
+// its handoff must not patch the NodeClaim read at planning. It returns false if the node is already rebooting,
+// deleting or gone.
+func PrepareReboot(ctx context.Context, cmd *Command) (bool, error) {
+	r, ok := cmd.Method.(*Repair)
+	if !ok || len(cmd.Candidates) != 1 {
+		return false, serrors.Wrap(fmt.Errorf("reboot command must have one candidate and the repair method"), "command-id", cmd.ID)
+	}
+	candidate := cmd.Candidates[0]
+	nodeClaim, err := r.rebootTarget(ctx, candidate)
+	if err != nil || nodeClaim == nil {
+		return false, err
+	}
+	cmd.Reboot = true
+	cmd.commitReboot = func(ctx context.Context) error {
+		return r.commitReboot(ctx, candidate, nodeClaim)
+	}
+	return true, nil
 }

@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -88,7 +89,10 @@ var _ = BeforeEach(func() {
 	clusterCost.Reset()
 	recorder.Reset()
 	env.Clock.SetTime(time.Now())
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	// A repair policy matcher, as the operator builds one when node repair is enabled, so specs can use the repair method.
+	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(
+		options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}})), cloudProvider))
+	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	podStateController = informer.NewPodController(env.Client, cluster)
