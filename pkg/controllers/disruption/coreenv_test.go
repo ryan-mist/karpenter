@@ -93,6 +93,7 @@ type coreEnv struct {
 	ncCtrl      *informer.NodeClaimController
 	podCtrl     *informer.PodController
 	npCtrl      *informer.NodePoolController
+	stopClock   func()
 }
 
 func newCoreEnv(parent context.Context, its []*cloudprovider.InstanceType) *coreEnv {
@@ -142,14 +143,41 @@ func newCoreEnv(parent context.Context, its []*cloudprovider.InstanceType) *core
 	return e
 }
 
-func (e *coreEnv) stop() { e.cancel() }
-
-func (e *coreEnv) drift() *disruption.Drift {
-	GinkgoHelper()
-	m, ok := lo.Find(e.methods, func(m disruption.Method) bool { _, ok := m.(*disruption.Drift); return ok })
-	Expect(ok).To(BeTrue())
-	return m.(*disruption.Drift)
+func (e *coreEnv) stop() {
+	if e.stopClock != nil {
+		e.stopClock()
+	}
+	e.cancel()
 }
+
+// stepClock elides validation waits until stop: whenever something waits on the fake clock (the 15 s command
+// validation), the clock steps forward by 15 s.
+func (e *coreEnv) stepClock() {
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(200 * time.Microsecond):
+			}
+			if env.Clock.HasWaiters() {
+				env.Clock.Step(15 * time.Second)
+			}
+		}
+	}()
+	e.stopClock = func() { close(done); <-stopped; e.stopClock = nil }
+}
+
+func coreMethod[T disruption.Method](e *coreEnv) T {
+	GinkgoHelper()
+	m, ok := lo.Find(e.methods, func(m disruption.Method) bool { _, ok := m.(T); return ok })
+	Expect(ok).To(BeTrue())
+	return m.(T)
+}
+
+func (e *coreEnv) drift() *disruption.Drift { return coreMethod[*disruption.Drift](e) }
 
 // coreParallel runs f(i) for i in [0,n) with a fixed worker pool.
 func coreParallel(n int, f func(i int)) {
@@ -224,6 +252,10 @@ type genSpec struct {
 	Pinned float64 `json:"pinned,omitempty"`
 	// PodCPU, if set, is every pod's CPU request (otherwise each workload group draws one).
 	PodCPU string `json:"podCPU,omitempty"`
+	// MixedTypes gives each node one of the 4, 8 and 16 CPU instance types instead of 8, so nodes differ in price.
+	MixedTypes bool `json:"mixedTypes,omitempty"`
+	// ConsolidateAfter of every NodePool; empty means Never.
+	ConsolidateAfter string `json:"consolidateAfter,omitempty"`
 }
 
 func randomGenSpec(seed int64, nodeChoices []int, budgetFor func(nodes int, r *rand.Rand) string) genSpec {
@@ -316,8 +348,17 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 	r := rand.New(rand.NewSource(g.Seed*7919 + 17))
 	zones := genZones(g.Zones)
 	it, _ := lo.Find(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType) bool { return i.Name == fmt.Sprintf("gen-%dcpu", genNodeITCPU) })
-	alloc := it.Allocatable()
-	allocCPU := alloc.Cpu().MilliValue()
+	// Each node's instance type: genNodeITCPU, or with MixedTypes one of 4, 8, 16 CPUs (from its own source, so other
+	// specs build the same clusters as before).
+	nodeIT := make([]*cloudprovider.InstanceType, g.Nodes)
+	rt := rand.New(rand.NewSource(g.Seed*15485863 + 5))
+	for i := range nodeIT {
+		nodeIT[i] = it
+		if g.MixedTypes {
+			name := fmt.Sprintf("gen-%dcpu", []int{4, 8, 16}[rt.Intn(3)])
+			nodeIT[i], _ = lo.Find(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType) bool { return i.Name == name })
+		}
+	}
 	run := uuid.NewString()[:6]
 	gc := &genCluster{spec: g, prefix: "x" + run[:5], nodeIdx: map[string]string{}, nodeZone: map[string]string{}}
 
@@ -350,12 +391,12 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 	// NodePools.
 	poolCPU := make([]int64, g.Pools)
 	for i := range g.Nodes {
-		poolCPU[i%g.Pools] += it.Capacity.Cpu().MilliValue()
+		poolCPU[i%g.Pools] += nodeIT[i].Capacity.Cpu().MilliValue()
 	}
 	for p := range g.Pools {
 		np := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
 			Disruption: v1.Disruption{
-				ConsolidateAfter:    v1.MustParseNillableDuration("Never"),
+				ConsolidateAfter:    v1.MustParseNillableDuration(lo.Ternary(g.ConsolidateAfter == "", "Never", g.ConsolidateAfter)),
 				ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
 				Budgets:             []v1.Budget{{Nodes: g.Budget}},
 			},
@@ -389,7 +430,7 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 		zone := zones[i%len(zones)]
 		labels := map[string]string{
 			v1.NodePoolLabelKey:            gc.pools[i%g.Pools].Name,
-			corev1.LabelInstanceTypeStable: it.Name,
+			corev1.LabelInstanceTypeStable: nodeIT[i].Name,
 			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
 			corev1.LabelTopologyZone:       zone,
 			corev1.LabelArchStable:         "amd64",
@@ -403,7 +444,7 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 		}
 		nc, _ := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-nc%04d", gc.prefix, i), Labels: labels},
-			Status:     v1.NodeClaimStatus{ProviderID: test.RandomProviderID(), Allocatable: alloc, Capacity: it.Capacity},
+			Status:     v1.NodeClaimStatus{ProviderID: test.RandomProviderID(), Allocatable: nodeIT[i].Allocatable(), Capacity: nodeIT[i].Capacity},
 		})
 		nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
 		nc.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
@@ -445,7 +486,8 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 			continue
 		}
 		used := int64(0)
-		target := int64(float64(allocCPU) * g.Util)
+		nodeAlloc := nodeIT[i].Allocatable()
+		target := int64(float64(nodeAlloc.Cpu().MilliValue()) * g.Util)
 		hasAnti := false
 		for range g.MaxPodsPerNode {
 			grp := r.Intn(genNumGroups)

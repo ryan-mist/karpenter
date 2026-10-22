@@ -47,6 +47,12 @@ type CoreOptions struct {
 	Order func([]*Candidate)
 	// Pending says what to do with new NodeClaims that hold none of the candidates' pods.
 	Pending PendingClaims
+	// Dedup, if set, skips consolidation methods while nothing has changed since they last found nothing to do.
+	Dedup Dedup
+	// Validator, if set, validates consolidation commands before they are returned, waiting out the validation delay
+	// (the disruption controller). Without it, commands are returned unvalidated, for a caller that validates them
+	// later.
+	Validator Validator
 
 	// minBatch is the smallest batch planned jointly; 0 means 2. Tests lower it to 1 to drive the batched path with
 	// one candidate.
@@ -79,6 +85,13 @@ const (
 type Effects interface {
 	// Publish publishes events about candidates (for example DisruptionBlocked).
 	Publish(evts ...events.Event)
+}
+
+// Dedup remembers that a consolidation method found nothing to do in the current cluster state.
+type Dedup interface {
+	// IsConsolidated reports whether nothing has changed since MarkConsolidated.
+	IsConsolidated() bool
+	MarkConsolidated()
 }
 
 // InlineEffects performs every effect immediately, as the disruption controller always has.
