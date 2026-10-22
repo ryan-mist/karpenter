@@ -113,7 +113,7 @@ type Controller struct {
 }
 
 func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, _ events.Recorder, cluster *state.Cluster, queue *disruption.Queue, clusterCost *cost.ClusterCost,
+	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *disruption.Queue, clusterCost *cost.ClusterCost,
 	opts ...option.Function[Options],
 ) *Controller {
 	o := option.Resolve(opts...)
@@ -123,6 +123,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	if o.Budgets == nil {
 		o.Budgets = o.Ledger.Budgets()
 	}
+	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, o.Lanes...)}, o.Observers...)
 	if o.Reserved == nil {
 		o.Reserved = o.Ledger.View()
 	}

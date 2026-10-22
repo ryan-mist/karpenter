@@ -53,6 +53,8 @@ type StepResult struct {
 	Admitted int
 	Took     time.Duration
 	EndedAt  time.Time
+	// SnapshotTook and PlanTook split Took: the snapshot build, and the planners (candidates, Plan and Submit).
+	SnapshotTook, PlanTook time.Duration
 	// Gated is why the whole lane didn't plan, if it didn't.
 	Gated types.GateReason
 	// NextTimer is the earliest time a planner reported something becomes eligible; zero if none.
@@ -108,7 +110,7 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 	defer func() {
 		r.EndedAt = l.deps.Clock.Now()
 		r.Took = r.EndedAt.Sub(start)
-		l.deps.Observer.RoundFinished(l.spec.ID, r, ev)
+		l.deps.Observer.RoundFinished(ctx, l.spec.ID, r, ev)
 	}()
 	for _, p := range l.spec.Planners {
 		r.Admitted += l.collect(p.Name())
@@ -120,11 +122,13 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 	}
 	synced := l.deps.Cluster.Synced(ctx)
 	snapshot, err := l.deps.Snapshots.Build(ctx, l.scope)
+	r.SnapshotTook = l.deps.Clock.Since(start)
 	if err != nil {
 		r.Err = err
 		return r
 	}
 	ev = snapshot.Events
+	defer func() { r.PlanTook = l.deps.Clock.Since(start) - r.SnapshotTook }()
 	for _, p := range l.spec.Planners {
 		if _, ok := l.unresolved[p.Name()]; ok {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateUnresolved)

@@ -28,6 +28,14 @@ const (
 	ConsolidationRejected      = "ConsolidationRejected"
 	ConsolidationApproved      = "ConsolidationApproved"
 
+	// disruption pipeline (DisruptionPipeline feature gate): why a planner did nothing for a NodePool
+	DisruptionBudgetExhausted    = "DisruptionBudgetExhausted"
+	DisruptionWaitingForLaunch   = "DisruptionWaitingForLaunch"
+	DisruptionCandidatesBlocked  = "DisruptionCandidatesBlocked"
+	ConsolidationNoCheaperOption = "ConsolidationNoCheaperOption"
+	ConsolidationScanIncomplete  = "ConsolidationScanIncomplete"
+	RepairBreakerTripped         = "RepairBreakerTripped"
+
 	// provisioning/scheduling
 	FailedScheduling          = "FailedScheduling"
 	NoCompatibleInstanceTypes = "NoCompatibleInstanceTypes"
