@@ -184,19 +184,29 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// Attempt different disruption methods. We'll only let one method perform an action
+	// Attempt different disruption methods in order. A method whose commands only delete nodes lets the later methods
+	// run in the same pass; any other command ends the pass.
 	// Consecutive methods share one candidate snapshot, until one of them has candidates (see methodCandidates).
 	var snapshot *CandidateSnapshot
+	disrupted := false
 	for i, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m, &snapshot)
+		cmds, err := c.disrupt(ctx, m, &snapshot)
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
 			}
 			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
 		}
-		if success {
+		if len(cmds) == 0 {
+			continue
+		}
+		disrupted = true
+		// StartCommand marks delete-only candidates for deletion and adds them to the queue before it returns, so the
+		// candidates and budgets that later methods build already account for them. Replacements are different: a
+		// launching NodeClaim is not yet a StateNode, so later simulations can't see it until cluster state syncs.
+		// Terminate-first and reboot also lead to capacity that isn't in cluster state yet, so they end the pass too.
+		if !lo.EveryBy(cmds, func(cmd Command) bool { return cmd.Decision() == DeleteDecision }) || !c.cluster.Synced(ctx) {
 			// The methods after this one are not evaluated this pass; a steady rate here is a starvation signal.
 			for _, skipped := range c.methods[i+1:] {
 				SkippedEvaluationsTotal.Inc(methodLabels(skipped))
@@ -204,12 +214,16 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 		}
 	}
+	if disrupted {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	}
 
 	// All methods did nothing, so return nothing to do
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **CandidateSnapshot) (bool, error) {
+// disrupt runs one method and starts its commands. It returns the commands it started.
+func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **CandidateSnapshot) ([]Command, error) {
 	labels := methodLabels(disruption)
 	defer metrics.Measure(EvaluationDurationSeconds, labels)()
 	LastEvaluationTimestampSeconds.Set(float64(c.clock.Now().Unix()), labels)
@@ -223,7 +237,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	})
 	observePhase(CandidatesPhase, labels, time.Since(phaseStart))
 	if err != nil {
-		return false, fmt.Errorf("determining candidates, %w", err)
+		return nil, fmt.Errorf("determining candidates, %w", err)
 	}
 	EligibleNodes.Set(float64(len(candidates)), map[string]string{
 		metrics.ReasonLabel: strings.ToLower(string(disruption.Reason())),
@@ -231,7 +245,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
@@ -241,7 +255,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 	observePhase(BudgetsPhase, labels, time.Since(phaseStart))
 	if err != nil {
-		return false, fmt.Errorf("building disruption budgets, %w", err)
+		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
 	phaseStart = time.Now()
@@ -263,11 +277,11 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 		}
 	}()
 	if err != nil {
-		return false, fmt.Errorf("computing disruption decision, %w", err)
+		return nil, fmt.Errorf("computing disruption decision, %w", err)
 	}
 	toStart := lo.Filter(lo.Range(len(cmds)), func(i int, _ int) bool { return cmds[i].Decision() != NoOpDecision })
 	if len(toStart) == 0 {
-		return false, nil
+		return nil, nil
 	}
 
 	phaseStart = time.Now()
@@ -288,9 +302,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 		}
 	})
 	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
+		return nil, fmt.Errorf("disrupting candidates, %w", err)
 	}
-	return true, nil
+	return lo.Map(toStart, func(i int, _ int) Command { return cmds[i] }), nil
 }
 
 // recordGated counts a pass that stopped at the cluster state sync gate and starts the gate period if it is new.
