@@ -44,28 +44,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
-// NewCandidateSnapshotFromNodes is NewCandidateSnapshot with the state-node deep copy supplied by the caller, so a
-// test can give it and the legacy oracle the same node order (DeepCopyNodes returns map order).
-func NewCandidateSnapshotFromNodes(ctx context.Context, deepCopyNodes func() state.StateNodes, kubeClient client.Client, recorder events.Recorder,
-	clk clock.Clock, cloudProvider cloudprovider.CloudProvider, queue *Queue,
-) (*CandidateSnapshot, error) {
-	return newCandidateSnapshot(ctx, deepCopyNodes, kubeClient, recorder, clk, cloudProvider, queue)
-}
-
 // MethodCandidates is the candidate step of Controller.disrupt.
 func MethodCandidates(ctx context.Context, m Method, snapshot **CandidateSnapshot, build func() (*CandidateSnapshot, error)) (candidates, allCandidates []*Candidate, s *CandidateSnapshot, err error) {
 	return methodCandidates(ctx, m, snapshot, build)
-}
-
-// Explain returns why the snapshot node with providerID is not a candidate for disruptionClass (nil if it is one).
-func (s *CandidateSnapshot) Explain(ctx context.Context, providerID string, disruptionClass string) (error, bool) {
-	for i, n := range s.nodes {
-		if n.ProviderID() == providerID {
-			_, err := s.candidate(ctx, i, disruptionClass)
-			return err, true
-		}
-	}
-	return nil, false
 }
 
 // CandidateFields is every Candidate field, in comparable form.
@@ -262,6 +243,3 @@ func LegacyGetCandidatesWithTotals(ctx context.Context, deepCopyNodes func() sta
 	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
 	return filtered, nodePoolTotals, nil
 }
-
-// ReschedulablePods returns the candidate's reschedulable pods, which are shared with the informer cache.
-func (c *Candidate) ReschedulablePods() []*corev1.Pod { return c.reschedulablePods }
