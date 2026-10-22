@@ -175,12 +175,13 @@ func validated(ctx context.Context, v disruption.Validator, in RevalidateInput) 
 // delay, without waiting in the lane. Pod-free plans may be admitted while cluster state is unsynced.
 type emptinessPlanner struct {
 	planner
-	core *disruption.Emptiness
+	core  *disruption.Emptiness
+	dedup disruption.Dedup
 }
 
 func (p *emptinessPlanner) Plan(ctx context.Context, in PlanInput) (PlanOutput, error) {
 	version := in.Reserved.Version()
-	res, err := p.core.Compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects}, in.Candidates...)
+	res, err := p.core.Compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects, Dedup: p.dedup}, in.Candidates...)
 	return PlanOutput{Plans: p.plans(res.Commands, version, in)}, err
 }
 
@@ -235,26 +236,36 @@ type batchPlanner struct {
 	cachedReboot bool
 	// budgetFree is repair's: an uninitialized node is repaired without budget, so the planner plans at zero budget.
 	budgetFree bool
+	// fair, if set, orders candidates round-robin across NodePools and backs off NodePools whose commands failed
+	// (drift). Without it the core's own order applies (repair's score order).
+	fair *poolFairness
 }
 
 func (p *batchPlanner) BudgetFree() bool { return p.budgetFree }
 
 func (p *batchPlanner) options(batch int) disruption.CoreOptions {
-	return disruption.CoreOptions{
+	opts := disruption.CoreOptions{
 		Batch:        max(batch, 1),
 		Sizer:        p.sizer,
 		Deadline:     disruption.BatchSimDeadline,
 		Effects:      p.effects,
 		Sim:          p.sim,
-		Order:        byDisruptionTime(p.Reason()),
 		Pending:      disruption.DropPendingOnly,
 		CachedReboot: p.cachedReboot,
 	}
+	if p.fair != nil {
+		opts.Order = p.fair.order(byDisruptionTime(p.Reason()))
+	}
+	return opts
 }
 
 func (p *batchPlanner) Plan(ctx context.Context, in PlanInput) (PlanOutput, error) {
 	version := in.Reserved.Version()
-	res, err := p.compute(ctx, p.budgets(ctx, in, in.Candidates), p.options(len(in.Candidates)), in.Candidates...)
+	candidates := in.Candidates
+	if p.fair != nil {
+		candidates = p.fair.eligible(candidates)
+	}
+	res, err := p.compute(ctx, p.budgets(ctx, in, candidates), p.options(len(candidates)), candidates...)
 	out := PlanOutput{Plans: p.plans(res.Commands, version, in)}
 	for _, id := range res.Deferred {
 		out.Verdicts = append(out.Verdicts, types.Verdict{Planner: p.name, ProviderID: id, Reason: types.ReasonDeferred})
@@ -270,6 +281,28 @@ func (p *batchPlanner) Revalidate(ctx context.Context, in RevalidateInput) ([]*P
 		return accept(in.Plan, in.Fresh), nil
 	}
 	return p.resimulate(ctx, in, in.Fresh)
+}
+
+// Resolved records that a NodePool was served when one of its plans started, and backs its NodePools off when the
+// start failed (a replacement NodeClaim was rejected, say): the command never reached the queue, so its completion
+// hook won't.
+func (p *batchPlanner) Resolved(plan *Plan, r Resolution) {
+	if p.fair == nil {
+		return
+	}
+	switch {
+	case r.Kind == Started:
+		p.fair.started(nodePoolsOf(plan.Candidates)...)
+	case r.Reason == types.ReasonStartFailed:
+		p.fair.finished(false, nodePoolsOf(plan.Candidates)...)
+	}
+}
+
+// finished backs off the NodePools of a failed command, and resets them when one succeeds.
+func (p *batchPlanner) finished(cmd *disruption.Command) {
+	if p.fair != nil && cmd.Method == p.method {
+		p.fair.finished(cmd.Succeeded, nodePoolsOf(cmd.Candidates)...)
+	}
 }
 
 // Replan plans the surviving siblings of a batch again, jointly.
@@ -319,6 +352,7 @@ type consolidationPlanner struct {
 	planner
 	compute   func(ctx context.Context, budgets map[string]int, opts disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error)
 	validator disruption.Validator
+	dedup     disruption.Dedup
 }
 
 func (p *consolidationPlanner) NeedsTotals() bool      { return true }
@@ -326,7 +360,7 @@ func (p *consolidationPlanner) AlwaysResimulate() bool { return true }
 
 func (p *consolidationPlanner) Plan(ctx context.Context, in PlanInput) (PlanOutput, error) {
 	version := in.Reserved.Version()
-	res, err := p.compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects, Sim: p.sim, Evaluator: in.Evaluator}, in.Candidates...)
+	res, err := p.compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects, Sim: p.sim, Evaluator: in.Evaluator, Dedup: p.dedup}, in.Candidates...)
 	return PlanOutput{Plans: p.plans(res.Commands, version, in)}, err
 }
 
@@ -357,20 +391,22 @@ func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluste
 			out[RepairPlanner] = &batchPlanner{planner: base(RepairPlanner, m, types.ShapeReplacing), compute: m.Compute,
 				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), cachedReboot: true, budgetFree: true}
 		case *disruption.Emptiness:
-			p := &emptinessPlanner{planner: base(EmptinessPlanner, m, types.ShapePodFree), core: m}
+			p := &emptinessPlanner{planner: base(EmptinessPlanner, m, types.ShapePodFree), core: m, dedup: &stateDedup{cluster: cluster}}
 			p.validateAt = disruption.CommandValidationDelay
 			out[EmptinessPlanner] = p
 		case *disruption.StaticDrift:
 			out[StaticDriftPlanner] = &staticDriftPlanner{planner: base(StaticDriftPlanner, m, types.ShapeReplacing), core: m}
 		case *disruption.Drift:
-			out[DriftPlanner] = &batchPlanner{planner: base(DriftPlanner, m, types.ShapeReplacing), compute: m.Compute,
-				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline)}
+			p := &batchPlanner{planner: base(DriftPlanner, m, types.ShapeReplacing), compute: m.Compute,
+				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), fair: newPoolFairness(clk)}
+			queue.WithCompletionHook(p.finished)
+			out[DriftPlanner] = p
 		case *disruption.MultiNodeConsolidation:
-			p := &consolidationPlanner{planner: base(MultiNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator()}
+			p := &consolidationPlanner{planner: base(MultiNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: &stateDedup{cluster: cluster}}
 			p.validateAt = disruption.CommandValidationDelay
 			out[MultiNodePlanner] = p
 		case *disruption.SingleNodeConsolidation:
-			p := &consolidationPlanner{planner: base(SingleNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator()}
+			p := &consolidationPlanner{planner: base(SingleNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: &stateDedup{cluster: cluster}}
 			p.validateAt = disruption.CommandValidationDelay
 			out[SingleNodePlanner] = p
 		}

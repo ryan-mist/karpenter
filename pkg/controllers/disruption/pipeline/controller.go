@@ -145,6 +145,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	}
 	if o.Executor == nil {
 		o.Executor = NewExecutor(ExecutorDeps{
+			Planners: lo.FlatMap(o.Lanes, func(l LaneSpec, _ int) []Planner { return l.Planners }),
 			Ledger:   o.Ledger,
 			Admitter: o.Admitter,
 			Starter:  o.Starter,
