@@ -71,6 +71,7 @@ type FeatureGates struct {
 	TerminateFirstRepair      bool
 	PodDeletionCostManagement bool
 	PredictionEnabled         bool
+	DisruptionPipeline        bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -157,6 +158,14 @@ var (
 			"predicted by a registered prediction source, and waits for that source to hydrate before scheduling. " +
 			"Requires a registered prediction source.",
 	}
+	DisruptionPipelineFeatureGate = FeatureGate{
+		Name:    "DisruptionPipeline",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter plans voluntary disruption in parallel lanes and admits plans one at a time against fresh " +
+			"cluster state, instead of running disruption methods one after another. Drift and repair are batched up " +
+			"to the disruption budget. Budget semantics are unchanged.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -171,6 +180,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	TerminateFirstRepairFeatureGate,
 	PodDeletionCostManagementFeatureGate,
 	PredictionEnabledFeatureGate,
+	DisruptionPipelineFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -298,6 +308,7 @@ func DefaultFeatureGates() FeatureGates {
 		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
 		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
 		PredictionEnabled:         PredictionEnabledFeatureGate.Default,
+		DisruptionPipeline:        DisruptionPipelineFeatureGate.Default,
 	}
 }
 
@@ -340,6 +351,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[PredictionEnabledFeatureGate.Name]; ok {
 		gates.PredictionEnabled = val
+	}
+	if val, ok := gateMap[DisruptionPipelineFeatureGate.Name]; ok {
+		gates.DisruptionPipeline = val
 	}
 
 	return gates, nil

@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/capacitybuffer"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	metricsnode "sigs.k8s.io/karpenter/pkg/controllers/metrics/node"
 	metricsnodepool "sigs.k8s.io/karpenter/pkg/controllers/metrics/nodepool"
@@ -126,7 +127,7 @@ func NewControllers(
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
-		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost),
+		newDisruptionController(ctx, clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost),
 		provisioning.NewPodController(kubeClient, p, cluster),
 		provisioning.NewNodeController(kubeClient, p),
 		nodepoolhash.NewController(kubeClient, cloudProvider),
@@ -229,4 +230,16 @@ func NewControllers(
 	}
 
 	return controllers
+}
+
+// newDisruptionController returns the voluntary disruption controller: the pipeline controller with the
+// DisruptionPipeline feature gate on, otherwise the disruption controller. Both start commands through queue.
+func newDisruptionController(ctx context.Context, clk clock.Clock, kubeClient client.Client, p *provisioning.Provisioner,
+	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *disruption.Queue,
+	clusterCost *cost.ClusterCost,
+) controller.Controller {
+	if options.FromContext(ctx).FeatureGates.DisruptionPipeline {
+		return pipeline.NewController(ctx, clk, kubeClient, p, cloudProvider, recorder, cluster, queue, clusterCost)
+	}
+	return disruption.NewController(ctx, clk, kubeClient, p, cloudProvider, recorder, cluster, queue, clusterCost)
 }

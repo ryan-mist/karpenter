@@ -366,6 +366,7 @@ var _ = Describe("Options", func() {
 			Entry("when CapacityBuffer is overridden", "CapacityBuffer"),
 			Entry("when TerminateFirstDrift is overridden", "TerminateFirstDrift"),
 			Entry("when TerminateFirstRepair is overridden", "TerminateFirstRepair"),
+			Entry("when DisruptionPipeline is overridden", "DisruptionPipeline"),
 		)
 	})
 
@@ -602,6 +603,7 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.FeatureGates.TerminateFirstDrift).To(Equal(optsB.FeatureGates.TerminateFirstDrift))
 	Expect(optsA.FeatureGates.TerminateFirstRepair).To(Equal(optsB.FeatureGates.TerminateFirstRepair))
+	Expect(optsA.FeatureGates.DisruptionPipeline).To(Equal(optsB.FeatureGates.DisruptionPipeline))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
 	Expect(optsA.LegacyNodeRepair).To(Equal(optsB.LegacyNodeRepair))
 	Expect(optsA.SchedulerConfig).To(Equal(optsB.SchedulerConfig))
