@@ -38,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
@@ -65,12 +66,14 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
@@ -96,9 +99,17 @@ type coreEnv struct {
 	stopClock   func()
 }
 
-func newCoreEnv(parent context.Context, its []*cloudprovider.InstanceType) *coreEnv {
+// newCoreEnv builds the disruption stack for its. With repairPolicies, node repair is enabled with those policies, as
+// the operator does at startup.
+func newCoreEnv(parent context.Context, its []*cloudprovider.InstanceType, repairPolicies ...cloudprovider.RepairPolicy) *coreEnv {
 	GinkgoHelper()
 	cloudProvider.InstanceTypes = its
+	var clusterOpts []option.Function[state.ClusterOptions]
+	if len(repairPolicies) > 0 {
+		cloudProvider.RepairPolicy = repairPolicies
+		parent = options.ToContext(parent, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}}))
+		clusterOpts = append(clusterOpts, state.WithRepairPolicyMatcher(lo.Must(health.NewRepairPolicyMatcher(parent, cloudProvider))))
+	}
 	ctx, cancel := context.WithCancel(log.IntoContext(parent, logr.Discard()))
 	ctx = injection.WithControllerName(ctx, "disruption")
 	c := lo.Must(cache.New(env.Config, cache.Options{Scheme: scheme.Scheme}))
@@ -128,7 +139,7 @@ func newCoreEnv(parent context.Context, its []*cloudprovider.InstanceType) *core
 	e := &coreEnv{ctx: ctx, cancel: cancel, client: kc, recorder: test.NewEventRecorder()}
 	e.clusterCost = cost.NewClusterCost(ctx, cloudProvider, kc)
 	ExpectSingletonReconciled(ctx, informer.NewPricingController(kc, cloudProvider, e.clusterCost))
-	e.cluster = state.NewCluster(env.Clock, kc, cloudProvider)
+	e.cluster = state.NewCluster(env.Clock, kc, cloudProvider, clusterOpts...)
 	e.nodeCtrl = informer.NewNodeController(kc, e.cluster)
 	e.ncCtrl = informer.NewNodeClaimController(kc, cloudProvider, e.cluster, e.clusterCost)
 	e.podCtrl = informer.NewPodController(kc, e.cluster)
