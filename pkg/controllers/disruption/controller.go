@@ -260,7 +260,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 		observePhase(ValidatePhase, labels, validating)
 	}
 	// Computing a command with a static replacement reserves a node-count slot that StartCommand releases. Release the
-	// slot of any command that never reaches StartCommand (ParallelizeUntil skips the rest once ctx is cancelled), or
+	// slot of any command that never reaches StartCommand (ParallelizeUntil skips the rest once ctx is canceled), or
 	// static scale-up of its NodePool stays capped.
 	started := make([]bool, len(cmds))
 	defer func() {
