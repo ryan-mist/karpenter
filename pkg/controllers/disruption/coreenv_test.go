@@ -265,6 +265,8 @@ type genSpec struct {
 	MixedTypes bool `json:"mixedTypes,omitempty"`
 	// ConsolidateAfter of every NodePool; empty means Never.
 	ConsolidateAfter string `json:"consolidateAfter,omitempty"`
+	// ConsolidationPolicy of every NodePool; empty means WhenEmptyOrUnderutilized.
+	ConsolidationPolicy v1.ConsolidationPolicy `json:"consolidationPolicy,omitempty"`
 }
 
 func randomGenSpec(seed int64, nodeChoices []int, budgetFor func(nodes int, r *rand.Rand) string) genSpec {
@@ -299,6 +301,12 @@ func setDriftedTime(nc *v1.NodeClaim, t time.Time) {
 func genZones(n int) []string { return genAllZones[:n] }
 
 func genInstanceTypes(zones []string) []*cloudprovider.InstanceType {
+	return genInstanceTypesOf(zones, v1.CapacityTypeOnDemand)
+}
+
+// genInstanceTypesOf returns instance types of 2 to 32 CPUs with an offering per zone and capacity type. Spot
+// offerings cost 70% of on-demand.
+func genInstanceTypesOf(zones []string, capacityTypes ...string) []*cloudprovider.InstanceType {
 	var its []*cloudprovider.InstanceType
 	for _, cpu := range []int{2, 4, 8, 16, 32} {
 		res := corev1.ResourceList{
@@ -307,10 +315,13 @@ func genInstanceTypes(zones []string) []*cloudprovider.InstanceType {
 			corev1.ResourcePods:   resource.MustParse("110"),
 		}
 		its = append(its, fake.NewInstanceType(fmt.Sprintf("gen-%dcpu", cpu), fake.WithResources(res),
-			fake.WithOfferings(lo.Map(zones, func(z string, _ int) cloudprovider.Offering {
-				return cloudprovider.Offering{Available: true, Price: fake.PriceFromResources(res), Requirements: scheduling.NewLabelRequirements(map[string]string{
-					v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: z,
-				})}
+			fake.WithOfferings(lo.FlatMap(zones, func(z string, _ int) []cloudprovider.Offering {
+				return lo.Map(capacityTypes, func(ct string, _ int) cloudprovider.Offering {
+					price := fake.PriceFromResources(res) * lo.Ternary(ct == v1.CapacityTypeSpot, 0.7, 1.0)
+					return cloudprovider.Offering{Available: true, Price: price, Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey: ct, corev1.LabelTopologyZone: z,
+					})}
+				})
 			})...)))
 	}
 	return its
@@ -403,7 +414,7 @@ func (e *coreEnv) buildGen(g genSpec) *genCluster {
 		np := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
 			Disruption: v1.Disruption{
 				ConsolidateAfter:    v1.MustParseNillableDuration(lo.Ternary(g.ConsolidateAfter == "", "Never", g.ConsolidateAfter)),
-				ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+				ConsolidationPolicy: lo.Ternary(g.ConsolidationPolicy == "", v1.ConsolidationPolicyWhenEmptyOrUnderutilized, g.ConsolidationPolicy),
 				Budgets:             []v1.Budget{{Nodes: g.Budget}},
 			},
 		}})
@@ -734,10 +745,13 @@ func coreDiffEnv(name string, def int) int {
 // that aren't no-ops and the number of candidates.
 func (e *coreEnv) compute(m disruption.Method, f func(budgets map[string]int, cands []*disruption.Candidate) ([]disruption.Command, error)) ([]disruption.Command, int) {
 	GinkgoHelper()
-	cands, _, err := disruption.GetCandidatesWithTotals(e.ctx, e.cluster, e.client, e.recorder, env.Clock, cloudProvider, m.ShouldDisrupt, m.Class(), e.queue, e.clusterCost)
+	cands, totals, err := disruption.GetCandidatesWithTotals(e.ctx, e.cluster, e.client, e.recorder, env.Clock, cloudProvider, m.ShouldDisrupt, m.Class(), e.queue, e.clusterCost)
 	Expect(err).ToNot(HaveOccurred())
 	if len(cands) == 0 {
 		return nil, 0
+	}
+	if setter, ok := m.(disruption.NodePoolTotalsSetter); ok {
+		setter.SetNodePoolTotals(totals)
 	}
 	budgets, err := disruption.BuildDisruptionBudgetMapping(e.ctx, e.cluster, env.Clock, e.client, cloudProvider, e.recorder, m.Reason())
 	Expect(err).ToNot(HaveOccurred())
