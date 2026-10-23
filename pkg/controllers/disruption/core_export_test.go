@@ -21,6 +21,7 @@ package disruption
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -29,11 +30,14 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -309,4 +313,168 @@ func legacyUnreplaceableCommands(ctx context.Context, d *StaticDrift, np *v1.Nod
 		d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, blockedReason)...)
 	}
 	return cmds
+}
+
+// LegacyRepairComputeCommands and legacyRepairComputeCommands are verbatim copies of Repair.ComputeCommands and
+// Repair.computeCommands at the parent of the repair core (disr/a03-staticdrift-core; repair.go as on
+// disr/99-integration), with the receiver made a parameter. They are the reference of the repair differential.
+// ComputeCommands orders eligible candidates by the repair score and returns one command for the highest-scoring
+// candidate whose NodePool has budget. Workload-bearing candidates verify rescheduling capacity and pre-spin any
+// required replacement; empty candidates may produce a delete-only command. Reboot candidates produce a Reboot command
+// whose handoff to the reboot controller runs when the command starts. Only one command per pass, mirroring drift.
+//
+// It logs the resolved repair decision for each candidate it acts on, which records why that policy and drain bound won.
+func LegacyRepairComputeCommands(ctx context.Context, r *Repair, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	cmds, err := legacyRepairComputeCommands(ctx, r, disruptionBudgetMapping, candidates...)
+	for _, cmd := range cmds {
+		for _, c := range cmd.Candidates {
+			log.FromContext(ctx).WithValues(append([]any{"Node", klog.KObj(c.Node)}, c.RepairPolicyResult.LogValues()...)...).Info("selected repair policy")
+		}
+	}
+	return cmds, err
+}
+
+//nolint:gocyclo // Static and dynamic replacement flows are intentionally kept inline.
+func legacyRepairComputeCommands(ctx context.Context, r *Repair, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	// We use a fixed value for now so all candidates get the same value
+	// This is important for repair since it scores candidates based on their current age (calculated as now - eligibleAt).
+	// We don't want the order in which candidates are evaluated to affect their age.
+	now := r.clock.Now()
+	sort.SliceStable(candidates, func(i, j int) bool {
+		si, sj := candidates[i].RepairPolicyResult.ScoreAt(now), candidates[j].RepairPolicyResult.ScoreAt(now)
+		if si != sj {
+			return si > sj // higher score repairs first
+		}
+		// Deterministic tie-break: lower disruption cost, then node name, so the same set always yields the same order.
+		if candidates[i].DisruptionCost != candidates[j].DisruptionCost {
+			return candidates[i].DisruptionCost < candidates[j].DisruptionCost
+		}
+		return candidates[i].Name() < candidates[j].Name()
+	})
+	trippedPools, err := r.breakerTrippedPools(ctx)
+	if err != nil {
+		return []Command{}, err
+	}
+	for _, candidate := range candidates {
+		if trippedPools[candidate.NodePool.Name] {
+			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
+				fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", repairUnhealthyThreshold, candidate.NodePool.Name))...)
+			continue
+		}
+		// Budgets only count initialized nodes, since an uninitialized node runs no workload to protect, so repairing one
+		// neither needs nor consumes budget.
+		if candidate.Initialized() && disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			continue
+		}
+		// Repair admits nodes with blocking (PDB / do-not-disrupt) pods only on the promise of this drain bound, so it
+		// must be stamped before either replacement path returns a command.
+		candidate.TerminationGracePeriod = effectiveDrainBound(candidate, candidate.RepairPolicyResult)
+		// Reboot is in-place, so skip replacement and termination paths.
+		if candidate.RepairPolicyResult.Action == cloudprovider.RebootNode {
+			nodeClaim, err := r.rebootTarget(ctx, candidate)
+			if err != nil {
+				return []Command{}, err
+			}
+			if nodeClaim == nil {
+				continue
+			}
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				Reboot:              true,
+				commitReboot: func(ctx context.Context) error {
+					return r.commitReboot(ctx, candidate, nodeClaim)
+				},
+			}}, nil
+		}
+		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
+
+		// Static NodePools aren't reactively scheduled, so repair can't simulate a replacement — it mirrors StaticDrift.
+		if candidate.OwnedByStaticNodePool() {
+			np := candidate.NodePool
+			active, _, pendingDisruption := r.cluster.NodePoolState.GetNodeCount(np.Name)
+
+			// Skip until scale-down completes: a replacement would just be surplus the deprovisioner deletes.
+			if int64(active+pendingDisruption) > lo.FromPtr(np.Spec.Replicas) {
+				continue
+			}
+
+			nct := pscheduling.NewNodeClaimTemplate(np)
+			// Only a candidate holding a slot in a still-offered reservation frees a slot the refill can use, so only it can
+			// terminate first on full reservations; any other candidate can't be replaced either way, so it's blocked.
+			// Checked only with terminate-first enabled, since without it there's nothing to do but replace first.
+			var reservationsFull bool
+			if terminateFirstEnabled {
+				full, offered, err := staticReservations(ctx, r.cloudProvider, np, nct)
+				// Other candidates don't depend on this one, so one NodePool's failure doesn't stop repair for the rest.
+				if err != nil {
+					log.FromContext(ctx).Error(err, "skipping repair candidate, failed checking capacity reservations")
+					continue
+				}
+				if full && !holdsOfferedReservation(candidate, offered) {
+					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool's capacity reservations are full and cannot stage a replacement")...)
+					continue
+				}
+				reservationsFull = full
+			}
+			limit, ok := np.Spec.Limits[resources.Node]
+			nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
+			// Atomic accounting, not a naive count: deleting/already-reserved nodes would otherwise let repair burst
+			// past limits.nodes when commands race. A zero result reserves nothing, so the delete-only path leaks no
+			// reservation; a non-zero result's slot is consumed by the replacement staged below. Full reservations are
+			// checked first so the delete-only path never takes a slot.
+			if reservationsFull || r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
+				// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand
+				// the workload with no replacement.
+				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
+				if !terminateFirstEnabled || !refillable {
+					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, lo.Ternary(reservationsFull,
+						"static NodePool's capacity reservations are full and cannot stage a replacement",
+						"static NodePool is at its node limit and cannot stage a replacement"))...)
+					continue
+				}
+				return []Command{{
+					Candidates:           []*Candidate{candidate},
+					PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{candidate}),
+					TerminateFirstReason: lo.Ternary(reservationsFull, TerminateFirstNoReservedCapacity, TerminateFirstStaticAtLimit),
+				}}, nil
+			}
+			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct}}}
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
+				Results:             result,
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			}}, nil
+		}
+		// Repair pre-spins for all reschedulable workload, including pods whose eviction is currently blocked.
+		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, candidate,
+			terminateFirstEnabled, SimulationOptions{IncludeBlockedCandidatePods: true})
+		if err != nil {
+			if errors.Is(err, errCandidateDeleting) {
+				continue
+			}
+			return []Command{}, err
+		}
+		if terminateFirst {
+			// Carry the Results (no Replacements) so nodes that can absorb the freed pods get nominated.
+			return []Command{{
+				Candidates:           []*Candidate{candidate},
+				Results:              results,
+				PoolDisruptionCosts:  computePoolDisruptionCosts([]*Candidate{candidate}),
+				TerminateFirstReason: TerminateFirstNoReservedCapacity,
+			}}, nil
+		}
+		if !results.AllNonPendingPodsScheduled() {
+			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			continue
+		}
+		return []Command{{
+			Candidates:          []*Candidate{candidate},
+			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
+			Results:             results,
+			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+		}}, nil
+	}
+	return []Command{}, nil
 }
