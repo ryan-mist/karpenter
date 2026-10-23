@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,12 +195,83 @@ type InstanceType struct {
 	once                   sync.Once
 	allocatableOfferings   []AllocatableOfferings
 	capacityOverlayApplied bool
+	// base holds the lazily computed base allocatable (no offering overrides). Copies created with WithOfferings
+	// share it, so the computation runs once across all of them rather than once per copy.
+	base atomic.Pointer[sharedAllocatable]
+}
+
+// sharedAllocatable lazily computes the base allocatable for the Capacity map and Overhead it was created for.
+type sharedAllocatable struct {
+	once        sync.Once
+	capacity    corev1.ResourceList
+	overhead    *InstanceTypeOverhead
+	allocatable corev1.ResourceList
+}
+
+// matches reports whether b was created for i's current Capacity map and Overhead. Maps are compared by identity
+// rather than contents, so an InstanceType whose Capacity or Overhead has been reassigned stops matching and computes
+// its own allocatable.
+func (b *sharedAllocatable) matches(i *InstanceType) bool {
+	if b.overhead != i.Overhead || len(b.capacity) != len(i.Capacity) || (b.capacity == nil) != (i.Capacity == nil) {
+		return false
+	}
+	return b.capacity == nil || reflect.ValueOf(b.capacity).UnsafePointer() == reflect.ValueOf(i.Capacity).UnsafePointer()
+}
+
+// sharedBase returns the base allocatable holder for i, creating it if needed. It is safe for concurrent use.
+func (i *InstanceType) sharedBase() *sharedAllocatable {
+	if b := i.base.Load(); b != nil && b.matches(i) {
+		return b
+	}
+	b := &sharedAllocatable{capacity: i.Capacity, overhead: i.Overhead}
+	if i.base.CompareAndSwap(nil, b) {
+		return b
+	}
+	if existing := i.base.Load(); existing != nil && existing.matches(i) {
+		return existing
+	}
+	// The stored holder was created for a Capacity or Overhead that has since been reassigned. Use an unshared
+	// holder rather than racing other readers to replace it.
+	return b
+}
+
+// baseAllocatable returns the base allocatable (no offering overrides), computing it at most once per holder.
+func (i *InstanceType) baseAllocatable() corev1.ResourceList {
+	b := i.sharedBase()
+	b.once.Do(func() { b.allocatable = i.computeAllocatable(nil, nil) })
+	return b.allocatable
+}
+
+// WithOfferings returns a shallow copy of the instance type with the given offerings. All other exported fields
+// are shared with the receiver, as is the base allocatable, so it is computed at most once across the receiver and
+// all of its copies. This is intended for cloud providers that return a fresh InstanceType per GetInstanceTypes call
+// (for example, with per-NodeClass offerings) built from a cached base InstanceType.
+//
+// The shared fields (Capacity, Overhead, VolumeAttachmentLimits, DynamicResources and Requirements) must be treated
+// as immutable. Reassigning a field on the returned copy is safe: reassigning Requirements doesn't affect allocatable,
+// and reassigning Capacity or Overhead (or calling ApplyCapacityOverlay) detaches the copy from the shared base
+// allocatable. Offerings with a CapacityOverride or OverheadOverride are grouped and computed per copy as usual.
+// WithOfferings must not be called concurrently with writes to the receiver's fields.
+func (i *InstanceType) WithOfferings(offerings Offerings) *InstanceType {
+	out := &InstanceType{
+		Name:                   i.Name,
+		Requirements:           i.Requirements,
+		Offerings:              offerings,
+		Capacity:               i.Capacity,
+		VolumeAttachmentLimits: i.VolumeAttachmentLimits,
+		DynamicResources:       i.DynamicResources,
+		Overhead:               i.Overhead,
+		capacityOverlayApplied: i.capacityOverlayApplied,
+	}
+	out.base.Store(i.sharedBase())
+	return out
 }
 
 type InstanceTypes []*InstanceType
 
 // Since we have a no copy the sync.Once field, we need to maintain a custom
-// DeepCopyInto function.
+// DeepCopyInto function. The cached allocatable is not copied: the copy gets its own Capacity and Overhead and
+// computes its own allocatable.
 //
 //nolint:gocyclo
 func (in *InstanceType) DeepCopyInto(out *InstanceType) {
@@ -271,7 +343,7 @@ func (i *InstanceType) precompute() {
 	}
 	if !hasOverrides {
 		i.allocatableOfferings = []AllocatableOfferings{
-			{Allocatable: i.computeAllocatable(nil, nil), Offerings: i.Offerings.Available()},
+			{Allocatable: i.baseAllocatable(), Offerings: i.Offerings.Available()},
 		}
 		return
 	}
@@ -315,7 +387,7 @@ func (i *InstanceType) groupOfferingsByOverride() []AllocatableOfferings {
 	for idx, key := range order {
 		group := groups[key]
 		if idx == 0 {
-			group.Allocatable = i.computeAllocatable(nil, nil)
+			group.Allocatable = i.baseAllocatable()
 		} else {
 			// Use the first offering in the group to get the override values
 			o := group.Offerings[0]
@@ -373,6 +445,8 @@ func (i *InstanceType) IsPricingOverlayApplied() bool {
 func (i *InstanceType) ApplyCapacityOverlay(updatedCapacity corev1.ResourceList) {
 	i.Capacity = lo.Assign(i.Capacity, updatedCapacity)
 	i.capacityOverlayApplied = true
+	// Capacity is now a new map, so stop sharing the base allocatable computed for the previous one.
+	i.base.Store(nil)
 }
 
 func (i *InstanceType) IsCapacityOverlayApplied() bool {
