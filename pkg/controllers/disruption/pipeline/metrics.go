@@ -22,6 +22,7 @@ import (
 	"github.com/samber/lo"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
@@ -38,6 +39,24 @@ const (
 	causeLabel   = "cause"
 	levelLabel   = "level"
 	kindLabel    = "kind"
+	stageLabel   = "stage"
+	dropLabel    = "drop_reason"
+)
+
+// Planning stages of a round's candidates, admission results of a batch, and joint simulation results and stages.
+// They exist only as metric values.
+var (
+	stageEligible = opmetrics.Value{Name: "eligible", Help: "Candidates the planner was given."}
+	stagePlanned  = opmetrics.Value{Name: "planned", Help: "Candidates in the round's plans."}
+	stageDeferred = opmetrics.Value{Name: "deferred", Help: "Candidates the planner deferred to a later round (a joint simulation's later chunks)."}
+	batchStarted  = opmetrics.Value{Name: "started", Help: "At least one plan of the batch starts."}
+	batchRejected = opmetrics.Value{Name: "rejected", Help: "Every plan of the batch was rejected."}
+	batchWaited   = opmetrics.Value{Name: "waited", Help: "The batch waits for a later commit step."}
+	batchDropped  = opmetrics.Value{Name: "dropped", Help: "The batch waited too long, or the pipeline stopped."}
+	jointAccepted = opmetrics.Value{Name: "accepted", Help: "A batch of candidates was accepted."}
+	jointNone     = opmetrics.Value{Name: "none", Help: "No batch worked out; the planner planned one candidate at a time."}
+	jointTimedOut = opmetrics.Value{Name: "timed_out", Help: "A simulation ran past its deadline."}
+	jointFirst    = opmetrics.Value{Name: "first", Help: "Candidates of the first simulation."}
 )
 
 // Shadow comparison levels, mismatch kinds and causes.
@@ -261,5 +280,86 @@ var (
 	ShadowAgreementRatio = opmetrics.NewPrometheusGauge(crmetrics.Registry, prometheus.GaugeOpts{
 		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_shadow_agreement_ratio",
 		Help: "Share of the disruption pipeline's reference-level shadow comparisons that agreed, since start. Labeled by planner.",
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+)
+
+var (
+	PlanStageDim = opmetrics.Label{
+		Name:   stageLabel,
+		Help:   "How far a planner's candidates got in a round.",
+		Values: []opmetrics.Value{stageEligible, stagePlanned, stageDeferred},
+	}
+	BatchResultDim = opmetrics.Label{
+		Name:   resultLabel,
+		Help:   "What admission did with a batch of plans.",
+		Values: []opmetrics.Value{batchStarted, batchRejected, batchWaited, batchDropped},
+	}
+)
+
+var (
+	PlannedCandidates = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_planned_candidates",
+		Help:    "Candidates of a disruption pipeline planner's round, by how far they got. Labeled by planner and stage.",
+		Buckets: []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000},
+	}, []opmetrics.Label{PlannerDim, PlanStageDim}, opmetrics.Alpha)
+	PlansPerRound = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_plans_per_round",
+		Help:    "Plans a disruption pipeline planner submitted in a round that planned. Labeled by planner.",
+		Buckets: []float64{1, 2, 3, 5, 10, 20, 50, 100},
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+	AdmittedBatchesTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_admitted_batches_total",
+		Help: "Number of admission decisions on a disruption pipeline batch (a plan alone counts as a batch of one). Labeled by planner and result.",
+	}, []opmetrics.Label{PlannerDim, BatchResultDim}, opmetrics.Alpha)
+)
+
+var (
+	JointResultDim = opmetrics.Label{
+		Name:   resultLabel,
+		Help:   "How a planner's joint simulation ended.",
+		Values: []opmetrics.Value{jointAccepted, jointNone, jointTimedOut},
+	}
+	JointStageDim = opmetrics.Label{
+		Name: stageLabel,
+		Help: "Candidates of a joint simulation, by stage.",
+		Values: []opmetrics.Value{
+			jointFirst,
+			{Name: jointAccepted.Name, Help: "Candidates the batch accepted."},
+			{Name: stageDeferred.Name, Help: "Accepted candidates left to a later round."},
+		},
+	}
+	JointDropDim = opmetrics.Label{
+		Name: dropLabel,
+		Help: "Why a joint simulation took a candidate out of its batch.",
+		Values: []opmetrics.Value{
+			{Name: string(disruption.DropPodsUnschedulable), Help: "One of the candidate's pods failed to schedule."},
+			{Name: string(disruption.DropUninitializedDestination), Help: "Reserved, not produced since dependency tracking (decision #16): one of the candidate's pods was placed on a node that isn't initialized while uninitialized destinations were fenced."},
+			{Name: string(disruption.DropHalved), Help: "The batch was halved after a pod of no candidate failed to schedule."},
+		},
+	}
+)
+
+var (
+	JointSimulationsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_joint_simulations_total",
+		Help: "Number of a disruption pipeline planner's joint simulations, by how they ended. Labeled by planner and result.",
+	}, []opmetrics.Label{PlannerDim, JointResultDim}, opmetrics.Alpha)
+	JointChunkedTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_joint_simulations_chunked_total",
+		Help: "Number of a disruption pipeline planner's accepted joint simulations that were planned again in chunks of ComponentCap. Labeled by planner.",
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+	JointCandidates = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_joint_simulation_candidates",
+		Help:    "Candidates of a disruption pipeline planner's joint simulation. Labeled by planner and stage.",
+		Buckets: []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000},
+	}, []opmetrics.Label{PlannerDim, JointStageDim}, opmetrics.Alpha)
+	JointDroppedCandidatesTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_joint_simulation_dropped_candidates_total",
+		Help: "Number of candidates a disruption pipeline planner's joint simulations took out of their batch. Labeled by planner and drop_reason.",
+	}, []opmetrics.Label{PlannerDim, JointDropDim}, opmetrics.Alpha)
+	JointSimulationDurationSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_joint_simulation_duration_seconds",
+		Help:    "Duration of the simulation that accepted a disruption pipeline planner's batch. Labeled by planner.",
+		Buckets: metrics.DurationBuckets(),
 	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
 )

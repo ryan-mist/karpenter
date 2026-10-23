@@ -81,3 +81,5 @@ func (s *Shadow) WaitIdle() { s.jobs.Wait() }
 
 // BatchSizer is a batch planner's sizer.
 func BatchSizer(p Planner) *disruption.BatchSizer { return p.(*batchPlanner).sizer }
+
+func RecordJoint(planner string, res disruption.CoreResult) { recordJoint(planner, res) }

@@ -329,19 +329,21 @@ func quantile(sorted []float64, q float64) float64 {
 	return sorted[min(len(sorted)-1, int(q*float64(len(sorted))))]
 }
 
-// pipelineCounters are the pipeline's and the joint simulations' counters, by series.
+// pipelineCounters are the pipeline's and the joint simulations' counters, and its histograms' sums and counts, by series.
 func pipelineCounters() map[string]float64 {
 	out := map[string]float64{}
 	for _, mf := range lo.Must(crmetrics.Registry.Gather()) {
 		name := mf.GetName()
-		if !lo.SomeBy([]string{"pipeline_plans_total", "pipeline_admission_resims_total", "pipeline_gated_seconds_total", "_batch_"}, func(sub string) bool {
-			return strings.Contains(name, sub)
-		}) {
+		if !strings.Contains(name, "_pipeline_") && !strings.Contains(name, "_batch_") || strings.Contains(name, "_shadow_") {
 			continue
 		}
 		for _, m := range mf.Metric {
 			if m.Counter != nil {
 				out[fmt.Sprint(name, m.GetLabel())] = m.GetCounter().GetValue()
+			}
+			if h := m.GetHistogram(); h != nil {
+				out[fmt.Sprint(name, "_sum", m.GetLabel())] = h.GetSampleSum()
+				out[fmt.Sprint(name, "_count", m.GetLabel())] = float64(h.GetSampleCount())
 			}
 		}
 	}

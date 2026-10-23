@@ -288,6 +288,9 @@ func (p *batchPlanner) Plan(ctx context.Context, in PlanInput) (PlanOutput, erro
 		candidates = p.fair.eligible(candidates)
 	}
 	res, err := p.compute(ctx, p.budgets(ctx, in, candidates), p.options(len(candidates)), candidates...)
+	if !p.withoutMetrics {
+		recordJoint(p.name, res)
+	}
 	out := PlanOutput{Plans: p.plans(res.Commands, version, in)}
 	for _, id := range res.Deferred {
 		out.Verdicts = append(out.Verdicts, types.Verdict{Planner: p.name, ProviderID: id, Reason: types.ReasonDeferred})

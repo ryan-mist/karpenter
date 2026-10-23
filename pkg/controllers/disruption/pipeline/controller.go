@@ -36,6 +36,7 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -144,7 +145,9 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 		o.Lanes = DefaultLanes(DefaultPlanners(ctx, clk, cluster, kubeClient, provisioner, cp, queue, methodEvents, o.Ledger.View()))
 	}
 	wakes := NewWakeHub()
-	o.Observers = append([]Observer{NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, methodEvents, o.Lanes...), newWakeObserver(wakes, o.Lanes...)}, o.Observers...)
+	mo := NewMetricsObserver(clk, kubeClient, recorder, o.Ledger, methodEvents, o.Lanes...)
+	mo.(*metricsObserver).logger = log.FromContext(ctx).WithName("disruption.pipeline")
+	o.Observers = append([]Observer{mo, newWakeObserver(wakes, o.Lanes...)}, o.Observers...)
 	// A completed command frees its nodes' budget slots.
 	queue.WithCompletionHook(func(*disruption.Command) { wakes.Publish("", types.WakeLedgerRelease) })
 	if o.Reserved == nil {
