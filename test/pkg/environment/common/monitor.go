@@ -215,6 +215,11 @@ func (m *Monitor) poll() state {
 	return st
 }
 
+// AvgUtilization returns the unweighted mean, over Karpenter-launched nodes, of each node's
+// requested/allocatable ratio for the resource. Every node counts equally regardless of its size, so
+// when node sizes are mixed the result depends on which nodes pods happen to bind to: moving a few
+// pods from small nodes onto a large one lowers it even though the pods and nodes are unchanged.
+// TotalUtilization does not have this sensitivity.
 func (m *Monitor) AvgUtilization(resource corev1.ResourceName) float64 {
 	utilization := m.nodeUtilization(resource)
 	sum := 0.0
@@ -222,6 +227,30 @@ func (m *Monitor) AvgUtilization(resource corev1.ResourceName) float64 {
 		sum += v
 	}
 	return sum / float64(len(utilization))
+}
+
+// TotalUtilization returns the aggregate utilization of the resource across Karpenter-launched nodes:
+// the sum of pod requests on those nodes divided by the sum of their allocatable. This equals the
+// per-node utilization weighted by node allocatable, so it depends only on which pods and nodes
+// exist, not on how the pods are distributed across the nodes. It returns 0 when there are no
+// Karpenter-launched nodes with allocatable for the resource.
+func (m *Monitor) TotalUtilization(resource corev1.ResourceName) float64 {
+	st := m.poll()
+	requested, allocatable := 0.0, 0.0
+	for nodeName, requests := range st.nodeRequests {
+		nodeAllocatable := st.nodes[nodeName].Status.Allocatable[resource]
+		// skip any nodes we didn't launch, matching nodeUtilization
+		if st.nodes[nodeName].Labels[v1.NodePoolLabelKey] == "" || nodeAllocatable.IsZero() {
+			continue
+		}
+		nodeRequested := requests[resource]
+		requested += nodeRequested.AsApproximateFloat64()
+		allocatable += nodeAllocatable.AsApproximateFloat64()
+	}
+	if allocatable == 0 {
+		return 0
+	}
+	return requested / allocatable
 }
 
 func (m *Monitor) MinUtilization(resource corev1.ResourceName) float64 {
