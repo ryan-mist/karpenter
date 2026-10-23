@@ -644,7 +644,7 @@ var _ = Describe("StaticDrift", func() {
 		})
 		It("should release the node-count slots of computed commands that never start", func() {
 			limitedDriftedPool()
-			// Cancelling the reconcile context right after computing makes the controller skip starting every command.
+			// Canceling the reconcile context right after computing makes the controller skip starting every command.
 			cancelCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			controller := disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
