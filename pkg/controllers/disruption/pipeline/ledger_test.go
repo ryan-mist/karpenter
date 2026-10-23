@@ -228,8 +228,8 @@ var _ = Describe("Ledger", func() {
 			Expect(started).To(HaveLen(1))
 			Expect(started[0].PlanID).To(Equal(b.ID))
 			Expect(l.StartedSince(l.Version())).To(BeEmpty())
-			// Once no reserved plan predates it and it is older than StaleAfter, it is dropped.
-			env.Clock.Step(pipeline.StaleAfter + time.Second)
+			// Once no reserved plan predates it and it is older than StaleAfter+MaxPlanTime, it is dropped.
+			env.Clock.Step(pipeline.StaleAfter + pipeline.MaxPlanTime + time.Second)
 			c := budgetPlan(w.nodePool.Name, v1.DisruptionReasonDrifted, ids[2])
 			c.Footprint.ComputedAt = l.Version()
 			Expect(l.Reserve(ctx, c)).To(Equal([]error{nil}))

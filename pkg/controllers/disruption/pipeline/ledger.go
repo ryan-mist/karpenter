@@ -701,13 +701,13 @@ func (l *ledger) MarkStarted(id uuid.UUID) {
 }
 
 // prune drops the started footprints that no reserved plan can need: older than every reserved plan's ComputedAt, and
-// older than StaleAfter (a plan computed but not yet submitted that is older is re-simulated anyway).
+// older than StaleAfter+MaxPlanTime (a plan computed but not yet submitted whose round is older is re-simulated anyway).
 func (l *ledger) prune() {
 	oldest := uint64(math.MaxUint64)
 	for _, r := range l.reserved {
 		oldest = min(oldest, r.footprint.ComputedAt)
 	}
-	cutoff := l.clock.Now().Add(-StaleAfter)
+	cutoff := l.clock.Now().Add(-StaleAfter - MaxPlanTime)
 	l.started = lo.Filter(l.started, func(s StartedFootprint, _ int) bool { return s.Version > oldest || s.At.After(cutoff) })
 }
 

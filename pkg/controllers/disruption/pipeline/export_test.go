@@ -78,3 +78,6 @@ func (s *Shadow) SetShadowLogger(l logr.Logger) { s.logger = l }
 
 // WaitIdle waits for the shadow's sample goroutines.
 func (s *Shadow) WaitIdle() { s.jobs.Wait() }
+
+// BatchSizer is a batch planner's sizer.
+func BatchSizer(p Planner) *disruption.BatchSizer { return p.(*batchPlanner).sizer }

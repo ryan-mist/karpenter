@@ -41,6 +41,14 @@ type Revalidator interface {
 	Replan(ctx context.Context, survivors []*Plan, in RevalidateInput) ([]*Plan, error)
 }
 
+// JointRevalidator is implemented by a planner that can re-simulate several plans of one batch together: admission
+// then re-simulates a batch's plans that need it with one joint simulation instead of one per plan.
+type JointRevalidator interface {
+	// RevalidateJointly accepts the plans of ins on their rebuilt candidates with one joint re-simulation, all or
+	// nothing. It returns the plans to start in their place, or a *RejectError.
+	RevalidateJointly(ctx context.Context, ins []RevalidateInput) ([]*Plan, error)
+}
+
 // RevalidateInput is what a planner accepts a plan on.
 type RevalidateInput struct {
 	Plan *Plan
@@ -129,9 +137,19 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 	accepted := map[uuid.UUID][]*Plan{}
 	var survivors []*Pending
 	var resims []types.ResimCause
+	var joint *[]RevalidateInput
+	jr, isJoint := a.planners[group[0].Plan.Planner].(JointRevalidator)
+	if isJoint && len(group) > 1 {
+		joint = &[]RevalidateInput{}
+	}
+	var deferred []*Pending
 	for _, p := range group {
-		plans, causes, wait, err := a.admitOne(ctx, p, step, &res)
+		n := len(lo.FromPtr(joint))
+		plans, causes, wait, err := a.admitOne(ctx, p, step, &res, joint)
 		switch {
+		case len(lo.FromPtr(joint)) > n:
+			deferred = append(deferred, p)
+			resims = append(resims, causes...)
 		case err != nil:
 			res.Rejected[p.Plan.ID] = rejectReason(ctx, err)
 			resims = append(resims, causes...)
@@ -146,6 +164,29 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 	if len(res.Wait) > 0 && len(group) > 1 {
 		// A batch starts together: if part of it must wait, all of it waits.
 		return waitAll(res, group)
+	}
+	switch {
+	case len(deferred) == 0:
+	case len(res.Rejected) > 0:
+		// Another member was rejected: the deferred members are re-planned with the other survivors below.
+		survivors = append(survivors, deferred...)
+	default:
+		plans, err := jr.RevalidateJointly(ctx, *joint)
+		switch {
+		case err != nil:
+			for i, p := range deferred {
+				res.Rejected[p.Plan.ID] = lo.Ternary(i == 0, rejectReason(ctx, err), types.ReasonSiblingRejected)
+			}
+		case coupledToAdmitted(step, plans):
+			return waitAll(res, group)
+		default:
+			// The joint plans replace every re-simulated member; the first carries them, so the batch's Swap starts
+			// each once.
+			for i, p := range deferred {
+				accepted[p.Plan.ID] = lo.Ternary(i == 0, plans, nil)
+			}
+			survivors = append(survivors, deferred...)
+		}
 	}
 	if len(res.Rejected) > 0 && len(survivors) > 0 && len(group) > 1 {
 		return a.replan(ctx, group, survivors, step, res, resims)
@@ -171,9 +212,16 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 		}
 		return res
 	}
+	jointIDs := lo.FlatMap(deferred, func(p *Pending, _ int) []uuid.UUID {
+		return lo.Map(accepted[p.Plan.ID], func(q *Plan, _ int) uuid.UUID { return q.ID })
+	})
+	isJointMember := lo.SliceToMap(deferred, func(p *Pending) (uuid.UUID, bool) { return p.Plan.ID, true })
 	for _, p := range survivors {
 		plans := accepted[p.Plan.ID]
-		if len(plans) != 1 || plans[0].ID != p.Plan.ID {
+		switch {
+		case isJointMember[p.Plan.ID]:
+			res.Replaced[p.Plan.ID] = jointIDs
+		case len(plans) != 1 || plans[0].ID != p.Plan.ID:
 			res.Replaced[p.Plan.ID] = lo.Map(plans, func(q *Plan, _ int) uuid.UUID { return q.ID })
 		}
 	}
@@ -220,7 +268,7 @@ func coupledToAdmitted(step *CommitStep, plans []*Plan) bool {
 
 // admitOne decides for one plan, returning the plans to start in its place and why they were re-simulated, or that it
 // waits.
-func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, res *AdmitResult) ([]*Plan, []types.ResimCause, bool, error) {
+func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, res *AdmitResult, joint *[]RevalidateInput) ([]*Plan, []types.ResimCause, bool, error) {
 	plan := p.Plan
 	planner := a.planners[plan.Planner]
 	rv := revalidatorFor(planner)
@@ -272,6 +320,11 @@ func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, r
 	if rv.AlwaysResimulate() && lo.SomeBy(step.Admitted, func(o *Plan) bool { return o.BatchID != plan.BatchID }) {
 		return nil, nil, true, nil
 	}
+	// A batch's plans that need a re-simulation are re-simulated together, after every member is checked.
+	if joint != nil && len(in.Causes) > 0 && len(in.Rejected) == 0 && plan.Action != types.ActionReboot && plan.TerminateFirst == "" {
+		*joint = append(*joint, in)
+		return nil, in.Causes, false, nil
+	}
 	plans, err := rv.Revalidate(ctx, in)
 	if err != nil {
 		return nil, in.Causes, false, err
@@ -302,7 +355,11 @@ func (a *admitter) causes(plan *Plan, p *Pending, step *CommitStep, rebuilt *Reb
 			in.Causes = appendCause(in.Causes, types.ResimCoupled)
 		}
 	}
-	if step.Now.Sub(plan.ComputedAt) > StaleAfter {
+	// Staleness counts from the plan's submission, right after its simulation finished, not from the round's start: a
+	// joint simulation can take most of StaleAfter itself, and would otherwise leave every plan of its batch stale. A
+	// round older than StaleAfter+MaxPlanTime is stale however recently it was submitted: the Ledger keeps started
+	// footprints only that long, so coupling with an older start could no longer be seen.
+	if step.Now.Sub(p.SubmittedAt) > StaleAfter || step.Now.Sub(plan.ComputedAt) > StaleAfter+MaxPlanTime {
 		in.Causes = appendCause(in.Causes, types.ResimStale)
 	}
 	for np, v := range plan.CatalogVersions {
