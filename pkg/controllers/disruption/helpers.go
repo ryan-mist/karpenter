@@ -273,10 +273,6 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *cost.ClusterCost,
 ) ([]*Candidate, map[string]NodePoolTotals, error) {
-	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
-	if err != nil {
-		return nil, nil, err
-	}
 	pdbs, err := pdb.NewLimits(ctx, kubeClient)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
@@ -287,6 +283,11 @@ func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeCl
 	// We don't want the order in which candidates are evaluated to affect their DisruptionCost.
 	var fixedNowClk clock.Clock = fixedNowClock{Clock: clk, now: clk.Now()}
 	allNodes := cluster.DeepCopyNodes()
+	// A candidate only reads instance types for the NodePool that owns it, so skip resolving them for the rest.
+	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMapForNodes(ctx, kubeClient, cloudProvider, allNodes)
+	if err != nil {
+		return nil, nil, err
+	}
 	allCandidates := lo.FilterMap(allNodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
 		cn, e := NewCandidate(ctx, kubeClient, recorder, fixedNowClk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
 		return cn, e == nil
@@ -307,8 +308,28 @@ type fixedNowClock struct {
 func (c fixedNowClock) Now() time.Time                  { return c.now }
 func (c fixedNowClock) Since(t time.Time) time.Duration { return c.now.Sub(t) }
 
-// BuildNodePoolMap builds a provName -> nodePool map and a provName -> instanceName -> instance type map
+// BuildNodePoolMap builds a nodePoolName -> nodePool map and a nodePoolName -> instanceTypeName -> instance type map
+// for every managed NodePool.
 func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider) (map[string]*v1.NodePool, map[string]map[string]*cloudprovider.InstanceType, error) {
+	return buildNodePoolMap(ctx, kubeClient, cloudProvider, nil)
+}
+
+// BuildNodePoolMapForNodes is like BuildNodePoolMap, but only resolves instance types for NodePools that own at least
+// one of the given nodes (by the karpenter.sh/nodepool label). The returned NodePool map still contains every managed
+// NodePool. Resolving instance types is the dominant cost of building these maps and scales with the number of
+// NodePools, while callers that build candidates from existing nodes only look up the owning NodePool's instance types.
+func BuildNodePoolMapForNodes(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, nodes []*state.StateNode) (map[string]*v1.NodePool, map[string]map[string]*cloudprovider.InstanceType, error) {
+	owners := sets.New[string]()
+	for _, n := range nodes {
+		if name := n.Labels()[v1.NodePoolLabelKey]; name != "" {
+			owners.Insert(name)
+		}
+	}
+	return buildNodePoolMap(ctx, kubeClient, cloudProvider, owners)
+}
+
+// buildNodePoolMap resolves instance types for every NodePool when owners is nil, otherwise only for NodePools in owners.
+func buildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, owners sets.Set[string]) (map[string]*v1.NodePool, map[string]map[string]*cloudprovider.InstanceType, error) {
 	nodePoolMap := map[string]*v1.NodePool{}
 	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
 	if err != nil {
@@ -318,6 +339,9 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 	nodePoolToInstanceTypesMap := map[string]map[string]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
 		nodePoolMap[np.Name] = np
+		if owners != nil && !owners.Has(np.Name) {
+			continue
+		}
 
 		nodePoolInstanceTypes, err := cloudProvider.GetInstanceTypes(ctx, np)
 		if err != nil {
