@@ -49,11 +49,20 @@ type Rebuilt struct {
 	Events *RoundEvents
 
 	instanceTypes map[string]map[string]*cloudprovider.InstanceType
+	// catalog memoizes CatalogVersion: every plan of a batch asks for its NodePools'.
+	catalog map[string]string
 }
 
 // CatalogVersion is the live catalog version of nodePool, as Snapshot.CatalogVersion.
 func (r *Rebuilt) CatalogVersion(nodePool string) string {
-	return CatalogVersion(r.instanceTypes[nodePool])
+	if v, ok := r.catalog[nodePool]; ok {
+		return v
+	}
+	if r.catalog == nil {
+		r.catalog = map[string]string{}
+	}
+	r.catalog[nodePool] = CatalogVersion(r.instanceTypes[nodePool])
+	return r.catalog[nodePool]
 }
 
 type rebuilder struct {

@@ -135,6 +135,20 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 		res.Wait = group
 		return res
 	}
+	// One rebuild for the whole batch: rebuilding lists the NodePools, their instance types and the PDBs, which at
+	// scale costs about as much for one candidate as for all of them (KWOK run 2: per-plan rebuilds were 74 s of a
+	// 180 s profile, ~10 s per batch of ~40 plans).
+	rebuilt, err := a.rebuilder.Rebuild(ctx, classOf(a.planners[group[0].Plan.Planner]),
+		lo.FlatMap(group, func(p *Pending, _ int) []string { return providerIDsOfCandidates(p.Plan.Candidates) })...)
+	if err != nil {
+		for _, p := range group {
+			res.Rejected[p.Plan.ID] = rejectReason(ctx, err)
+		}
+		return res
+	}
+	res.Events = append(res.Events, rebuilt.Events)
+	rechecks := lo.SliceToMap(lo.Zip2(group, a.ledger.RecheckAll(ctx, lo.Map(group, func(p *Pending, _ int) uuid.UUID { return p.Plan.ID })...)),
+		func(t lo.Tuple2[*Pending, error]) (uuid.UUID, error) { return t.A.Plan.ID, t.B })
 	accepted := map[uuid.UUID][]*Plan{}
 	var survivors []*Pending
 	var resims []types.ResimCause
@@ -146,7 +160,7 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 	var deferred []*Pending
 	for _, p := range group {
 		n := len(lo.FromPtr(joint))
-		plans, causes, wait, err := a.admitOne(ctx, p, step, &res, joint)
+		plans, causes, wait, err := a.admitOne(ctx, p, step, rebuilt, rechecks[p.Plan.ID], joint)
 		switch {
 		case len(lo.FromPtr(joint)) > n:
 			deferred = append(deferred, p)
@@ -200,7 +214,6 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 	// committed with one all-or-nothing Swap, so a member that can't be committed leaves no other member's change
 	// behind.
 	all := lo.FlatMap(survivors, func(p *Pending, _ int) []*Plan { return accepted[p.Plan.ID] })
-	var err error
 	if len(group) == 1 {
 		err = a.commit(ctx, survivors[0].Plan, all)
 	} else {
@@ -265,23 +278,15 @@ func coupledToAdmitted(step *CommitStep, plans []*Plan) bool {
 	})
 }
 
-// admitOne decides for one plan, returning the plans to start in its place and why they were re-simulated, or that it
-// waits.
-func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, res *AdmitResult, joint *[]RevalidateInput) ([]*Plan, []types.ResimCause, bool, error) {
+// admitOne decides for one plan, on the batch's rebuilt candidates and the Ledger's recheck of the plan, returning the
+// plans to start in its place and why they were re-simulated, or that it waits.
+func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, rebuilt *Rebuilt, recheck error, joint *[]RevalidateInput) ([]*Plan, []types.ResimCause, bool, error) {
 	plan := p.Plan
 	planner := a.planners[plan.Planner]
 	rv := revalidatorFor(planner)
-	ids := providerIDsOfCandidates(plan.Candidates)
-	class := disruption.GracefulDisruptionClass
-	if planner != nil {
-		class = planner.Class()
-	}
-	rebuilt, err := a.rebuilder.Rebuild(ctx, class, ids...)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	res.Events = append(res.Events, rebuilt.Events)
-	in := RevalidateInput{Plan: plan, Rejected: rebuilt.Rejected, Reserved: a.ledger.View(), Now: step.Now}
+	// The plan's own rejections: the batch's rebuild covers its siblings' candidates too.
+	rejected := lo.PickByKeys(rebuilt.Rejected, providerIDsOfCandidates(plan.Candidates))
+	in := RevalidateInput{Plan: plan, Rejected: rejected, Reserved: a.ledger.View(), Now: step.Now}
 	for _, c := range plan.Candidates {
 		fresh, ok := rebuilt.Candidates[c.ProviderID()]
 		if !ok {
@@ -307,8 +312,8 @@ func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, r
 	if !step.Synced && !plan.PodFreeOn(in.Fresh) {
 		return nil, nil, true, nil
 	}
-	if err := a.ledger.Recheck(ctx, plan.ID); err != nil {
-		return nil, nil, false, err
+	if recheck != nil {
+		return nil, nil, false, recheck
 	}
 	if err := a.causes(plan, p, step, rebuilt, rv, &in); err != nil {
 		return nil, nil, false, err
@@ -460,4 +465,12 @@ func (defaultRevalidator) Revalidate(_ context.Context, in RevalidateInput) ([]*
 
 func (defaultRevalidator) Replan(context.Context, []*Plan, RevalidateInput) ([]*Plan, error) {
 	return nil, &RejectError{Reason: types.ReasonSiblingRejected}
+}
+
+// classOf is the disruption class a planner's candidates are rebuilt for.
+func classOf(p Planner) string {
+	if p == nil {
+		return disruption.GracefulDisruptionClass
+	}
+	return p.Class()
 }
