@@ -305,7 +305,7 @@ func (p *batchPlanner) Revalidate(ctx context.Context, in RevalidateInput) ([]*P
 	if len(in.Causes) == 0 || in.Plan.Action == types.ActionReboot || in.Plan.TerminateFirst != "" {
 		return accept(in.Plan, in.Fresh), nil
 	}
-	return p.resimulate(ctx, in, in.Fresh, true)
+	return p.resimulate(ctx, in, in.Fresh, true, false)
 }
 
 // Resolved records that a NodePool was served when one of its plans started, and backs its NodePools off when the
@@ -332,34 +332,47 @@ func (p *batchPlanner) finished(cmd *disruption.Command) {
 
 // Replan plans the surviving siblings of a batch again, jointly.
 func (p *batchPlanner) Replan(ctx context.Context, survivors []*Plan, in RevalidateInput) ([]*Plan, error) {
-	return p.resimulate(ctx, in, lo.FlatMap(survivors, func(s *Plan, _ int) []*disruption.Candidate { return s.Candidates }), true)
+	return p.resimulate(ctx, in, lo.FlatMap(survivors, func(s *Plan, _ int) []*disruption.Candidate { return s.Candidates }), true, true)
 }
 
 // RevalidateJointly re-simulates the plans of one batch together, on their rebuilt candidates, as the joint
-// simulation that planned them did: one simulation instead of one per plan, all or nothing.
+// simulation that planned them did: one simulation instead of one per plan.
 func (p *batchPlanner) RevalidateJointly(ctx context.Context, ins []RevalidateInput) ([]*Plan, error) {
-	return p.resimulate(ctx, ins[0], lo.FlatMap(ins, func(in RevalidateInput, _ int) []*disruption.Candidate { return in.Fresh }), false)
+	return p.resimulate(ctx, ins[0], lo.FlatMap(ins, func(in RevalidateInput, _ int) []*disruption.Candidate { return in.Fresh }), false, true)
 }
 
-// resimulate plans the candidates again now, against started state. It fails unless every candidate is planned. With
-// keep, a single plan that comes back as one plan keeps in.Plan's identity, so the Ledger amends it.
-func (p *batchPlanner) resimulate(ctx context.Context, in RevalidateInput, cs []*disruption.Candidate, keep bool) ([]*Plan, error) {
+// resimOptions are the options of a re-simulation of n candidates. It is of exactly these candidates (a whole batch,
+// when admission re-simulates or re-plans one jointly), so the batch sizer, which sizes new batches, doesn't size it;
+// but its deadline is the sizer's, which grows with the measured cost of a simulation: at 2000 nodes a joint
+// simulation takes several seconds, longer than BatchSimDeadline (KWOK run 2: re-plans timed out, and their batches
+// were rejected as sibling_rejected).
+func (p *batchPlanner) resimOptions(n int) disruption.CoreOptions {
+	opts := p.options(n)
+	if opts.Sizer != nil && opts.Deadline > 0 {
+		opts.Deadline = max(opts.Deadline, opts.Sizer.Deadline())
+	}
+	opts.Sizer = nil
+	return opts
+}
+
+// resimulate plans the candidates again now, against started state. Unless partial, it fails unless every candidate is
+// planned; with partial (a batch re-planned or re-simulated jointly) it accepts the candidates the joint simulation
+// accepted, whose plans are consistent on their own (the simulation that accepted them removed exactly them), and
+// leaves the others to a later round. It fails when none is planned. With keep, a single plan that comes back as one
+// plan keeps in.Plan's identity, so the Ledger amends it.
+func (p *batchPlanner) resimulate(ctx context.Context, in RevalidateInput, cs []*disruption.Candidate, keep, partial bool) ([]*Plan, error) {
 	version := in.Reserved.Version()
 	budgets := lo.CountValuesBy(cs, func(c *disruption.Candidate) string { return c.NodePool.Name })
-	// A re-simulation is of exactly these candidates (a whole batch, when admission re-simulates it jointly), so the
-	// batch sizer, which sizes new batches, doesn't apply.
-	opts := p.options(len(cs))
-	opts.Sizer = nil
-	res, err := p.compute(ctx, budgets, opts, cs...)
+	res, err := p.compute(ctx, budgets, p.resimOptions(len(cs)), cs...)
 	if err != nil {
 		return nil, err
 	}
 	planned := lo.FlatMap(res.Commands, func(cmd disruption.Command, _ int) []*disruption.Candidate { return cmd.Candidates })
-	if len(planned) != len(cs) {
+	if len(planned) == 0 || (!partial && len(planned) != len(cs)) {
 		return nil, reject(types.ReasonResimUnschedulable, "%d of %d candidates can be disrupted now", len(planned), len(cs))
 	}
 	plans := p.plans(res.Commands, version, PlanInput{Now: in.Now})
-	if keep && len(plans) == 1 && len(res.Commands) == 1 {
+	if keep && len(plans) == 1 && len(res.Commands) == 1 && len(planned) == len(cs) {
 		// One plan replaces one plan: keep its identity, so the Ledger amends it.
 		plans[0].ID, plans[0].BatchID, plans[0].Siblings = in.Plan.ID, in.Plan.BatchID, in.Plan.Siblings
 		plans[0].CatalogVersions, plans[0].ComputedAt = in.Plan.CatalogVersions, in.Now

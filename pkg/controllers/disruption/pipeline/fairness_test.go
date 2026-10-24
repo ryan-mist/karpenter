@@ -38,9 +38,6 @@ var _ = Describe("Drift fairness", func() {
 		cands = s.CandidatesFor(ctx, newStubPlanner("drift"))
 		Expect(cands).To(HaveLen(5))
 	})
-	pools := func(cs []*disruption.Candidate) []string {
-		return lo.Map(cs, func(c *disruption.Candidate, _ int) string { return c.NodePool.Name })
-	}
 	It("interleaves NodePools, least recently served first", func() {
 		f := pipeline.NewPoolFairness(env.Clock, func() float64 { return 0.5 })
 		first, second := lo.Ternary(a.nodePool.Name < b.nodePool.Name, a, b), lo.Ternary(a.nodePool.Name < b.nodePool.Name, b, a)

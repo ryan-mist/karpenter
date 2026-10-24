@@ -130,6 +130,11 @@ func expectSubmitted(lane types.LaneID) {
 	}).Should(BeNumerically(">=", 1))
 }
 
+// pools are the candidates' NodePool names.
+func pools(cs []*disruption.Candidate) []string {
+	return lo.Map(cs, func(c *disruption.Candidate, _ int) string { return c.NodePool.Name })
+}
+
 func queuedCandidates() []string {
 	return lo.FlatMap(queue.GetCommands(), func(cmd *disruption.Command, _ int) []string {
 		return lo.Map(cmd.Candidates, func(c *disruption.Candidate, _ int) string { return c.ProviderID() })
@@ -335,6 +340,107 @@ var _ = Describe("Planners", func() {
 		r := exec.Step(ctx)
 		Expect(r.Rejected).To(BeZero())
 		Expect(queuedCandidates()).To(ConsistOf(planned))
+	})
+	It("re-simulates with the batch sizer's deadline, not its size", func() {
+		newWorld(1)
+		planners := pipeline.DefaultPlanners(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, queue, &pipeline.RoundEvents{}, pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue).View())
+		sizer := pipeline.BatchSizer(planners["drift"])
+		// A large cluster: one simulation costs 5 s, far above BatchSimDeadline; then a timeout shrinks the size.
+		sizer.Observe(disruption.BatchOutcome{Size: 40, Sims: []disruption.SimSample{{Took: 5 * time.Second}}, TimedOut: true})
+		Expect(sizer.Deadline()).To(BeNumerically(">", disruption.BatchSimDeadline))
+		opts := pipeline.ResimOptions(planners["drift"], 40)
+		Expect(opts.Sizer).To(BeNil())
+		Expect(opts.Batch).To(Equal(40))
+		Expect(opts.Deadline).To(Equal(sizer.Deadline()))
+	})
+	It("starts the candidates a batch's joint re-simulation or re-plan accepted, and leaves the others", func() {
+		w := newWorld(6)
+		w.only(v1.ConditionTypeDrifted)
+		w.withPods("1", lo.Range(6)...)
+		l := pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue)
+		planners := pipeline.DefaultPlanners(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, queue, &pipeline.RoundEvents{}, l.View())
+		drift := planners["drift"]
+		var submitted []*pipeline.Plan
+		exec := &capturingExecutor{Executor: pipeline.NewExecutor(pipeline.ExecutorDeps{Ledger: l, Admitter: pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), drift),
+			Starter: pipeline.NewQueueStarter(queue, env.Clock), Sweeper: disruption.NewMarkSweeper(env.Client, cluster, env.Clock), Queue: queue, Cluster: cluster, Clock: env.Clock}), plans: &submitted}
+		lane := pipeline.NewLane(pipeline.LaneSpec{ID: "fast", Planners: []pipeline.Planner{drift}}, pipeline.LaneDeps{
+			Clock: env.Clock, Cluster: cluster, Executor: exec, Budgets: l.Budgets(), Reserved: l.View(),
+			Snapshots: pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, l.View()),
+		})
+		Expect(lane.Step(ctx).Err).ToNot(HaveOccurred())
+		cands := lo.FlatMap(submitted, func(p *pipeline.Plan, _ int) []*disruption.Candidate { return p.Candidates })
+		Expect(len(cands)).To(BeNumerically(">=", 2))
+		// The re-simulation accepts only the first candidate.
+		pipeline.SetCompute(drift, func(_ context.Context, _ map[string]int, _ disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error) {
+			return disruption.CoreResult{Commands: []disruption.Command{{Candidates: cs[:1]}}}, nil
+		})
+		in := pipeline.RevalidateInput{Plan: submitted[0], Fresh: cands, Reserved: l.View(), Now: env.Clock.Now(), Causes: []types.ResimCause{types.ResimStale}}
+		jr := drift.(pipeline.JointRevalidator)
+		plans, err := jr.RevalidateJointly(ctx, []pipeline.RevalidateInput{in})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lo.FlatMap(plans, func(p *pipeline.Plan, _ int) []*disruption.Candidate { return p.Candidates })).To(Equal(cands[:1]))
+		plans, err = drift.(pipeline.Revalidator).Replan(ctx, submitted, in)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lo.FlatMap(plans, func(p *pipeline.Plan, _ int) []*disruption.Candidate { return p.Candidates })).To(HaveLen(1))
+		// One plan re-simulated on its own is still all or nothing.
+		_, err = drift.(pipeline.Revalidator).Revalidate(ctx, in)
+		Expect(pipeline.RejectReasonOf(err)).To(Equal(types.ReasonResimUnschedulable))
+		// None accepted: the batch is rejected.
+		pipeline.SetCompute(drift, func(context.Context, map[string]int, disruption.CoreOptions, ...*disruption.Candidate) (disruption.CoreResult, error) {
+			return disruption.CoreResult{}, nil
+		})
+		_, err = jr.RevalidateJointly(ctx, []pipeline.RevalidateInput{in})
+		Expect(pipeline.RejectReasonOf(err)).To(Equal(types.ReasonResimUnschedulable))
+	})
+	It("resolves only the batch members whose candidates a partial joint re-simulation accepted as started", func() {
+		// One batch with one plan per NodePool; the joint re-simulation accepts one candidate of the NodePool that sorts
+		// first, so the other NodePool's plan is left out.
+		a, b := newWorld(3), newWorld(2)
+		early, late := lo.Ternary(a.nodePool.Name < b.nodePool.Name, a, b), lo.Ternary(a.nodePool.Name < b.nodePool.Name, b, a)
+		a.only(v1.ConditionTypeDrifted)
+		b.only(v1.ConditionTypeDrifted)
+		a.withPods("20", 0, 1, 2)
+		b.withPods("20", 0, 1)
+		l := pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue)
+		planners := pipeline.DefaultPlanners(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, queue, &pipeline.RoundEvents{}, l.View())
+		drift := planners["drift"]
+		var submitted []*pipeline.Plan
+		exec := &capturingExecutor{Executor: pipeline.NewExecutor(pipeline.ExecutorDeps{Ledger: l, Admitter: pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), drift),
+			Starter: pipeline.NewQueueStarter(queue, env.Clock), Sweeper: disruption.NewMarkSweeper(env.Client, cluster, env.Clock), Queue: queue, Cluster: cluster, Clock: env.Clock, Planners: []pipeline.Planner{drift}}), plans: &submitted}
+		lane := pipeline.NewLane(pipeline.LaneSpec{ID: "fast", Planners: []pipeline.Planner{drift}}, pipeline.LaneDeps{
+			Clock: env.Clock, Cluster: cluster, Executor: exec, Budgets: l.Budgets(), Reserved: l.View(),
+			Snapshots: pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, l.View()),
+		})
+		pipeline.SetCompute(drift, func(_ context.Context, _ map[string]int, _ disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error) {
+			byPool := lo.GroupBy(cs, func(c *disruption.Candidate) string { return c.NodePool.Name })
+			batch := uuid.New()
+			return disruption.CoreResult{Commands: []disruption.Command{
+				{Candidates: byPool[early.nodePool.Name], BatchID: batch}, {Candidates: byPool[late.nodePool.Name], BatchID: batch}}}, nil
+		})
+		Expect(lane.Step(ctx).Err).ToNot(HaveOccurred())
+		Expect(lo.Uniq(lo.Map(submitted, func(p *pipeline.Plan, _ int) uuid.UUID { return p.BatchID }))).To(HaveLen(1))
+		Expect(lo.Map(submitted, func(p *pipeline.Plan, _ int) []string { return lo.Uniq(pools(p.Candidates)) })).To(ConsistOf(
+			[]string{early.nodePool.Name}, []string{late.nodePool.Name}))
+		env.Clock.Step(pipeline.StaleAfter + time.Second)
+		var accepted string
+		pipeline.SetCompute(drift, func(_ context.Context, _ map[string]int, _ disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error) {
+			first, _ := lo.Find(cs, func(c *disruption.Candidate) bool { return c.NodePool.Name == early.nodePool.Name })
+			accepted = first.ProviderID()
+			return disruption.CoreResult{Commands: []disruption.Command{{Candidates: []*disruption.Candidate{first}}}}, nil
+		})
+		r := exec.Step(ctx)
+		Expect(r.Admitted).To(Equal(1))
+		Expect(queuedCandidates()).To(ConsistOf(accepted))
+		// The late NodePool's plan holds no accepted candidate: it is rejected as deferred, not resolved as started.
+		Expect(r.Rejected).To(Equal(1))
+		Expect(l.View().Unstarted().UnsortedList()).To(BeEmpty())
+		// Only the early NodePool was served, so the late one comes first in the next round.
+		s, err := pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, l.View()).Build(ctx, pipeline.Scope{})
+		Expect(err).ToNot(HaveOccurred())
+		cands := s.CandidatesFor(ctx, drift)
+		Expect(pools(cands)).To(ContainElements(early.nodePool.Name, late.nodePool.Name))
+		pipeline.Fairness(drift).Order(cands)
+		Expect(cands[0].NodePool.Name).To(Equal(late.nodePool.Name))
 	})
 	It("counts consolidation's failed validation when admission rejects a candidate", func() {
 		disruption.FailedValidationsTotal.Reset()

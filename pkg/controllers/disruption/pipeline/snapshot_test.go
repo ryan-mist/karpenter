@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -29,15 +30,32 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 func TestCatalogVersionChangesWithEveryOfferingInput(t *testing.T) {
-	its := lo.SliceToMap(fake.InstanceTypesAssorted()[:20], func(it *cloudprovider.InstanceType) (string, *cloudprovider.InstanceType) { return it.Name, it })
+	assorted := fake.InstanceTypesAssorted()[:20]
+	// Assorted instance types have one offering each; give the first one per zone and capacity type, as real ones have.
+	first := assorted[0].Offerings[0]
+	for _, zone := range []string{"test-zone-1", "test-zone-2", "test-zone-3"} {
+		for _, ct := range []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand} {
+			assorted[0].Offerings = append(assorted[0].Offerings, &cloudprovider.Offering{Price: first.Price, Available: true,
+				Requirements: scheduling.NewLabelRequirements(map[string]string{corev1.LabelTopologyZone: zone, v1.CapacityTypeLabelKey: ct})})
+		}
+	}
+	its := lo.SliceToMap(assorted, func(it *cloudprovider.InstanceType) (string, *cloudprovider.InstanceType) { return it.Name, it })
 	base := pipeline.CatalogVersion(its)
 	if again := pipeline.CatalogVersion(its); again != base {
 		t.Fatalf("same catalog: got %s, want %s", again, base)
 	}
-	o := lo.Values(its)[0].Offerings[0]
+	// The order of the offerings doesn't matter: providers build them from sets.
+	for _, it := range its {
+		it.Offerings = lo.Reverse(append(cloudprovider.Offerings{}, it.Offerings...))
+	}
+	if again := pipeline.CatalogVersion(its); again != base {
+		t.Fatalf("same offerings in another order: got %s, want %s", again, base)
+	}
+	o := assorted[0].Offerings[0]
 	for name, mutate := range map[string]func(){
 		"price":                func() { o.Price += 0.001 },
 		"availability":         func() { o.Available = !o.Available },
