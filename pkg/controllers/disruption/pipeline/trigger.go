@@ -46,8 +46,8 @@ const (
 
 // PollTrigger is the alpha trigger: it never wakes a lane early, and paces it like the disruption controller polls.
 // A lane runs again right away after one of its plans started (Fast) or after its duty-cycle gap (Background), after a
-// second while it waits for a gate or for its plans to resolve, at a planner's next timer, and after the polling period
-// otherwise.
+// second while it waits for a gate, for cluster state to sync (also when only some of its planners wait for it), for
+// its plans to resolve (and, Fast, for budget), at a planner's next timer, and after the polling period otherwise.
 type PollTrigger struct {
 	// Background paces every round by its duty cycle, even right after a start.
 	Background bool
@@ -63,8 +63,13 @@ func (t PollTrigger) Pace(last StepResult, _ types.WakeSet) time.Duration {
 		pace = pollingPeriod
 	case last.Admitted > 0:
 		pace = lo.Ternary(t.Background, duty, 0)
-	case last.Plans > 0, last.Gated == types.GateSynced, last.Gated == types.GateHydrating:
+	case last.Plans > 0, last.Gated == types.GateSynced, last.Gated == types.GateHydrating, last.HeldUnsynced:
 		pace = max(gatePoll, lo.Ternary(t.Background, duty, 0))
+	case last.BudgetBound && !t.Background:
+		// Budget frees when an in-flight disruption finishes, and nothing wakes the lane for that yet: a Fast lane
+		// polling at the polling period would leave freed budget unused for half of it on average (KWOK run 2). It
+		// polls at gatePoll instead, within its duty cycle.
+		pace = max(gatePoll, duty)
 	default:
 		pace = pollingPeriod
 	}
