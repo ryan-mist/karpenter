@@ -225,17 +225,25 @@ func (s *Shadow) Computing(ctx context.Context, m disruption.Method, snapshot *d
 		}
 	}()
 	ctx = shadowContext(ctx)
-	snap, err := NewSnapshotBuilder(s.kubeClient, s.cluster, s.clock, s.cloudProvider, s.queue, s.clusterCost, s.ledger.View(),
-		WithNodeSource(func(*state.Cluster) state.StateNodes { return snapshot.Nodes() })).Build(ctx, ScopeFor(types.LaneFast, p))
+	// The method's candidates were evaluated at its snapshot's fixed now, possibly well before this method ran (one
+	// snapshot serves the pass); the pipeline's are evaluated at the same now.
+	// The Ledger's budgets first, right after the method's were built: building the snapshot takes a while at scale.
+	ledgerBudgets := lo.MapValues(budgets, func(_ int, np string) int { return s.ledger.Budgets().Remaining(ctx, np, m.Reason()) })
+	snap, err := s.snapshotAt(ctx, p, snapshot.Nodes(), snapshot.Now())
 	if err != nil {
 		return
 	}
-	pipelineCandidates := s.compareSnapshot(ctx, p, m.Reason(), snap, candidates, budgets)
+	pipelineCandidates := s.compareSnapshot(ctx, p, m, snap, candidates, budgets, ledgerBudgets)
 	// Without candidates the method computes nothing; the snapshot level is all there is to compare.
 	if len(candidates) == 0 {
 		return
 	}
-	nodes := lo.Map(snapshot.Nodes(), func(n *state.StateNode, _ int) *state.StateNode { return n.DeepCopy() })
+	// The method's simulations read live cluster state when it computes, which is now (its candidates come from the
+	// pass's snapshot, possibly built well before: one snapshot serves several methods, and earlier methods may have
+	// started commands since). The shadow's simulations run on a copy of the live nodes taken now, so the commands the
+	// disruption controller starts meanwhile change nothing they see (KWOK soak: on the snapshot's nodes the shadow
+	// planned "delete X" where the method, seeing those starts, planned "replace X").
+	nodes := s.cluster.DeepCopyNodes()
 	in := PlanInput{Candidates: pipelineCandidates, Budgets: mapBudgets(lo.Assign(budgets)), Reserved: s.ledger.View(), Snapshot: snap,
 		Now: snap.BuiltAt, Synced: s.cluster.Synced(ctx)}
 	job := &shadowJob{legacy: make(chan *[]disruption.Command, 1)}
@@ -290,35 +298,110 @@ func (s *Shadow) run(ctx context.Context, name string, p Planner, in PlanInput, 
 	}
 	s.agree(name, false)
 	detail := fmt.Sprintf("the disruption controller computed %s; the pipeline planned %s", passSignature(*legacy, cmdSignature), passSignature(planned, cmdSignature))
-	// The recheck simulates on fresh state, not on the copy.
-	cause := s.recheck(context.WithValue(ctx, simNodesKey{}, nil), s.methods[name], p)
+	cause := s.recheck(ctx, s.methods[name], p)
 	if ctx.Err() == nil {
 		s.mismatch(shadowReference, name, kindCommands, cause, detail)
 	}
 }
 
 // compareSnapshot compares the planner's candidates and the Ledger's budgets with the method's, and returns the
-// planner's candidates. budgets is nil for a method without candidates.
-func (s *Shadow) compareSnapshot(ctx context.Context, p Planner, reason v1.DisruptionReason, snap *Snapshot, candidates []*disruption.Candidate,
-	budgets map[string]int,
+// planner's candidates. budgets is nil for a method without candidates; ledgerBudgets are the Ledger's for its NodePools. A difference is rechecked on fresh state (see
+// recheckCandidates, recheckBudget): race if the recheck agrees, logic otherwise.
+func (s *Shadow) compareSnapshot(ctx context.Context, p Planner, m disruption.Method, snap *Snapshot, candidates []*disruption.Candidate,
+	budgets, ledgerBudgets map[string]int,
 ) []*disruption.Candidate {
 	ShadowComparisonsTotal.Inc(map[string]string{ShadowLevelDim.Name: shadowSnapshot, PlannerDim.Name: p.Name()})
 	pipelineCandidates := snap.CandidatesFor(ctx, p)
-	want := sets.New(lo.Map(candidates, func(c *disruption.Candidate, _ int) string { return c.ProviderID() })...)
-	got := sets.New(lo.Map(pipelineCandidates, func(c *disruption.Candidate, _ int) string { return c.ProviderID() })...)
-	// The pipeline doesn't disrupt a node an in-flight command moves pods onto (R72); the disruption controller may.
-	missing := want.Difference(got).Difference(s.queue.InFlightDestinations())
-	if extra := got.Difference(want); missing.Len() > 0 || extra.Len() > 0 {
-		s.mismatch(shadowSnapshot, p.Name(), kindCandidates, causeLogic, fmt.Sprintf("candidates only the disruption controller has %v, only the pipeline has %v",
-			sets.List(missing), sets.List(extra)))
+	var rechecks []func()
+	if missing, extra := s.candidateDiff(candidates, pipelineCandidates); missing.Len() > 0 || extra.Len() > 0 {
+		detail := fmt.Sprintf("candidates only the disruption controller has %v, only the pipeline has %v", sets.List(missing), sets.List(extra))
+		rechecks = append(rechecks, func() { s.mismatch(shadowSnapshot, p.Name(), kindCandidates, s.recheckCandidates(ctx, p, m), detail) })
 	}
 	for np, n := range budgets {
-		if got := s.ledger.Budgets().Remaining(ctx, np, reason); got != n {
-			s.mismatch(shadowSnapshot, p.Name(), kindBudget, causeLogic, fmt.Sprintf("nodepool %s: %d nodes may be disrupted for %s, the pipeline says %d", np, n, reason, got))
+		if got := ledgerBudgets[np]; got != n {
+			detail := fmt.Sprintf("nodepool %s: %d nodes may be disrupted for %s, the pipeline says %d", np, n, m.Reason(), got)
+			rechecks = append(rechecks, func() {
+				s.mismatch(shadowSnapshot, p.Name(), kindBudget, s.recheckBudget(ctx, snap.NodePools, np, m.Reason()), detail)
+			})
 		}
+	}
+	if len(rechecks) > 0 {
+		// Off the disruption controller's path, like the reference level's recheck.
+		s.jobs.Add(1)
+		go func() {
+			defer s.jobs.Done()
+			for _, r := range rechecks {
+				if ctx.Err() != nil {
+					return
+				}
+				r()
+			}
+		}()
 	}
 	return pipelineCandidates
 }
+
+// candidateDiff is what only the method's candidates have, except nodes in-flight commands move pods onto (the
+// pipeline doesn't disrupt those, R72; the disruption controller may), and what only the pipeline's have.
+func (s *Shadow) candidateDiff(legacy, pipeline []*disruption.Candidate) (missing, extra sets.Set[string]) {
+	want := sets.New(lo.Map(legacy, func(c *disruption.Candidate, _ int) string { return c.ProviderID() })...)
+	got := sets.New(lo.Map(pipeline, func(c *disruption.Candidate, _ int) string { return c.ProviderID() })...)
+	return want.Difference(got).Difference(s.queue.InFlightDestinations()), got.Difference(want)
+}
+
+// snapshotAt builds the planner's snapshot on nodes, evaluated at now.
+func (s *Shadow) snapshotAt(ctx context.Context, p Planner, nodes state.StateNodes, now time.Time) (*Snapshot, error) {
+	return NewSnapshotBuilder(s.kubeClient, s.cluster, fixedClock{Clock: s.clock, now: now}, s.cloudProvider, s.queue, s.clusterCost, s.ledger.View(),
+		WithNodeSource(func(*state.Cluster) state.StateNodes { return nodes })).Build(ctx, ScopeFor(types.LaneFast, p))
+}
+
+// recheckCandidates computes the method's candidates (the shadow's copy of it) and the planner's back to back, on one
+// fresh copy of the nodes at one now: race if they agree (the state changed between the method's snapshot and the
+// comparison: pods bound or nominated, PDBs, NodePools), logic otherwise.
+func (s *Shadow) recheckCandidates(ctx context.Context, p Planner, m disruption.Method) string {
+	method, ok := s.methods[p.Name()]
+	if !ok {
+		method = m
+	}
+	cs, err := disruption.NewCandidateSnapshotFromNodes(ctx, s.cluster.DeepCopyNodes, s.kubeClient, discardRecorder{}, s.clock, s.cloudProvider, s.queue)
+	if err != nil {
+		return causeLogic
+	}
+	legacy := lo.Filter(cs.Candidates(ctx, method.Class()), func(c *disruption.Candidate, _ int) bool { return method.ShouldDisrupt(ctx, c) })
+	snap, err := s.snapshotAt(ctx, p, cs.Nodes(), cs.Now())
+	if err != nil {
+		return causeLogic
+	}
+	if missing, extra := s.candidateDiff(legacy, snap.CandidatesFor(ctx, p)); missing.Len() > 0 || extra.Len() > 0 {
+		return causeLogic
+	}
+	return causeRace
+}
+
+// recheckBudget computes the disruption controller's budget for nodePool (NodePoolStats and NodePoolBudgetMap, as
+// BuildDisruptionBudgetMapping does, without its metrics and events) and the Ledger's back to back on fresh state: race
+// if they agree (a disruption started or finished, or a node initialized, in between), logic otherwise.
+func (s *Shadow) recheckBudget(ctx context.Context, nodePools map[string]*v1.NodePool, nodePool string, reason v1.DisruptionReason) string {
+	np, ok := nodePools[nodePool]
+	if !ok {
+		return causeLogic
+	}
+	numNodes, disrupting := disruption.NodePoolStats(s.cluster, reason)
+	want := disruption.NodePoolBudgetMap(ctx, s.clock, map[string]*v1.NodePool{nodePool: np}, numNodes, disrupting, reason)[nodePool]
+	if s.ledger.Budgets().Remaining(ctx, nodePool, reason) != want {
+		return causeLogic
+	}
+	return causeRace
+}
+
+// fixedClock is a clock whose now is fixed.
+type fixedClock struct {
+	clock.Clock
+	now time.Time
+}
+
+func (c fixedClock) Now() time.Time                  { return c.now }
+func (c fixedClock) Since(t time.Time) time.Duration { return c.now.Sub(t) }
 
 // plan plans once with in.
 func (s *Shadow) plan(ctx context.Context, p Planner, in PlanInput) ([]disruption.Command, error) {
@@ -341,7 +424,8 @@ type legacyCore interface {
 	LegacyOptions() disruption.CoreOptions
 }
 
-// recheck runs the shadow's copy of the method's core and the planner back to back on fresh state: race if they agree.
+// recheck runs the shadow's copy of the method's core and the planner back to back on one fresh copy of the nodes: race
+// if they agree.
 // It uses only the shadow's own objects: the method the planner plans with, a simulator without pending-pod side
 // effects, a discarding recorder, an evaluator without metrics and the private Ledger's budgets.
 func (s *Shadow) recheck(ctx context.Context, m disruption.Method, p Planner) string {
@@ -349,7 +433,11 @@ func (s *Shadow) recheck(ctx context.Context, m disruption.Method, p Planner) st
 	if _, static := m.(*disruption.StaticDrift); !ok || static {
 		return causeLogic
 	}
-	snap, err := NewSnapshotBuilder(s.kubeClient, s.cluster, s.clock, s.cloudProvider, s.queue, s.clusterCost, s.ledger.View()).Build(ctx, ScopeFor(types.LaneFast, p))
+	// One fresh copy of the nodes at one now for both: the core's and the planner's simulations see the same nodes,
+	// whatever the disruption controller starts while they run.
+	fresh := s.cluster.DeepCopyNodes()
+	ctx = withSimNodes(ctx, fresh)
+	snap, err := s.snapshotAt(ctx, p, fresh, s.clock.Now())
 	if err != nil {
 		return causeLogic
 	}

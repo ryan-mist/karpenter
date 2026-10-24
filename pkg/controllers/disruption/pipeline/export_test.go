@@ -96,3 +96,9 @@ func Fairness(p Planner) *PoolFairness { return p.(*batchPlanner).fair }
 func SetCompute(p Planner, f func(ctx context.Context, budgets map[string]int, opts disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error)) {
 	p.(*batchPlanner).compute = f
 }
+
+// SimNodes are the nodes the shadow's simulations run on in ctx, if set.
+func SimNodes(ctx context.Context) state.StateNodes {
+	nodes, _ := ctx.Value(simNodesKey{}).(state.StateNodes)
+	return nodes
+}
