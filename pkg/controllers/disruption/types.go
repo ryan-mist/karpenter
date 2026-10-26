@@ -258,6 +258,12 @@ type Command struct {
 
 	CreationTimestamp time.Time
 	ID                uuid.UUID
+	// BatchID is shared by the commands planned from one joint simulation, and zero for a command planned alone.
+	BatchID uuid.UUID
+	// Dependencies are providerIDs of nodes that aren't initialized yet (in-flight replacements of other commands) to
+	// which the command schedules pods of its candidates. The candidates may be deleted only once every one of them is
+	// initialized, as for Replacements. Empty for every command the disruption controller plans.
+	Dependencies []string
 
 	Results             pscheduling.Results
 	Candidates          []*Candidate
