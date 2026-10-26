@@ -68,6 +68,10 @@ func FootprintOf(cmd disruption.Command, computedAt uint64) types.Footprint {
 			fp.Destinations.Insert(n.ProviderID())
 		}
 	}
+	if len(cmd.Dependencies) > 0 {
+		fp.Dependencies = sets.New(cmd.Dependencies...)
+		fp.Destinations = fp.Destinations.Union(fp.Dependencies)
+	}
 	// The command's replacements are its new NodeClaims (a core has already dropped the ones that aren't its own).
 	for _, r := range cmd.Replacements {
 		if fp.LimitCost == nil {

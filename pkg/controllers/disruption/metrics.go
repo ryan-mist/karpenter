@@ -263,6 +263,28 @@ var (
 		[]opmetrics.Label{},
 		opmetrics.Alpha,
 	)
+	QueueCommandsWaitingOnDependencies = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "queue_commands_waiting_on_dependencies",
+			Help:      "Number of disruption commands in the orchestration queue whose pods were simulated onto nodes that aren't initialized yet, and that are waiting for them before deleting their candidates.",
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+	QueueDependencyFailuresTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "queue_dependency_failures_total",
+			Help:      "Number of disruption commands that failed because a node their pods were simulated onto was deleted, or didn't initialize before the command timed out. Labeled by the decision, the disruption reason, the consolidation type and the cause.",
+		},
+		[]opmetrics.Label{DecisionDim, metrics.DisruptionReason, ConsolidationType, DependencyFailureCause},
+		opmetrics.Alpha,
+	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -402,6 +424,7 @@ var (
 const (
 	conditionLabel = "condition"
 	imageIDLabel   = "image_id"
+	causeLabel     = "cause"
 )
 
 var (
@@ -412,5 +435,18 @@ var (
 	ImageID = opmetrics.Label{
 		Name: imageIDLabel,
 		Help: "The image ID of the node that was disrupted.",
+	}
+	DependencyFailureCauseDeleted = opmetrics.Value{
+		Name: "deleted",
+		Help: "The dependency's NodeClaim was deleted (launch failure, registration or initialization TTL) or is being deleted.",
+	}
+	DependencyFailureCauseTimeout = opmetrics.Value{
+		Name: "timeout",
+		Help: "The dependency didn't initialize before the command timed out.",
+	}
+	DependencyFailureCause = opmetrics.Label{
+		Name:   causeLabel,
+		Help:   "Why a command's dependency failed.",
+		Values: []opmetrics.Value{DependencyFailureCauseDeleted, DependencyFailureCauseTimeout},
 	}
 )

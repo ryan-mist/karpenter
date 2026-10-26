@@ -30,6 +30,8 @@ const (
 	SameCandidate Conflict = "same_candidate"
 	// RemovesDestination: a disrupts a node b moves pods onto. A re-simulation of a can't see the pods b has yet to move.
 	RemovesDestination Conflict = "removes_destination"
+	// RemovesDependency: a disrupts a node that b waits on before deleting its candidates (decision #16).
+	RemovesDependency Conflict = "removes_dependency"
 )
 
 // Coupling is a relation between two plans under which one plan's simulation may be invalid once the other started.
@@ -68,6 +70,9 @@ func Relate(a, b types.Footprint) Relation {
 	}
 	if intersects(a.Removed, b.Destinations) {
 		r.Hard = append(r.Hard, RemovesDestination)
+	}
+	if intersects(a.Removed, b.Dependencies) {
+		r.Hard = append(r.Hard, RemovesDependency)
 	}
 	if intersects(a.Destinations, b.Removed) {
 		r.Coupled = append(r.Coupled, DestinationRemoved)

@@ -89,7 +89,8 @@ func (s *CandidateSnapshot) Explain(ctx context.Context, providerID string, disr
 	return nil, false
 }
 
-// InFlightDestinations are the existing nodes (providerIDs) that the queue's commands are moving pods onto.
+// InFlightDestinations are the existing nodes (providerIDs) that the queue's commands are moving pods onto, their
+// dependencies included.
 func (q *Queue) InFlightDestinations() sets.Set[string] {
 	q.RLock()
 	defer q.RUnlock()
@@ -100,6 +101,8 @@ func (q *Queue) InFlightDestinations() sets.Set[string] {
 				out.Insert(n.ProviderID())
 			}
 		}
+		// Dependencies are such destinations too; they are listed in case a command's results were trimmed.
+		out.Insert(cmd.Dependencies...)
 	}
 	return out
 }

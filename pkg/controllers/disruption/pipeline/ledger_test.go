@@ -224,6 +224,22 @@ var _ = Describe("Ledger", func() {
 			))).To(Equal([]types.RejectReason{types.ReasonConflict, types.ReasonConflict}))
 			Expect(l.View().InFlightDestinations().UnsortedList()).To(ConsistOf(ids[3]))
 		})
+		It("never gives another plan a node that a reserved plan or a started command depends on (decision #16)", func() {
+			// A reserved plan whose pods were simulated onto ids[1], which wasn't initialized.
+			p := budgetPlan(w.nodePool.Name, v1.DisruptionReasonDrifted, ids[0])
+			p.Footprint = pipeline.FootprintOf(disruption.Command{Dependencies: []string{ids[1]}}, l.Version())
+			p.Footprint.Removed, p.Footprint.BudgetNodes = sets.New(ids[0]), map[string]sets.Set[string]{w.nodePool.Name: sets.New(ids[0])}
+			Expect(l.Reserve(ctx, p)).To(Equal([]error{nil}))
+			// A started command that depends on ids[3] (its results don't list it).
+			queue.ProviderIDToCommand[ids[2]] = &disruption.Command{Dependencies: []string{ids[3]}}
+			Expect(l.View().InFlightDestinations().UnsortedList()).To(ConsistOf(ids[3]))
+			// Repair is the method that disrupts uninitialized nodes; any planner is rejected the same way.
+			Expect(reasonsOf(l.Reserve(ctx,
+				budgetPlan(w.nodePool.Name, v1.DisruptionReasonUnhealthy, ids[1]),
+				budgetPlan(w.nodePool.Name, v1.DisruptionReasonEmpty, ids[3]),
+				budgetPlan(w.nodePool.Name, v1.DisruptionReasonEmpty, ids[5]),
+			))).To(Equal([]types.RejectReason{types.ReasonConflict, types.ReasonConflict, ""}))
+		})
 		It("releases a rejected plan, and keeps a started plan's footprint for coupling", func() {
 			a, b := budgetPlan(w.nodePool.Name, v1.DisruptionReasonDrifted, ids[0]), budgetPlan(w.nodePool.Name, v1.DisruptionReasonDrifted, ids[1])
 			v0 := l.Version()
