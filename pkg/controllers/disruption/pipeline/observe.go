@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
@@ -43,6 +44,8 @@ import (
 // dedupe applies as today). A planner's explanations of why it did nothing for a NodePool become NodePool events,
 // published when the explanation changes.
 type metricsObserver struct {
+	// logger logs the planners' rounds and admission's batches at V(1).
+	logger     logr.Logger
 	clock      clock.Clock
 	kubeClient client.Client
 	recorder   events.Recorder
@@ -67,7 +70,8 @@ type metricsObserver struct {
 
 func NewMetricsObserver(clk clock.Clock, kubeClient client.Client, recorder events.Recorder, ledger Ledger, methodEvents *RoundEvents, lanes ...LaneSpec) Observer {
 	o := &metricsObserver{
-		clock: clk, kubeClient: kubeClient, recorder: recorder, ledger: ledger, methodEvents: methodEvents,
+		logger: logr.Discard(),
+		clock:  clk, kubeClient: kubeClient, recorder: recorder, ledger: ledger, methodEvents: methodEvents,
 		laneOf: map[string]types.LaneID{}, reasons: map[types.LaneID][]v1.DisruptionReason{}, planners: map[types.LaneID][]Planner{},
 		lastRound: map[types.LaneID]time.Time{}, unresolved: map[types.LaneID]int{}, explained: map[[2]string]string{},
 		roundGates: map[types.LaneID]sets.Set[types.GateReason]{},
@@ -206,6 +210,18 @@ func (o *metricsObserver) Gated(lane types.LaneID, planner string, gate types.Ga
 
 func (o *metricsObserver) Planned(_ types.LaneID, p Planner, candidates int, out PlanOutput, took time.Duration) {
 	PlannerDurationSeconds.Observe(took.Seconds(), map[string]string{plannerLabel: p.Name()})
+	if candidates > 0 {
+		planned := lo.SumBy(out.Plans, func(plan *Plan) int { return len(plan.Candidates) })
+		deferred := lo.CountBy(out.Verdicts, func(v types.Verdict) bool { return v.Reason == types.ReasonDeferred })
+		for stage, n := range map[string]int{stageEligible.Name: candidates, stagePlanned.Name: planned, stageDeferred.Name: deferred} {
+			PlannedCandidates.Observe(float64(n), map[string]string{PlannerDim.Name: p.Name(), PlanStageDim.Name: stage})
+		}
+		if len(out.Plans) > 0 {
+			PlansPerRound.Observe(float64(len(out.Plans)), map[string]string{PlannerDim.Name: p.Name()})
+		}
+		o.logger.V(1).Info("disruption pipeline planned candidates", "planner", p.Name(), "reason", p.Reason(),
+			"planned", planned, "eligible", candidates, "plans", len(out.Plans), "deferred", deferred, "duration", took.Truncate(time.Millisecond))
+	}
 	// The disruption controller's method metrics, which keep their meaning: when the method last ran, and its
 	// eligible nodes.
 	labels := map[string]string{metrics.ReasonLabel: strings.ToLower(string(p.Reason())), disruption.ConsolidationTypeLabel: consolidationType(p)}
@@ -224,6 +240,20 @@ func (o *metricsObserver) Planned(_ types.LaneID, p Planner, candidates int, out
 	}
 }
 
+// batchResult is what admission did with a batch.
+func batchResult(group []*Pending, r AdmitResult) string {
+	switch {
+	case len(r.Start) > 0:
+		return batchStarted.Name
+	case len(r.Wait) > 0:
+		return batchWaited.Name
+	case len(r.Dropped) == len(group):
+		return batchDropped.Name
+	default:
+		return batchRejected.Name
+	}
+}
+
 func consolidationType(p any) string {
 	if ct, ok := p.(interface{ ConsolidationType() string }); ok {
 		return ct.ConsolidationType()
@@ -239,6 +269,14 @@ func (o *metricsObserver) Admitted(group []*Pending, r AdmitResult, took time.Du
 	}
 	for _, cause := range r.Resims {
 		AdmissionResimsTotal.Inc(map[string]string{plannerLabel: planner, causeLabel: string(cause)})
+	}
+	result := batchResult(group, r)
+	AdmittedBatchesTotal.Inc(map[string]string{PlannerDim.Name: planner, BatchResultDim.Name: result})
+	if result != batchWaited.Name {
+		reasons := lo.CountValues(append(lo.Values(r.Rejected), lo.Values(r.Dropped)...))
+		o.logger.V(1).Info("disruption pipeline admitted batch", "planner", planner, "result", result, "plans", len(group),
+			"started-plans", len(r.Start), "started-candidates", lo.SumBy(r.Start, func(p *Plan) int { return len(p.Candidates) }),
+			"rejected-or-dropped", reasons, "resims", r.Resims, "duration", took.Truncate(time.Millisecond))
 	}
 	// The re-validation's events (why a candidate is now blocked), as the disruption controller's validation publishes.
 	for _, ev := range r.Events {
@@ -287,5 +325,31 @@ func (o *metricsObserver) CommitStepFinished(_ CommitStepResult, synced bool, _ 
 	case synced && !o.unsyncedSince.IsZero():
 		disruption.ClusterStateGateDurationSeconds.Observe(o.clock.Since(o.unsyncedSince).Seconds(), nil)
 		o.unsyncedSince = time.Time{}
+	}
+}
+
+// recordJoint records how a planner's joint simulation went, if one ran: how it ended, its candidates (first, accepted,
+// and deferred to a later round), why candidates were dropped, whether it was planned again in chunks, and how long the
+// accepting simulation took.
+func recordJoint(planner string, res disruption.CoreResult) {
+	bo := res.Batch
+	if bo == nil {
+		return
+	}
+	labels := map[string]string{PlannerDim.Name: planner}
+	result := lo.Ternary(bo.TimedOut, jointTimedOut, lo.Ternary(len(bo.Accepted) > 0, jointAccepted, jointNone)).Name
+	JointSimulationsTotal.Inc(lo.Assign(labels, map[string]string{JointResultDim.Name: result}))
+	JointCandidates.Observe(float64(bo.Size), lo.Assign(labels, map[string]string{JointStageDim.Name: jointFirst.Name}))
+	for _, r := range bo.Dropped {
+		JointDroppedCandidatesTotal.Inc(lo.Assign(labels, map[string]string{JointDropDim.Name: string(r)}))
+	}
+	if len(bo.Accepted) == 0 {
+		return
+	}
+	JointCandidates.Observe(float64(len(bo.Accepted)), lo.Assign(labels, map[string]string{JointStageDim.Name: jointAccepted.Name}))
+	JointCandidates.Observe(float64(len(res.Deferred)), lo.Assign(labels, map[string]string{JointStageDim.Name: stageDeferred.Name}))
+	JointSimulationDurationSeconds.Observe(bo.Outcome.Took.Seconds(), labels)
+	if res.Chunked {
+		JointChunkedTotal.Inc(labels)
 	}
 }

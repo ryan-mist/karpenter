@@ -81,6 +81,41 @@ var _ = Describe("Observer", func() {
 		ExpectMetricGaugeValue(pipeline.LedgerReservedNodes, 0, map[string]string{"nodepool": w.nodePool.Name})
 		ExpectMetricGaugeValue(disruption.NodePoolNodesConsumingBudgets, 2, map[string]string{"nodepool": w.nodePool.Name, "reason": "empty"})
 	})
+	It("records how far a round's candidates got, and what admission did with each batch", func() {
+		pipeline.PlannedCandidates.Reset()
+		pipeline.PlansPerRound.Reset()
+		pipeline.AdmittedBatchesTotal.Reset()
+		ExpectSingletonReconciled(ctx, c)
+		for stage, sum := range map[string]float64{"eligible": 2, "planned": 2, "deferred": 0} {
+			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_pipeline_planned_candidates", 1, map[string]string{"planner": "emptiness", "stage": stage})
+			m, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_pipeline_planned_candidates", map[string]string{"planner": "emptiness", "stage": stage})
+			Expect(ok).To(BeTrue())
+			Expect(m.GetHistogram().GetSampleSum()).To(Equal(sum))
+		}
+		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_pipeline_plans_per_round", 1, map[string]string{"planner": "emptiness"})
+		ExpectMetricCounterValue(pipeline.AdmittedBatchesTotal, 1, map[string]string{"planner": "emptiness", "result": "started"})
+	})
+	It("records a planner's joint simulation", func() {
+		for _, m := range []interface{ Reset() }{pipeline.JointSimulationsTotal, pipeline.JointChunkedTotal, pipeline.JointCandidates,
+			pipeline.JointDroppedCandidatesTotal, pipeline.JointSimulationDurationSeconds} {
+			m.Reset()
+		}
+		pipeline.RecordJoint("drift", disruption.CoreResult{})
+		pipeline.RecordJoint("drift", disruption.CoreResult{Batch: &disruption.BatchOutcome{Size: 8, TimedOut: true,
+			Dropped: map[string]disruption.DropReason{"a": disruption.DropUninitializedDestination}}})
+		pipeline.RecordJoint("drift", disruption.CoreResult{Chunked: true, Deferred: []string{"x", "y"}, Batch: &disruption.BatchOutcome{Size: 8,
+			Accepted: make([]*disruption.Candidate, 6), Outcome: disruption.Outcome{Took: time.Second}}})
+		ExpectMetricCounterValue(pipeline.JointSimulationsTotal, 1, map[string]string{"planner": "drift", "result": "timed_out"})
+		ExpectMetricCounterValue(pipeline.JointSimulationsTotal, 1, map[string]string{"planner": "drift", "result": "accepted"})
+		ExpectMetricCounterValue(pipeline.JointDroppedCandidatesTotal, 1, map[string]string{"planner": "drift", "drop_reason": "uninitialized_destination"})
+		ExpectMetricCounterValue(pipeline.JointChunkedTotal, 1, map[string]string{"planner": "drift"})
+		for stage, sum := range map[string]float64{"first": 16, "accepted": 6, "deferred": 2} {
+			m, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_pipeline_joint_simulation_candidates", map[string]string{"planner": "drift", "stage": stage})
+			Expect(ok).To(BeTrue())
+			Expect(m.GetHistogram().GetSampleSum()).To(Equal(sum))
+		}
+		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_pipeline_joint_simulation_duration_seconds", 1, map[string]string{"planner": "drift"})
+	})
 	It("counts gated rounds and publishes the budget event for a NodePool that allows no disruption", func() {
 		w.nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
 		ExpectApplied(ctx, env.Client, w.nodePool)
