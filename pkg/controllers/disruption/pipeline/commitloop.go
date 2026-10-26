@@ -36,15 +36,16 @@ import (
 // commit step at a time. Every write the pipeline makes happens in a step: starts, and the sweep of leftover
 // disruption taints and conditions, which never runs while a start does.
 type commitLoop struct {
-	ledger   Ledger
-	admitter Admitter
-	starter  Starter
-	sweeper  *disruption.MarkSweeper
-	queue    *disruption.Queue
-	cluster  Synced
-	clock    clock.Clock
-	scorer   Scorer
-	observer Observer
+	ledger    Ledger
+	admitter  Admitter
+	starter   Starter
+	sweeper   *disruption.MarkSweeper
+	queue     *disruption.Queue
+	cluster   Synced
+	clock     clock.Clock
+	scorer    Scorer
+	observer  Observer
+	resolvers map[string]Resolver
 
 	// step serializes commit steps.
 	step sync.Mutex
@@ -80,8 +81,16 @@ func (s *submission) resolve(r Resolution) {
 	}
 }
 
-// ExecutorDeps are what the commit loop needs. Observer may be nil.
+// Resolver is implemented by a planner that wants to know how its plans ended (drift serves a NodePool when one of its
+// plans starts).
+type Resolver interface {
+	Resolved(p *Plan, r Resolution)
+}
+
+// ExecutorDeps are what the commit loop needs. Observer and Planners may be nil.
 type ExecutorDeps struct {
+	// Planners get their plans' resolutions, if they are Resolvers.
+	Planners []Planner
 	Ledger   Ledger
 	Admitter Admitter
 	Starter  Starter
@@ -106,6 +115,8 @@ func NewExecutor(deps ExecutorDeps) Executor {
 		observer:   lo.Ternary[Observer](deps.Observer != nil, deps.Observer, NopObserver{}),
 		unresolved: map[string]int{},
 		submitted:  make(chan struct{}, 1),
+		resolvers: lo.SliceToMap(lo.Filter(deps.Planners, func(p Planner, _ int) bool { _, ok := p.(Resolver); return ok }),
+			func(p Planner) (string, Resolver) { return p.Name(), p.(Resolver) }),
 	}
 }
 
@@ -162,6 +173,9 @@ func (e *commitLoop) resolveLocked(sub *submission, p *Plan, r Resolution, count
 		e.unresolved[p.Planner]--
 	}
 	e.observer.Resolved(p, r, e.clock.Since(submittedAt))
+	if rv, ok := e.resolvers[p.Planner]; ok {
+		rv.Resolved(p, r)
+	}
 	sub.resolve(r)
 }
 

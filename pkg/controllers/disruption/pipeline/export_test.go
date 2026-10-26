@@ -16,7 +16,13 @@ limitations under the License.
 
 package pipeline
 
-import "sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
+import (
+	"k8s.io/utils/clock"
+
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+)
 
 // TriggerFor is the trigger the controller runs the lane with.
 func TriggerFor(c *Controller, lane types.LaneID) Trigger {
@@ -30,3 +36,23 @@ func TriggerFor(c *Controller, lane types.LaneID) Trigger {
 
 // NewWakeObserver is the observer that publishes the pipeline's own wake-ups.
 func NewWakeObserver(hub *WakeHub, lanes ...LaneSpec) Observer { return newWakeObserver(hub, lanes...) }
+
+// PoolFairness exposes drift's NodePool fairness for tests.
+type PoolFairness = poolFairness
+
+func NewPoolFairness(clk clock.Clock, jitter func() float64) *PoolFairness {
+	f := newPoolFairness(clk)
+	f.jitter = jitter
+	return f
+}
+
+func (f *PoolFairness) Eligible(cs []*disruption.Candidate) []*disruption.Candidate {
+	return f.eligible(cs)
+}
+func (f *PoolFairness) Order(cs []*disruption.Candidate) {
+	f.order(func([]*disruption.Candidate) {})(cs)
+}
+func (f *PoolFairness) Started(pools ...string)           { f.started(pools...) }
+func (f *PoolFairness) Finished(ok bool, pools ...string) { f.finished(ok, pools...) }
+
+func NewStateDedup(cluster *state.Cluster) disruption.Dedup { return &stateDedup{cluster: cluster} }
