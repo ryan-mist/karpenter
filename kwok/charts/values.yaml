@@ -169,4 +169,7 @@ settings:
     # -- predictionEnabled is ALPHA and is disabled by default.
     # Setting this to true will enable Karpenter to size nodes using VPA predictions during provisioning and disruption.
     predictionEnabled: false
+    # -- disruptionPipeline is ALPHA and is disabled by default.
+    # Setting this to true will make the disruption pipeline disrupt nodes in place of the disruption controller.
+    disruptionPipeline: false
 
