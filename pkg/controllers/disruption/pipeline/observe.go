@@ -47,9 +47,11 @@ type metricsObserver struct {
 	kubeClient client.Client
 	recorder   events.Recorder
 	ledger     Ledger
-	laneOf     map[string]types.LaneID
-	reasons    map[types.LaneID][]v1.DisruptionReason
-	planners   map[types.LaneID][]Planner
+	// methodEvents are what the planners' methods published (filters, validators); published with each round.
+	methodEvents *RoundEvents
+	laneOf       map[string]types.LaneID
+	reasons      map[types.LaneID][]v1.DisruptionReason
+	planners     map[types.LaneID][]Planner
 
 	mu        sync.Mutex
 	lastRound map[types.LaneID]time.Time
@@ -63,9 +65,9 @@ type metricsObserver struct {
 	explained map[[2]string]string
 }
 
-func NewMetricsObserver(clk clock.Clock, kubeClient client.Client, recorder events.Recorder, ledger Ledger, lanes ...LaneSpec) Observer {
+func NewMetricsObserver(clk clock.Clock, kubeClient client.Client, recorder events.Recorder, ledger Ledger, methodEvents *RoundEvents, lanes ...LaneSpec) Observer {
 	o := &metricsObserver{
-		clock: clk, kubeClient: kubeClient, recorder: recorder, ledger: ledger,
+		clock: clk, kubeClient: kubeClient, recorder: recorder, ledger: ledger, methodEvents: methodEvents,
 		laneOf: map[string]types.LaneID{}, reasons: map[types.LaneID][]v1.DisruptionReason{}, planners: map[types.LaneID][]Planner{},
 		lastRound: map[types.LaneID]time.Time{}, unresolved: map[types.LaneID]int{}, explained: map[[2]string]string{},
 		roundGates: map[types.LaneID]sets.Set[types.GateReason]{},
@@ -99,6 +101,7 @@ func (o *metricsObserver) RoundFinished(ctx context.Context, lane types.LaneID, 
 		o.recorder.Publish(ev.Events()...)
 		explanations = append(explanations, ev.NoActions()...)
 	}
+	o.publishMethodEvents()
 	o.explain(ctx, explanations)
 	// Each gate the round hit (the lane's, or one or more of its planners') accounts for the round's interval once.
 	if r.Gated != types.GateNone {
@@ -241,12 +244,12 @@ func (o *metricsObserver) Admitted(group []*Pending, r AdmitResult, took time.Du
 	for _, ev := range r.Events {
 		o.recorder.Publish(ev.Events()...)
 	}
-	// Consolidation's validation failures keep their counter, counted per candidate as the disruption controller's
-	// validation counts them.
-	for _, p := range group {
-		if _, rejected := r.Rejected[p.Plan.ID]; rejected && p.Plan.Method != nil && p.Plan.Method.ConsolidationType() != "" {
-			disruption.FailedValidationsTotal.Add(float64(len(p.Plan.Candidates)), map[string]string{disruption.ConsolidationTypeLabel: p.Plan.Method.ConsolidationType()})
-		}
+	o.publishMethodEvents()
+}
+
+func (o *metricsObserver) publishMethodEvents() {
+	if o.methodEvents != nil {
+		o.recorder.Publish(o.methodEvents.Drain()...)
 	}
 }
 
