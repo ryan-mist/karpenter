@@ -34,6 +34,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
@@ -49,6 +50,19 @@ func disruptionMetrics() map[string]string {
 		}
 	}
 	return out
+}
+
+// simNodesRecorder records the nodes its planner's first plan's simulations run on.
+type simNodesRecorder struct {
+	pipeline.Planner
+	nodes state.StateNodes
+}
+
+func (p *simNodesRecorder) Plan(ctx context.Context, in pipeline.PlanInput) (pipeline.PlanOutput, error) {
+	if p.nodes == nil {
+		p.nodes = pipeline.SimNodes(ctx)
+	}
+	return p.Planner.Plan(ctx, in)
 }
 
 // emptyFirst plans nothing for its first n calls, then as its planner does.
@@ -70,6 +84,7 @@ var _ = Describe("Shadow", func() {
 	var legacy *disruption.Controller
 	var writes atomic.Int64
 	var logged []string
+	var w *world
 	drift := map[string]string{"planner": "drift"}
 	BeforeEach(func() {
 		for _, m := range []interface{ Reset() }{pipeline.ShadowComparisonsTotal, pipeline.ShadowMismatchesTotal, pipeline.ShadowAgreementRatio} {
@@ -77,7 +92,7 @@ var _ = Describe("Shadow", func() {
 		}
 		// More drifted nodes than any spec has passes, so a recheck on fresh state always finds one to plan, whatever
 		// the disruption controller started meanwhile.
-		w := newWorld(5, 0, 1, 2, 3, 4)
+		w = newWorld(5, 0, 1, 2, 3, 4)
 		w.only(v1.ConditionTypeDrifted)
 		writes.Store(0)
 		logged = nil
@@ -148,6 +163,66 @@ var _ = Describe("Shadow", func() {
 		Expect(recorder.Events()).To(BeEmpty())
 		Expect(disruptionMetrics()).To(Equal(before))
 		Expect(writes.Load()).To(BeZero())
+	})
+	Context("snapshot level", func() {
+		var driftMethod disruption.Method
+		var cs *disruption.CandidateSnapshot
+		var cands []*disruption.Candidate
+		var budgets map[string]int
+		snapshotMismatches := func(kind, cause string) float64 {
+			m, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_pipeline_shadow_mismatches_total",
+				map[string]string{"level": "snapshot", "planner": "drift", "kind": kind, "cause": cause})
+			if !ok {
+				return 0
+			}
+			return m.GetCounter().GetValue()
+		}
+		build := func() {
+			methods := disruption.NewMethods(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+			driftMethod, _ = lo.Find(methods, func(m disruption.Method) bool { _, ok := m.(*disruption.Drift); return ok })
+			var err error
+			cs, err = disruption.NewCandidateSnapshot(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, queue)
+			Expect(err).ToNot(HaveOccurred())
+			cands = lo.Filter(cs.Candidates(ctx, driftMethod.Class()), func(c *disruption.Candidate, _ int) bool { return driftMethod.ShouldDisrupt(ctx, c) })
+			budgets, err = disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, driftMethod.Reason())
+			Expect(err).ToNot(HaveOccurred())
+		}
+		compare := func(cands []*disruption.Candidate, budgets map[string]int) {
+			shadow.Computing(ctx, driftMethod, cs, cands, budgets)
+			shadow.Computed(ctx, driftMethod, nil, nil)
+			shadow.WaitIdle()
+		}
+		It("evaluates the pipeline's candidates at the method's snapshot's now", func() {
+			// A provisioning pass nominated a node: the method's snapshot excludes it; the nomination expires before
+			// the method computes (KWOK soak: ~30 nodes of one zone only the pipeline had).
+			cluster.NominateNodeForPod(ctx, w.providerIDs()[0])
+			build()
+			Expect(cands).To(HaveLen(4))
+			env.Clock.Step(time.Hour)
+			compare(cands, budgets)
+			Expect(snapshotMismatches("candidates", "logic") + snapshotMismatches("candidates", "race")).To(BeZero())
+		})
+		It("simulates on the nodes as they are when the method computes, not as its snapshot had them", func() {
+			// An earlier method of the pass started a command after the pass's snapshot was built: the method's
+			// simulations see that node deleting, so the shadow's must too.
+			build()
+			cluster.MarkForDeletion(w.providerIDs()[0])
+			rec := &simNodesRecorder{Planner: shadow.ShadowPlanner("drift")}
+			shadow.SetShadowPlanner("drift", rec)
+			compare(cands[1:], budgets)
+			n, ok := lo.Find(rec.nodes, func(n *state.StateNode) bool { return n.ProviderID() == w.providerIDs()[0] })
+			Expect(ok).To(BeTrue())
+			Expect(n.MarkedForDeletion()).To(BeTrue())
+		})
+		It("counts snapshot-level differences that a fresh recheck doesn't confirm as races", func() {
+			build()
+			Expect(cands).To(HaveLen(5))
+			// The method saw a node fewer and one more disruption allowed than the state shows now.
+			compare(cands[1:], lo.MapValues(budgets, func(n int, _ string) int { return n + 1 }))
+			Expect(snapshotMismatches("candidates", "race")).To(Equal(1.0))
+			Expect(snapshotMismatches("budget", "race")).To(Equal(1.0))
+			Expect(snapshotMismatches("candidates", "logic") + snapshotMismatches("budget", "logic")).To(BeZero())
+		})
 	})
 	It("compares nothing when no computation is sampled", func() {
 		shadow = pipeline.NewShadow(ctx, env.Clock, env.Client, prov, cloudProvider, cluster, queue, clusterCost, 0.0000001)
