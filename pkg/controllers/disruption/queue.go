@@ -31,6 +31,7 @@ import (
 	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -104,6 +105,10 @@ type Queue struct {
 	provisioner         *provisioning.Provisioner
 	// completionHooks run after a command is removed from the queue (pipeline_seams.go).
 	completionHooks []func(*Command)
+	// waitingOnDependencies are the commands with a dependency that isn't initialized yet.
+	waitingOnDependencies map[*Command]struct{}
+	// hasDependencies is whether any command has had dependencies.
+	hasDependencies bool
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
@@ -113,13 +118,14 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 	queue := &Queue{
 		// nolint:staticcheck
 		// We need to implement a deprecated interface since Command currently doesn't implement "comparable"
-		source:              make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
-		ProviderIDToCommand: map[string]*Command{},
-		kubeClient:          kubeClient,
-		recorder:            recorder,
-		cluster:             cluster,
-		clock:               clock,
-		provisioner:         provisioner,
+		source:                make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
+		ProviderIDToCommand:   map[string]*Command{},
+		waitingOnDependencies: map[*Command]struct{}{},
+		kubeClient:            kubeClient,
+		recorder:              recorder,
+		cluster:               cluster,
+		clock:                 clock,
+		provisioner:           provisioner,
 	}
 	return queue
 }
@@ -170,6 +176,14 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 			ConsolidationTypeLabel: cmd.ConsolidationType(),
 		})
+		if cause, ok := dependencyFailureCause(err, q.isWaitingOnDependencies(cmd)); ok {
+			QueueDependencyFailuresTotal.Inc(map[string]string{
+				decisionLabel:          string(cmd.Decision()),
+				metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
+				ConsolidationTypeLabel: cmd.ConsolidationType(),
+				causeLabel:             cause,
+			})
+		}
 		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 		multiErr := multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
 		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
@@ -193,7 +207,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
 		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
-			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
+			err = NewUnrecoverableError(&CommandTimeoutError{serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp))})
 		}
 	}()
 	waitErrs := make([]error, len(cmd.Replacements))
@@ -225,9 +239,18 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		}
 		cmd.Replacements[i].Initialized = true
 	}
+	// The command's pods were also simulated onto its dependencies, so they must be initialized too. A failed
+	// dependency fails the command even while replacements are still initializing.
+	dependencyErr := q.waitForDependencies(ctx, cmd)
+	if IsUnrecoverableError(dependencyErr) {
+		return dependencyErr
+	}
 	// If we have any errors, don't continue
 	if err := multierr.Combine(waitErrs...); err != nil {
 		return fmt.Errorf("waiting for replacement initialization, %w", err)
+	}
+	if dependencyErr != nil {
+		return dependencyErr
 	}
 
 	// All replacements have been provisioned.
@@ -267,6 +290,107 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// If there were any deletion failures, we should requeue.
 	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.
 	return multierr.Combine(errs...)
+}
+
+// DependencyFailedError is the unrecoverable error of a command whose dependency was deleted before it initialized.
+type DependencyFailedError struct {
+	error
+}
+
+// CommandTimeoutError is the error of a command that reached its timeout, wrapping the error it timed out with. Its
+// message is the wrapped error's.
+type CommandTimeoutError struct {
+	error
+}
+
+func (e *CommandTimeoutError) Unwrap() error { return e.error }
+
+// waitForDependencies returns nil once every dependency of the command is initialized. A dependency whose NodeClaim is
+// gone or being deleted (a launch failure, or the registration or initialization TTL) fails the command, as a deleted
+// replacement does. One that isn't initialized yet is waited for until the command times out. Dependencies aren't
+// remembered as initialized: each one is checked until the candidates are deleted.
+func (q *Queue) waitForDependencies(ctx context.Context, cmd *Command) error {
+	if len(cmd.Dependencies) == 0 {
+		return nil
+	}
+	names := q.dependencyNodeClaimNames(cmd.Dependencies)
+	waitErrs := make([]error, 0, len(cmd.Dependencies))
+	for _, providerID := range cmd.Dependencies {
+		name, ok := names[providerID]
+		if !ok {
+			return NewUnrecoverableError(&DependencyFailedError{serrors.Wrap(fmt.Errorf("dependency was deleted"), "provider-id", providerID)})
+		}
+		nodeClaim := &v1.NodeClaim{}
+		if err := q.kubeClient.Get(ctx, types.NamespacedName{Name: name}, nodeClaim); err != nil {
+			if errors.IsNotFound(err) && !q.cluster.NodeClaimExists(name) {
+				return NewUnrecoverableError(&DependencyFailedError{serrors.Wrap(fmt.Errorf("dependency was deleted, %w", err), "NodeClaim", klog.KRef("", name))})
+			}
+			waitErrs = append(waitErrs, serrors.Wrap(fmt.Errorf("getting dependency nodeclaim, %w", err), "NodeClaim", klog.KRef("", name)))
+			continue
+		}
+		if !nodeClaim.DeletionTimestamp.IsZero() {
+			return NewUnrecoverableError(&DependencyFailedError{serrors.Wrap(fmt.Errorf("dependency is being deleted"), "NodeClaim", klog.KRef("", name))})
+		}
+		if !nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() {
+			q.recorder.Publish(disruptionevents.WaitingOnReadiness(nodeClaim))
+			waitErrs = append(waitErrs, serrors.Wrap(fmt.Errorf("dependency not initialized"), "NodeClaim", klog.KRef("", name)))
+		}
+	}
+	q.Lock()
+	q.hasDependencies = true
+	if len(waitErrs) > 0 {
+		q.waitingOnDependencies[cmd] = struct{}{}
+	} else {
+		delete(q.waitingOnDependencies, cmd)
+	}
+	q.recordQueueCommandsLocked()
+	q.Unlock()
+	if err := multierr.Combine(waitErrs...); err != nil {
+		return fmt.Errorf("waiting for dependency initialization, %w", err)
+	}
+	return nil
+}
+
+// dependencyNodeClaimNames maps the providerIDs that cluster state has a NodeClaim for to its name. The dependencies
+// were in cluster state when the command was simulated, so one that is missing now was deleted.
+func (q *Queue) dependencyNodeClaimNames(providerIDs []string) map[string]string {
+	wanted := sets.New(providerIDs...)
+	names := make(map[string]string, len(providerIDs))
+	for n := range q.cluster.Nodes() {
+		if n.NodeClaim != nil && wanted.Has(n.ProviderID()) {
+			names[n.ProviderID()] = n.NodeClaim.Name
+		}
+	}
+	return names
+}
+
+func (q *Queue) isWaitingOnDependencies(cmd *Command) bool {
+	q.RLock()
+	defer q.RUnlock()
+	_, ok := q.waitingOnDependencies[cmd]
+	return ok
+}
+
+// dependencyFailureCause is the cause label of a failed command's dependency failure, if a dependency failed it: it was
+// deleted, or the command timed out while waiting for one. A command that failed for another reason (a replacement was
+// deleted, say) has no dependency failure, even if a dependency was still waiting.
+func dependencyFailureCause(err error, waiting bool) (string, bool) {
+	// UnrecoverableError doesn't unwrap, and a timeout wraps the error it timed out with in another one.
+	timedOut, levels := false, 0
+	for unrecoverable := (*UnrecoverableError)(nil); stderrors.As(err, &unrecoverable); levels++ {
+		if failed := (*DependencyFailedError)(nil); stderrors.As(unrecoverable.error, &failed) {
+			return DependencyFailureCauseDeleted.Name, true
+		}
+		if levels == 0 {
+			timedOut = stderrors.As(unrecoverable.error, new(*CommandTimeoutError))
+		}
+		err = unrecoverable.error
+	}
+	// A timeout of a command that was still waiting: it wraps a recoverable error only (no other failure).
+	if timedOut && levels == 1 && waiting {
+		return DependencyFailureCauseTimeout.Name, true
+	}
+	return "", false
 }
 
 // recordCandidateDisrupted records the per-NodeClaim and per-pod disruption metrics for a candidate the command is
@@ -534,6 +658,7 @@ func (q *Queue) CompleteCommand(cmd *Command) {
 	for _, c := range cmd.Candidates {
 		delete(q.ProviderIDToCommand, c.ProviderID())
 	}
+	delete(q.waitingOnDependencies, cmd)
 	q.recordQueueCommandsLocked()
 	hooks := q.completionHooks
 	q.Unlock()
@@ -549,6 +674,10 @@ func (q *Queue) recordQueueCommandsLocked() {
 		cmds[cmd] = struct{}{}
 	}
 	QueueCommands.Set(float64(len(cmds)), nil)
+	// Only once a command has had dependencies, so that a queue without any (gate off) exports no new series.
+	if q.hasDependencies {
+		QueueCommandsWaitingOnDependencies.Set(float64(len(q.waitingOnDependencies)), nil)
+	}
 }
 
 func (q *Queue) IsEmpty() bool {

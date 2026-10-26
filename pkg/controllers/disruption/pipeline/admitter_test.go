@@ -559,6 +559,8 @@ var _ = Describe("Relate", func() {
 		Entry("disjoint", fp([]string{"a"}, []string{"x"}), fp([]string{"b"}, []string{"y"}), nil, nil),
 		Entry("same candidate", fp([]string{"a"}, nil), fp([]string{"a"}, nil), []pipeline.Conflict{pipeline.SameCandidate}, nil),
 		Entry("a deletes b's destination", fp([]string{"a"}, nil), fp([]string{"b"}, []string{"a"}), []pipeline.Conflict{pipeline.RemovesDestination}, nil),
+		Entry("a deletes a node b depends on", fp([]string{"a"}, nil), types.Footprint{Removed: sets.New("b"), Destinations: sets.New("a"), Dependencies: sets.New("a")},
+			[]pipeline.Conflict{pipeline.RemovesDestination, pipeline.RemovesDependency}, nil),
 		Entry("b deletes a's destination", fp([]string{"a"}, []string{"b"}), fp([]string{"b"}, nil), nil, []pipeline.Coupling{pipeline.DestinationRemoved}),
 		Entry("shared destination", fp([]string{"a"}, []string{"x"}), fp([]string{"b"}, []string{"x"}), nil, []pipeline.Coupling{pipeline.SharedDestination}),
 		Entry("shared zone topology group", fp([]string{"a"}, nil, 7), fp([]string{"b"}, nil, 7), nil, []pipeline.Coupling{pipeline.SharedTopology}),

@@ -35,6 +35,10 @@ type Footprint struct {
 	Removed sets.Set[string]
 	// Destinations is the set of existing nodes (providerIDs) that the plan moves at least one pod onto.
 	Destinations sets.Set[string]
+	// Dependencies are the Destinations that weren't initialized when the plan was simulated (decision #16): the queue
+	// deletes the plan's candidates only once they are initialized. Like any destination, no plan may disrupt them
+	// while the plan is reserved or in flight.
+	Dependencies sets.Set[string]
 	// NewNodeClaims are the simulation-local IDs of new NodeClaims hosting at least one of the plan's pods. They are
 	// meaningful only within one simulation.
 	NewNodeClaims []string

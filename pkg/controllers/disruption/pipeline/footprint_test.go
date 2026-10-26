@@ -73,6 +73,12 @@ var _ = Describe("Footprint", func() {
 		Expect(fp.Removed.UnsortedList()).To(ConsistOf(ids[0], ids[1]))
 		Expect(fp.BudgetNodes).To(Equal(map[string]sets.Set[string]{w.nodePool.Name: sets.New(ids[0], ids[1])}))
 		Expect(fp.Destinations.UnsortedList()).To(ConsistOf(ids[2]))
+		Expect(fp.Dependencies).To(BeEmpty())
+		// Dependencies (decision #16) are destinations too.
+		cmd.Dependencies = []string{ids[2], ids[3]}
+		withDeps := pipeline.FootprintOf(cmd, 7)
+		Expect(withDeps.Dependencies.UnsortedList()).To(ConsistOf(ids[2], ids[3]))
+		Expect(withDeps.Destinations.UnsortedList()).To(ConsistOf(ids[2], ids[3]))
 		cost := fp.LimitCost[w.nodePool.Name]
 		Expect(lo.ToPtr(cost[corev1.ResourceCPU]).String()).To(Equal("8"))
 		Expect(lo.ToPtr(cost[resources.Node]).String()).To(Equal("1"))
