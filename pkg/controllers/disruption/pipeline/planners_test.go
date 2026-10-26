@@ -311,6 +311,31 @@ var _ = Describe("Planners", func() {
 		survivors := lo.FlatMap(submitted[:len(submitted)-1], func(p *pipeline.Plan, _ int) []string { return providerIDsOf(p.Candidates) })
 		Expect(queuedCandidates()).To(ConsistOf(survivors))
 	})
+	It("re-simulates a whole stale batch in one joint simulation at admission, whatever its batch sizer says", func() {
+		w := newWorld(12)
+		w.only(v1.ConditionTypeDrifted)
+		w.withPods("1", lo.Range(12)...)
+		l := pipeline.NewLedger(env.Client, cluster, cloudProvider, env.Clock, queue)
+		events := &pipeline.RoundEvents{}
+		planners := pipeline.DefaultPlanners(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, queue, events, l.View())
+		exec := pipeline.NewExecutor(pipeline.ExecutorDeps{Ledger: l, Admitter: pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), planners["drift"]),
+			Starter: pipeline.NewQueueStarter(queue, env.Clock), Sweeper: disruption.NewMarkSweeper(env.Client, cluster, env.Clock), Queue: queue, Cluster: cluster, Clock: env.Clock})
+		var submitted []*pipeline.Plan
+		capture := &capturingExecutor{Executor: exec, plans: &submitted}
+		lane := pipeline.NewLane(pipeline.LaneSpec{ID: "fast", Planners: []pipeline.Planner{planners["drift"]}}, pipeline.LaneDeps{
+			Clock: env.Clock, Cluster: cluster, Executor: capture, Budgets: l.Budgets(), Reserved: l.View(),
+			Snapshots: pipeline.NewSnapshotBuilder(env.Client, cluster, env.Clock, cloudProvider, queue, clusterCost, l.View()),
+		})
+		Expect(lane.Step(ctx).Err).ToNot(HaveOccurred())
+		planned := lo.FlatMap(submitted, func(p *pipeline.Plan, _ int) []string { return providerIDsOf(p.Candidates) })
+		Expect(len(submitted)).To(BeNumerically(">=", 2))
+		// The plans are stale by admission, and meanwhile a timed-out simulation shrank the sizer to its minimum.
+		env.Clock.Step(pipeline.StaleAfter + time.Second)
+		pipeline.BatchSizer(planners["drift"]).Observe(disruption.BatchOutcome{Size: 2, TimedOut: true})
+		r := exec.Step(ctx)
+		Expect(r.Rejected).To(BeZero())
+		Expect(queuedCandidates()).To(ConsistOf(planned))
+	})
 	It("counts consolidation's failed validation when admission rejects a candidate", func() {
 		disruption.FailedValidationsTotal.Reset()
 		pipeline.UnresolvedPlans.Reset()

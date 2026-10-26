@@ -69,8 +69,11 @@ func (v referenceView) InFlightDestinations() sets.Set[string] {
 
 // Internal constants. None of them is a user setting.
 const (
-	// StaleAfter is how old a plan may be before the Admitter re-simulates it.
+	// StaleAfter is how long after its submission a plan may wait before the Admitter re-simulates it.
 	StaleAfter = 10 * time.Second
+	// MaxPlanTime bounds how long a round's planning may take before its plans are stale anyway (StaleAfter counts from
+	// submission); the Ledger keeps started footprints for StaleAfter+MaxPlanTime.
+	MaxPlanTime = 30 * time.Second
 	// MaxAdmissionWait is how long after its ValidateAt a plan may wait for admission before it is dropped.
 	MaxAdmissionWait = time.Minute
 	// SweepTick is how often the commit loop removes leftover disruption taints and conditions.

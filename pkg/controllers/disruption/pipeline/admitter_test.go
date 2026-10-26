@@ -69,6 +69,33 @@ func (p *acceptingPlanner) Replan(_ context.Context, survivors []*pipeline.Plan,
 	return p.replan(survivors)
 }
 
+// jointPlanner is an acceptingPlanner that re-simulates a batch's plans jointly: one plan over all their fresh
+// candidates.
+type jointPlanner struct {
+	*acceptingPlanner
+	joint [][]pipeline.RevalidateInput
+	fail  bool
+	// destinations, if set, are the joint plan's destinations.
+	destinations sets.Set[string]
+}
+
+func (p *jointPlanner) RevalidateJointly(_ context.Context, ins []pipeline.RevalidateInput) ([]*pipeline.Plan, error) {
+	p.joint = append(p.joint, ins)
+	if p.fail {
+		return nil, &pipeline.RejectError{Reason: types.ReasonResimUnschedulable}
+	}
+	q := deletePlan(lo.FlatMap(ins, func(in pipeline.RevalidateInput, _ int) []*disruption.Candidate { return in.Fresh })...)
+	q.ID, q.BatchID, q.Siblings, q.Planner, q.Reason = uuid.New(), ins[0].Plan.BatchID, 1, ins[0].Plan.Planner, ins[0].Plan.Reason
+	q.Footprint.BudgetNodes = ins[0].Plan.Footprint.BudgetNodes
+	q.Footprint.Destinations = p.destinations
+	for _, in := range ins[1:] {
+		for np, ids := range in.Plan.Footprint.BudgetNodes {
+			q.Footprint.BudgetNodes[np] = q.Footprint.BudgetNodes[np].Union(ids)
+		}
+	}
+	return []*pipeline.Plan{q}, nil
+}
+
 var _ = Describe("Admitter", func() {
 	var w *world
 	var l pipeline.Ledger
@@ -221,7 +248,7 @@ var _ = Describe("Admitter", func() {
 		})
 		It("re-simulates a stale plan, a plan whose catalog or pods changed, a plan with a rejected sibling, and consolidation always", func() {
 			stale := plan(ids[0])
-			stale.Plan.ComputedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
+			stale.SubmittedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
 			catalog := plan(ids[1])
 			catalog.Plan.CatalogVersions = map[string]string{w.nodePool.Name: "old"}
 			pods := plan(ids[4])
@@ -238,6 +265,24 @@ var _ = Describe("Admitter", func() {
 			consolidation := plan(ids[3])
 			admitter.Admit(ctx, []*pipeline.Pending{consolidation}, step())
 			Expect(planner.inputs[4].Causes).To(Equal([]types.ResimCause{types.ResimAlways}))
+		})
+		It("counts staleness from the plan's submission, not from when its round started", func() {
+			// A long joint simulation: computed long ago, submitted just now.
+			p := plan(ids[0])
+			p.Plan.ComputedAt = env.Clock.Now().Add(-pipeline.StaleAfter - 15*time.Second)
+			admitter.Admit(ctx, []*pipeline.Pending{p}, step())
+			Expect(planner.inputs[0].Causes).To(BeEmpty())
+			// A round older than StaleAfter+MaxPlanTime is stale anyway: the Ledger no longer keeps older starts.
+			old := plan(ids[1])
+			old.Plan.ComputedAt = env.Clock.Now().Add(-pipeline.StaleAfter - pipeline.MaxPlanTime - time.Second)
+			admitter.Admit(ctx, []*pipeline.Pending{old}, step())
+			Expect(planner.inputs[1].Causes).To(Equal([]types.ResimCause{types.ResimStale}))
+			// A plan that waited longer than StaleAfter since its submission is stale.
+			waited := plan(ids[2])
+			waited.Plan.ComputedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
+			waited.SubmittedAt = waited.Plan.ComputedAt
+			admitter.Admit(ctx, []*pipeline.Pending{waited}, step())
+			Expect(planner.inputs[2].Causes).To(Equal([]types.ResimCause{types.ResimStale}))
 		})
 		It("rejects a consolidation candidate whose pods changed instead of re-placing them", func() {
 			planner.always = true
@@ -298,6 +343,36 @@ var _ = Describe("Admitter", func() {
 			}
 			return ps
 		}
+		It("re-simulates a batch's stale plans with one joint simulation, and starts its plans in their place", func() {
+			jp := &jointPlanner{acceptingPlanner: planner}
+			admitter = pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), jp)
+			g := batch(plan(ids[0]), plan(ids[1]), plan(ids[2]))
+			for _, p := range g {
+				p.SubmittedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
+			}
+			r := admitter.Admit(ctx, g, step())
+			Expect(planner.inputs).To(BeEmpty()) // no plan was re-simulated alone
+			Expect(jp.joint).To(HaveLen(1))
+			Expect(jp.joint[0]).To(HaveLen(3))
+			Expect(r.Rejected).To(BeEmpty())
+			Expect(started(r)).To(ConsistOf(ids[0], ids[1], ids[2]))
+			Expect(r.Start).To(HaveLen(1))
+			for _, p := range g {
+				Expect(r.Replaced[p.Plan.ID]).To(Equal([]uuid.UUID{r.Start[0].ID}))
+			}
+			Expect(l.View().Unstarted().UnsortedList()).To(ConsistOf(ids[0], ids[1], ids[2]))
+		})
+		It("rejects the whole batch when its joint re-simulation fails", func() {
+			jp := &jointPlanner{acceptingPlanner: planner, fail: true}
+			admitter = pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), jp)
+			g := batch(plan(ids[0]), plan(ids[1]))
+			for _, p := range g {
+				p.SubmittedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
+			}
+			r := admitter.Admit(ctx, g, step())
+			Expect(r.Start).To(BeEmpty())
+			Expect(r.Rejected).To(Equal(map[uuid.UUID]types.RejectReason{g[0].Plan.ID: types.ReasonResimUnschedulable, g[1].Plan.ID: types.ReasonSiblingRejected}))
+		})
 		It("starts a batch as a unit", func() {
 			Expect(started(admitter.Admit(ctx, batch(plan(ids[0]), plan(ids[1])), step()))).To(Equal([]string{ids[0], ids[1]}))
 		})
@@ -345,6 +420,28 @@ var _ = Describe("Admitter", func() {
 			Expect(r.Wait).To(HaveLen(3))
 			// Nothing changed in the Ledger.
 			Expect(l.View().Unstarted().UnsortedList()).To(ConsistOf(ids[0], ids[1], ids[2]))
+		})
+		It("makes a batch whose joint re-simulation is coupled to a plan admitted earlier in the step wait", func() {
+			// Rule 9 for the joint path: the members alone relate to nothing admitted, but the joint plans do; they
+			// must wait for the next step, whose re-simulation sees that plan started.
+			jp := &jointPlanner{acceptingPlanner: planner, destinations: sets.New(ids[3])}
+			admitter = pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), jp)
+			g := batch(plan(ids[0]), plan(ids[1]))
+			for _, p := range g {
+				p.SubmittedAt = env.Clock.Now().Add(-pipeline.StaleAfter - time.Second)
+			}
+			s := step()
+			s.Admitted = []*pipeline.Plan{{ID: uuid.New(), BatchID: uuid.New(), Footprint: types.Footprint{Removed: sets.New(ids[5]), Destinations: sets.New(ids[3])}}}
+			r := admitter.Admit(ctx, g, s)
+			Expect(jp.joint).To(HaveLen(1))
+			Expect(r.Start).To(BeEmpty())
+			Expect(r.Rejected).To(BeEmpty())
+			Expect(r.Replaced).To(BeEmpty())
+			Expect(r.Wait).To(HaveLen(2))
+			// Nothing changed in the Ledger.
+			Expect(l.View().Unstarted().UnsortedList()).To(ConsistOf(ids[0], ids[1]))
+			// With nothing admitted before it, the same batch starts.
+			Expect(started(admitter.Admit(ctx, g, step()))).To(ConsistOf(ids[0], ids[1]))
 		})
 		It("makes the whole batch wait while unsynced if one member moves pods", func() {
 			unlaunched := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: w.nodePool.Name}}})
