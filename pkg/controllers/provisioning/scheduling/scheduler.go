@@ -102,9 +102,33 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// limitsUsed counts resources against NodePool limits on top of the nodes the scheduler is given: capacity that
+	// a simulation doesn't model as a node but that will exist (for example replacements other disruption commands
+	// planned). Keyed by NodePool name.
+	limitsUsed map[string]corev1.ResourceList
+	// candidatePodsLast schedules pods that are neither pending nor on a deleting node (a disruption simulation's
+	// candidate pods) after all other pods, so pending pods and pods of deleting nodes keep the capacity that is already
+	// being launched for them (uninitialized nodes) and the candidates' pods get what is left.
+	candidatePodsLast bool
+	// podGroups assigns pods to groups; pods of different groups never share a node, existing or new. Pods without a
+	// group go anywhere.
+	podGroups map[types.UID]int
 }
 
 type Options = option.Function[options]
+
+// CandidatePodsLast schedules a disruption simulation's candidate pods after the other pods. See
+// options.candidatePodsLast.
+var CandidatePodsLast = func(opts *options) {
+	opts.candidatePodsLast = true
+}
+
+// PodGroups keeps pods of different groups off each other's nodes. See options.podGroups.
+var PodGroups = func(groups map[types.UID]int) Options {
+	return func(opts *options) {
+		opts.podGroups = groups
+	}
+}
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict
@@ -118,6 +142,16 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 			opts.creditReservationCapacity = map[string]int{}
 		}
 		opts.creditReservationCapacity[reservationID] += count
+	}
+}
+
+// CountAgainstLimits counts resources against a NodePool's limits before scheduling. See options.limitsUsed.
+var CountAgainstLimits = func(nodePool string, used corev1.ResourceList) Options {
+	return func(opts *options) {
+		if opts.limitsUsed == nil {
+			opts.limitsUsed = map[string]corev1.ResourceList{}
+		}
+		opts.limitsUsed[nodePool] = resources.Merge(opts.limitsUsed[nodePool], used)
 	}
 }
 
@@ -214,6 +248,9 @@ func NewScheduler(
 		reservationManager:        reservationManager,
 		reservedOfferingMode:      resolved.reservedOfferingMode,
 		creditReservationCapacity: resolved.creditReservationCapacity,
+		candidatePodsLast:         resolved.candidatePodsLast,
+		podGroups:                 resolved.podGroups,
+		nodeGroups:                map[any]int{},
 		preferencePolicy:          resolved.preferencePolicy,
 		minValuesPolicy:           minValuesPolicy,
 		numConcurrentReconciles:   lo.Ternary(resolved.numConcurrentReconciles > 0, resolved.numConcurrentReconciles, 1),
@@ -242,6 +279,7 @@ func NewScheduler(
 	}
 	s.deletingNodeNames = deletingNodeNames
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
+	s.countAgainstLimits(resolved.limitsUsed)
 	return s
 }
 
@@ -285,6 +323,9 @@ type Scheduler struct {
 	minValuesPolicy           karpopts.MinValuesPolicy
 	numConcurrentReconciles   int
 	deletingNodeNames         sets.Set[string]
+	candidatePodsLast         bool
+	podGroups                 map[types.UID]int
+	nodeGroups                map[any]int // *ExistingNode or *NodeClaim -> group of the pods placed on it
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -498,6 +539,9 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	}
 
 	q := NewQueue(pods, s.cachedPodData)
+	if s.candidatePodsLast {
+		sort.SliceStable(q.pods, func(i, j int) bool { return !s.isCandidatePod(q.pods[i]) && s.isCandidatePod(q.pods[j]) })
+	}
 
 	startTime := s.clock.Now()
 	for {
@@ -670,9 +714,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod, volume
 	var allocationResult *dynamicresources.AllocationResult
 
 	parallelizeUntil(s.numConcurrentReconciles, len(s.existingNodes), func(i int) bool {
-		if s.existingNodes[i].isUnderConsolidateAfter && (!pod.IsPending(p) && !s.deletingNodeNames.Has(p.Spec.NodeName)) {
-			// We shouldn't try to schedule candidate pods onto nodes that are under consolidate after.
-			// Pending pods and pods from deleting nodes are exempt.
+		if s.excludedFrom(s.existingNodes[i], p) {
 			return true
 		}
 		r, result, err := s.existingNodes[i].CanAdd(ctx, p, s.cachedPodData[p.UID], volumes, s.allocator)
@@ -695,6 +737,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod, volume
 	// If we set the existingNode to something valid, this means that we successfully scheduled to one of these nodes
 	if existingNode != nil {
 		existingNode.Add(ctx, p, s.cachedPodData[p.UID], requirements, volumes, allocationResult)
+		s.joinGroup(existingNode, p)
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to existing nodes")
@@ -710,6 +753,9 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod, volu
 	var offeringsToReserve []*cloudprovider.Offering
 	var allocationResult *dynamicresources.AllocationResult
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
+		if !s.groupAllows(s.newNodeClaims[i], pod) {
+			return true
+		}
 		r, its, ofr, result, err := s.newNodeClaims[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], volumes, false, s.allocator)
 		if err == nil {
 			mu.Lock()
@@ -731,6 +777,7 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod, volu
 	})
 	if inflightNodeClaim != nil {
 		inflightNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, volumes, offeringsToReserve, allocationResult, s.allocator)
+		s.joinGroup(inflightNodeClaim, pod)
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to inflight nodes")
@@ -828,6 +875,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 		// we will launch this nodeClaim and need to track its maximum possible resource usage against our remaining resources
 		newNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, volumes, offeringsToReserve, allocationResult, s.allocator)
 		s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
+		s.joinGroup(newNodeClaim, pod)
 		s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
 		return nil
 	}
@@ -874,6 +922,49 @@ func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1
 		return false
 	}
 	return true
+}
+
+// excludedFrom reports whether p may not be placed on the existing node n: a candidate pod of a disruption simulation
+// is kept off nodes under consolidateAfter, and a pod of a group is kept off nodes holding another group's pods.
+func (s *Scheduler) excludedFrom(n *ExistingNode, p *corev1.Pod) bool {
+	// We shouldn't try to schedule candidate pods onto nodes that are under consolidate after.
+	// Pending pods and pods from deleting nodes are exempt.
+	if n.isUnderConsolidateAfter && s.isCandidatePod(p) {
+		return true
+	}
+	return !s.groupAllows(n, p)
+}
+
+// isCandidatePod reports whether p is a disruption simulation's candidate pod: neither pending nor on a deleting node.
+func (s *Scheduler) isCandidatePod(p *corev1.Pod) bool {
+	return !pod.IsPending(p) && !s.deletingNodeNames.Has(p.Spec.NodeName)
+}
+
+// groupAllows reports whether p may be placed on node (an *ExistingNode or *NodeClaim): a pod without a group may go
+// anywhere, a pod with one only where no pod of another group is.
+func (s *Scheduler) groupAllows(node any, p *corev1.Pod) bool {
+	g, ok := s.podGroups[p.UID]
+	if !ok {
+		return true
+	}
+	ng, ok := s.nodeGroups[node]
+	return !ok || ng == g
+}
+
+// joinGroup records that node holds a pod of p's group.
+func (s *Scheduler) joinGroup(node any, p *corev1.Pod) {
+	if g, ok := s.podGroups[p.UID]; ok {
+		s.nodeGroups[node] = g
+	}
+}
+
+// countAgainstLimits subtracts used, by NodePool, from the remaining resources of NodePools with limits.
+func (s *Scheduler) countAgainstLimits(used map[string]corev1.ResourceList) {
+	for np, rl := range used {
+		if remaining, ok := s.remainingResources[np]; ok {
+			s.remainingResources[np] = resources.Subtract(remaining, rl)
+		}
+	}
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
