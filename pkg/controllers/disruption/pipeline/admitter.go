@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
@@ -212,15 +213,13 @@ func (a *admitter) Admit(ctx context.Context, group []*Pending, step *CommitStep
 		}
 		return res
 	}
-	jointIDs := lo.FlatMap(deferred, func(p *Pending, _ int) []uuid.UUID {
-		return lo.Map(accepted[p.Plan.ID], func(q *Plan, _ int) uuid.UUID { return q.ID })
-	})
+	jointPlans := lo.FlatMap(deferred, func(p *Pending, _ int) []*Plan { return accepted[p.Plan.ID] })
 	isJointMember := lo.SliceToMap(deferred, func(p *Pending) (uuid.UUID, bool) { return p.Plan.ID, true })
 	for _, p := range survivors {
 		plans := accepted[p.Plan.ID]
 		switch {
 		case isJointMember[p.Plan.ID]:
-			res.Replaced[p.Plan.ID] = jointIDs
+			replaceOrDefer(&res, p.Plan, jointPlans)
 		case len(plans) != 1 || plans[0].ID != p.Plan.ID:
 			res.Replaced[p.Plan.ID] = lo.Map(plans, func(q *Plan, _ int) uuid.UUID { return q.ID })
 		}
@@ -400,12 +399,27 @@ func (a *admitter) replan(ctx context.Context, group, survivors []*Pending, step
 		return rejectAll(lo.Ternary(RejectReasonOf(err) != "", RejectReasonOf(err), types.ReasonSiblingRejected))
 	}
 	res.Resims = append(append(res.Resims, resims...), types.ResimSibling)
-	ids := lo.Map(replans, func(q *Plan, _ int) uuid.UUID { return q.ID })
 	for _, p := range plans {
-		res.Replaced[p.ID] = ids
+		replaceOrDefer(&res, p, replans)
 	}
 	res.Start = replans
 	return res
+}
+
+// replaceOrDefer records that member, one plan of a batch re-simulated jointly, is replaced by the plans holding its
+// candidates. A joint simulation may accept only part of the batch (the others are left to a later round): a member
+// none of whose candidates were accepted is rejected as deferred, so it doesn't resolve with the plans that started
+// (its NodePools weren't served). The Swap that started the plans already released its reservation.
+func replaceOrDefer(res *AdmitResult, member *Plan, plans []*Plan) {
+	ids := sets.New(providerIDsOfCandidates(member.Candidates)...)
+	holding := lo.FilterMap(plans, func(q *Plan, _ int) (uuid.UUID, bool) {
+		return q.ID, lo.SomeBy(q.Candidates, func(c *disruption.Candidate) bool { return ids.Has(c.ProviderID()) })
+	})
+	if len(holding) == 0 {
+		res.Rejected[member.ID] = types.ReasonDeferred
+		return
+	}
+	res.Replaced[member.ID] = holding
 }
 
 func appendCause(causes []types.ResimCause, c types.ResimCause) []types.ResimCause {

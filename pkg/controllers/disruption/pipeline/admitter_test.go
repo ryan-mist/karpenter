@@ -464,6 +464,24 @@ var _ = Describe("Admitter", func() {
 			Expect(r.Wait).To(HaveLen(2))
 			Expect(r.Resims).To(BeEmpty())
 		})
+		It("rejects a re-planned member as deferred when the re-plan accepted none of its candidates (N-2)", func() {
+			g := batch(plan(ids[0]), plan(ids[1]), plan(ids[2]))
+			cluster.MarkForDeletion(ids[1])
+			planner.replan = func(survivors []*pipeline.Plan) ([]*pipeline.Plan, error) {
+				// The joint re-plan accepts only the first survivor's candidates.
+				q := deletePlan(survivors[0].Candidates...)
+				q.ID = uuid.New()
+				q.BatchID, q.Siblings, q.Reason = q.ID, 1, v1.DisruptionReasonDrifted
+				return []*pipeline.Plan{q}, nil
+			}
+			r := admitter.Admit(ctx, g, step())
+			Expect(started(r)).To(Equal([]string{ids[0]}))
+			Expect(r.Replaced).To(Equal(map[uuid.UUID][]uuid.UUID{g[0].Plan.ID: {r.Start[0].ID}}))
+			Expect(r.Rejected).To(Equal(map[uuid.UUID]types.RejectReason{g[1].Plan.ID: types.ReasonCandidateInvalid, g[2].Plan.ID: types.ReasonDeferred}))
+			// The left-out member's candidate isn't reserved any more (the executor releases the rejected g[1] by its ID).
+			Expect(l.View().Unstarted().UnsortedList()).ToNot(ContainElement(ids[2]))
+			Expect(l.View().Unstarted().UnsortedList()).To(ContainElement(ids[0]))
+		})
 		It("re-plans the survivors once if one plan is rejected, or starts none", func() {
 			g := batch(plan(ids[0]), plan(ids[1]), plan(ids[2]))
 			cluster.MarkForDeletion(ids[1])

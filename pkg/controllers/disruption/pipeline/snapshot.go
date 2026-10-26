@@ -214,7 +214,10 @@ func (s *Snapshot) CatalogVersion(nodePool string) string {
 }
 
 // CatalogVersion is a fingerprint of instance types and their offerings: names, offering zone, capacity type,
-// reservation ID and capacity, availability and price. A nil map (no instance types) has its own version.
+// reservation ID and capacity, availability and price. It doesn't depend on the order of the offerings: cloud providers
+// build them from sets (the AWS provider iterates its zones and capacity types), so a rebuilt offering cache lists the
+// same offerings in another order (KWOK run 2: 95 of 98 admission re-simulations). A nil map (no instance types) has
+// its own version.
 func CatalogVersion(its map[string]*cloudprovider.InstanceType) string {
 	if its == nil {
 		return "unavailable"
@@ -224,10 +227,14 @@ func CatalogVersion(its map[string]*cloudprovider.InstanceType) string {
 	sort.Strings(names)
 	for _, name := range names {
 		fmt.Fprintf(h, "%s;", name)
-		for _, o := range its[name].Offerings {
+		offerings := lo.Map(its[name].Offerings, func(o *cloudprovider.Offering, _ int) string {
 			// Requirement.String, not Offering.Zone and friends: Any picks a random value from a multi-valued requirement.
-			fmt.Fprintf(h, "%s/%s/%s/%d/%t/%g;", o.Requirements.Get(corev1.LabelTopologyZone), o.Requirements.Get(v1.CapacityTypeLabelKey),
+			return fmt.Sprintf("%s/%s/%s/%d/%t/%g;", o.Requirements.Get(corev1.LabelTopologyZone), o.Requirements.Get(v1.CapacityTypeLabelKey),
 				o.Requirements.Get(cloudprovider.ReservationIDLabel), o.ReservationCapacity, o.Available, o.Price)
+		})
+		sort.Strings(offerings)
+		for _, o := range offerings {
+			fmt.Fprint(h, o)
 		}
 	}
 	return fmt.Sprintf("%016x", h.Sum64())

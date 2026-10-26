@@ -17,6 +17,8 @@ limitations under the License.
 package pipeline
 
 import (
+	"context"
+
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/go-logr/logr"
 	"k8s.io/utils/clock"
@@ -83,3 +85,14 @@ func (s *Shadow) WaitIdle() { s.jobs.Wait() }
 func BatchSizer(p Planner) *disruption.BatchSizer { return p.(*batchPlanner).sizer }
 
 func RecordJoint(planner string, res disruption.CoreResult) { recordJoint(planner, res) }
+
+// ResimOptions are the options a batch planner re-simulates n candidates with.
+func ResimOptions(p Planner, n int) disruption.CoreOptions { return p.(*batchPlanner).resimOptions(n) }
+
+// Fairness is a batch planner's NodePool fairness.
+func Fairness(p Planner) *PoolFairness { return p.(*batchPlanner).fair }
+
+// SetCompute replaces a batch planner's core.
+func SetCompute(p Planner, f func(ctx context.Context, budgets map[string]int, opts disruption.CoreOptions, cs ...*disruption.Candidate) (disruption.CoreResult, error)) {
+	p.(*batchPlanner).compute = f
+}
