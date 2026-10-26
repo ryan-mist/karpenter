@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -122,6 +123,29 @@ func PrepareReboot(ctx context.Context, cmd *Command) (bool, error) {
 		return r.commitReboot(ctx, candidate, nodeClaim)
 	}
 	return true, nil
+}
+
+// WithoutEvaluationStats is ctx without the current evaluation's statistics, for work that must not count as the
+// disruption controller's (the pipeline's shadow mode simulating beside it).
+func WithoutEvaluationStats(ctx context.Context) context.Context {
+	return withEvaluationStats(ctx, nil)
+}
+
+// ComputeObserver sees each method's computation in a pass of the disruption controller: the disruption pipeline's
+// shadow mode compares its own plans with the commands. It must not modify what it is given.
+type ComputeObserver interface {
+	// Computing is called before ComputeCommands, with the snapshot the candidates were built from, the candidates and
+	// the budgets ComputeCommands gets. For a method without candidates it is called with no candidates and nil
+	// budgets, and Computed follows with no commands (ComputeCommands doesn't run).
+	Computing(ctx context.Context, m Method, snapshot *CandidateSnapshot, candidates []*Candidate, budgets map[string]int)
+	// Computed is called with what ComputeCommands returned, before any command starts.
+	Computed(ctx context.Context, m Method, cmds []Command, err error)
+}
+
+// WithComputeObserver makes the disruption controller tell o about each method's computation. Only the pipeline's
+// shadow mode sets it.
+func WithComputeObserver(o ComputeObserver) option.Function[ControllerOptions] {
+	return func(opts *ControllerOptions) { opts.computeObserver = o }
 }
 
 // WithCompletionHook makes the queue call hook after it completes a command, successfully or not. Hooks must be added

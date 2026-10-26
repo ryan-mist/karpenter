@@ -68,13 +68,16 @@ type Controller struct {
 	lastRun       map[string]time.Time
 	// unsyncedSince is when the loop first found cluster state unsynced; zero while it is synced.
 	unsyncedSince time.Time
+	// computeObserver, if set, sees each method's computation (the disruption pipeline's shadow mode).
+	computeObserver ComputeObserver
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
 const pollingPeriod = 10 * time.Second
 
 type ControllerOptions struct {
-	methods []Method
+	methods         []Method
+	computeObserver ComputeObserver
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -92,17 +95,18 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 		SkippedEvaluationsTotal.Add(0, methodLabels(m))
 	}
 	return &Controller{
-		queue:         queue,
-		sweeper:       NewMarkSweeper(kubeClient, cluster, clk),
-		clock:         clk,
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		provisioner:   provisioner,
-		recorder:      recorder,
-		cloudProvider: cp,
-		clusterCost:   clusterCost,
-		lastRun:       map[string]time.Time{},
-		methods:       o.methods,
+		queue:           queue,
+		sweeper:         NewMarkSweeper(kubeClient, cluster, clk),
+		clock:           clk,
+		kubeClient:      kubeClient,
+		cluster:         cluster,
+		provisioner:     provisioner,
+		recorder:        recorder,
+		cloudProvider:   cp,
+		clusterCost:     clusterCost,
+		lastRun:         map[string]time.Time{},
+		methods:         o.methods,
+		computeObserver: o.computeObserver,
 	}
 }
 
@@ -239,6 +243,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		if c.computeObserver != nil {
+			c.computeObserver.Computing(ctx, disruption, s, nil, nil)
+			c.computeObserver.Computed(ctx, disruption, nil, nil)
+		}
 		return nil, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
@@ -251,9 +259,15 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method, snapshot **
 	if err != nil {
 		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}
+	if c.computeObserver != nil {
+		c.computeObserver.Computing(ctx, disruption, s, candidates, disruptionBudgetMapping)
+	}
 	// Determine the disruption action
 	phaseStart = time.Now()
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
+	if c.computeObserver != nil {
+		c.computeObserver.Computed(ctx, disruption, cmds, err)
+	}
 	validating := time.Duration(stats.validating.Load())
 	observePhase(ComputePhase, labels, max(time.Since(phaseStart)-validating, 0))
 	if stats.validations.Load() > 0 {

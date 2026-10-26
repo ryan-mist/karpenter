@@ -26,7 +26,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
-// The pipeline's metrics are emitted only with the DisruptionPipeline feature gate on.
+// The pipeline's metrics are emitted only with the DisruptionPipeline feature gate on, except the shadow metrics,
+// which only the shadow mode emits (with the gate off).
 const (
 	subsystem    = "voluntary_disruption"
 	laneLabel    = "lane"
@@ -35,6 +36,19 @@ const (
 	gateLabel    = "gate"
 	plannerLabel = "planner"
 	causeLabel   = "cause"
+	levelLabel   = "level"
+	kindLabel    = "kind"
+)
+
+// Shadow comparison levels, mismatch kinds and causes.
+const (
+	shadowSnapshot  = "snapshot"
+	shadowReference = "reference"
+	kindCandidates  = "candidates"
+	kindBudget      = "budget"
+	kindCommands    = "commands"
+	causeRace       = "race"
+	causeLogic      = "logic"
 )
 
 // Round phases.
@@ -205,4 +219,47 @@ var (
 		Help:    "Duration of the disruption pipeline's sweep of leftover disruption taints and conditions in seconds.",
 		Buckets: metrics.DurationBuckets(),
 	}, []opmetrics.Label{}, opmetrics.Alpha)
+)
+
+var (
+	ShadowLevelDim = opmetrics.Label{
+		Name: levelLabel,
+		Help: "What the disruption pipeline's shadow mode compared.",
+		Values: []opmetrics.Value{
+			{Name: shadowSnapshot, Help: "Each planner's candidates and budgets against the disruption controller's."},
+			{Name: shadowReference, Help: "The reference planner's plans against the disruption controller's commands."},
+		},
+	}
+	ShadowKindDim = opmetrics.Label{
+		Name: kindLabel,
+		Help: "What differed in a shadow comparison.",
+		Values: []opmetrics.Value{
+			{Name: kindCandidates, Help: "The candidate sets."},
+			{Name: kindBudget, Help: "A NodePool's remaining budget."},
+			{Name: kindCommands, Help: "The commands, also up to equivalent nodes."},
+		},
+	}
+	ShadowCauseDim = opmetrics.Label{
+		Name: causeLabel,
+		Help: "Why a shadow comparison differed, from a recheck on fresh state.",
+		Values: []opmetrics.Value{
+			{Name: causeRace, Help: "The recheck agreed: cluster state changed in between."},
+			{Name: causeLogic, Help: "The recheck differed too, or none was possible."},
+		},
+	}
+)
+
+var (
+	ShadowComparisonsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_shadow_comparisons_total",
+		Help: "Number of the disruption pipeline's shadow comparisons. Labeled by level and planner.",
+	}, []opmetrics.Label{ShadowLevelDim, PlannerDim}, opmetrics.Alpha)
+	ShadowMismatchesTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_shadow_mismatches_total",
+		Help: "Number of the disruption pipeline's shadow comparisons that differed. Labeled by level, planner, kind and cause.",
+	}, []opmetrics.Label{ShadowLevelDim, PlannerDim, ShadowKindDim, ShadowCauseDim}, opmetrics.Alpha)
+	ShadowAgreementRatio = opmetrics.NewPrometheusGauge(crmetrics.Registry, prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_shadow_agreement_ratio",
+		Help: "Share of the disruption pipeline's reference-level shadow comparisons that agreed, since start. Labeled by planner.",
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
 )

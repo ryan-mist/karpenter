@@ -47,3 +47,12 @@ func TestDisruptionControllerFollowsTheDisruptionPipelineGate(t *testing.T) {
 		}
 	}
 }
+
+func TestDisruptionControllerRunsTheShadowWithTheGateOff(t *testing.T) {
+	t.Setenv(pipeline.ShadowEnv, "0.5")
+	ctx := test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{DisruptionPipeline: lo.ToPtr(false)}}).ToContext(context.Background())
+	c := newDisruptionController(ctx, clock.NewFakeClock(time.Now()), nil, nil, nil, nil, nil, &disruption.Queue{}, nil)
+	if got := c.(interface{ Name() string }).Name(); got != "disruption" {
+		t.Errorf("shadow mode: got controller %q, want the disruption controller", got)
+	}
+}

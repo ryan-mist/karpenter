@@ -233,13 +233,19 @@ func NewControllers(
 }
 
 // newDisruptionController returns the voluntary disruption controller: the pipeline controller with the
-// DisruptionPipeline feature gate on, otherwise the disruption controller. Both start commands through queue.
+// DisruptionPipeline feature gate on, otherwise the disruption controller. Both start commands through queue. With
+// the gate off and the undocumented pipeline.ShadowEnv set, the pipeline plans beside the disruption controller in
+// shadow mode and never acts.
 func newDisruptionController(ctx context.Context, clk clock.Clock, kubeClient client.Client, p *provisioning.Provisioner,
 	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *disruption.Queue,
 	clusterCost *cost.ClusterCost,
 ) controller.Controller {
 	if options.FromContext(ctx).FeatureGates.DisruptionPipeline {
 		return pipeline.NewController(ctx, clk, kubeClient, p, cloudProvider, recorder, cluster, queue, clusterCost)
+	}
+	if rate := pipeline.ShadowRate(); rate > 0 {
+		return disruption.NewController(ctx, clk, kubeClient, p, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruption.WithComputeObserver(pipeline.NewShadow(ctx, clk, kubeClient, p, cloudProvider, cluster, queue, clusterCost, rate)))
 	}
 	return disruption.NewController(ctx, clk, kubeClient, p, cloudProvider, recorder, cluster, queue, clusterCost)
 }

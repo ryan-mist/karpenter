@@ -74,7 +74,12 @@ type planner struct {
 	// nominates makes every existing node a plan places pods on (pending pods too) one of its Destinations, as the
 	// disruption controller nominates them when the command starts (reference mode).
 	nominates bool
+	// withoutMetrics records none of the disruption controller's metrics (the shadow mode).
+	withoutMetrics bool
 }
+
+// methodOf is the disruption method the planner plans with.
+func (p *planner) methodOf() disruption.Method { return p.method }
 
 func (p *planner) Name() string                { return p.name }
 func (p *planner) Reason() v1.DisruptionReason { return p.method.Reason() }
@@ -377,7 +382,7 @@ func (p *consolidationPlanner) AlwaysResimulate() bool { return true }
 
 func (p *consolidationPlanner) Plan(ctx context.Context, in PlanInput) (PlanOutput, error) {
 	version := in.Reserved.Version()
-	res, err := p.compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects, Sim: p.sim, Evaluator: in.Evaluator, Dedup: p.dedup}, in.Candidates...)
+	res, err := p.compute(ctx, p.budgets(ctx, in, in.Candidates), disruption.CoreOptions{Effects: p.effects, Sim: p.sim, Evaluator: in.Evaluator, Dedup: p.dedup, WithoutMetrics: p.withoutMetrics}, in.Candidates...)
 	return PlanOutput{Plans: p.plans(res.Commands, version, in)}, err
 }
 
@@ -399,11 +404,23 @@ type PlannerOptions struct {
 	// backoff (R73 off); simulations see the candidates of reserved, unstarted plans as deleting, as a pass of the
 	// disruption controller sees the commands earlier methods started (decision #9 off).
 	Reference bool
+	// shadow makes the consolidation planners search every time, without skipping an unchanged cluster state (the
+	// shadow mode plans only on sampled passes, so it can't tell what changed), and record none of the disruption
+	// controller's metrics.
+	shadow bool
 }
 
 // WithReference makes DefaultPlanners plan as the disruption controller does (PlannerOptions.Reference).
 func WithReference() option.Function[PlannerOptions] {
 	return func(o *PlannerOptions) { o.Reference = true }
+}
+
+// dedupFor is a consolidation planner's dedup: nil without dedup.
+func dedupFor(o *PlannerOptions, cluster *state.Cluster) disruption.Dedup {
+	if o.shadow {
+		return nil
+	}
+	return &stateDedup{cluster: cluster}
 }
 
 // DefaultPlanners are the pipeline's planners over the disruption methods (disruption.NewMethods), built with the
@@ -415,7 +432,7 @@ func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluste
 	eff := effects{recorder: recorder, cluster: cluster, reserved: reserved}
 	sim := lo.Ternary(o.Reference, newReferenceSimulator, NewSimulator)(disruption.NewLegacySimulator(kubeClient, cluster, provisioner, clk, recorder), reserved)
 	base := func(name string, m disruption.Method, shape types.Shape) planner {
-		return planner{name: name, method: m, shape: shape, effects: eff, sim: sim, nominates: o.Reference}
+		return planner{name: name, method: m, shape: shape, effects: eff, sim: sim, nominates: o.Reference, withoutMetrics: o.shadow}
 	}
 	out := map[string]Planner{}
 	for _, m := range disruption.NewMethods(ctx, clk, cluster, kubeClient, provisioner, cp, recorder, queue) {
@@ -424,7 +441,7 @@ func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluste
 			out[RepairPlanner] = &batchPlanner{planner: base(RepairPlanner, m, types.ShapeReplacing), compute: m.Compute,
 				sizer: disruption.NewBatchSizer(disruption.BatchSimDeadline), cachedReboot: true, budgetFree: true, reference: o.Reference}
 		case *disruption.Emptiness:
-			p := &emptinessPlanner{planner: base(EmptinessPlanner, m, types.ShapePodFree), core: m, dedup: &stateDedup{cluster: cluster}}
+			p := &emptinessPlanner{planner: base(EmptinessPlanner, m, types.ShapePodFree), core: m, dedup: dedupFor(o, cluster)}
 			p.validateAt = disruption.CommandValidationDelay
 			out[EmptinessPlanner] = p
 		case *disruption.StaticDrift:
@@ -438,11 +455,11 @@ func DefaultPlanners(ctx context.Context, clk clock.Clock, cluster *state.Cluste
 			}
 			out[DriftPlanner] = p
 		case *disruption.MultiNodeConsolidation:
-			p := &consolidationPlanner{planner: base(MultiNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: &stateDedup{cluster: cluster}}
+			p := &consolidationPlanner{planner: base(MultiNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: dedupFor(o, cluster)}
 			p.validateAt = disruption.CommandValidationDelay
 			out[MultiNodePlanner] = p
 		case *disruption.SingleNodeConsolidation:
-			p := &consolidationPlanner{planner: base(SingleNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: &stateDedup{cluster: cluster}}
+			p := &consolidationPlanner{planner: base(SingleNodePlanner, m, types.ShapeReplacing), compute: m.Compute, validator: m.Validator(), dedup: dedupFor(o, cluster)}
 			p.validateAt = disruption.CommandValidationDelay
 			out[SingleNodePlanner] = p
 		}

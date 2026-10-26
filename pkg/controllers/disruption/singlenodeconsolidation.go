@@ -87,7 +87,9 @@ func (s *SingleNodeConsolidation) Compute(ctx context.Context, disruptionBudgetM
 
 	for i, candidate := range candidates {
 		if s.clock.Now().After(timeout) {
-			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
+			if !opts.WithoutMetrics {
+				ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
+			}
 			log.FromContext(ctx).V(1).Info("abandoning single-node consolidation due to timeout", "candidates_evaluated", i)
 
 			s.PreviouslyUnseenNodePools = unseenNodePools

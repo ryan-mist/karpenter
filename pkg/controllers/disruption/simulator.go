@@ -89,6 +89,8 @@ type SimOptions struct {
 	WithoutPendingPodSideEffects bool
 	// AlsoDeleting are nodes simulated as if they were already being disrupted (SimulationOptions.AlsoDeleting).
 	AlsoDeleting sets.Set[string]
+	// Nodes are the state nodes to simulate on in place of cluster state's (SimulationOptions.Nodes).
+	Nodes state.StateNodes
 }
 
 // Outcome is the result of one simulation.
@@ -120,7 +122,8 @@ func (s *LegacySimulator) Simulate(ctx context.Context, opts SimOptions, candida
 	simOpts := SimulationOptions{IncludeBlockedCandidatePods: opts.IncludeBlockedCandidatePods, ExcludeDestinations: opts.ExcludeDestinations,
 		LimitsUsed: opts.LimitsUsed, SkipDeletingNodePods: opts.SkipDeletingNodePods,
 		TrackUninitialized: opts.TrackUninitialized, CandidateGroupSize: opts.CandidateGroupSize,
-		WithoutPendingPodSideEffects: opts.WithoutPendingPodSideEffects, AlsoDeleting: opts.AlsoDeleting}
+		WithoutPendingPodSideEffects: opts.WithoutPendingPodSideEffects, AlsoDeleting: opts.AlsoDeleting,
+		Nodes: opts.Nodes}
 	var out Outcome
 	var err error
 	if opts.ReservedFallback && len(candidates) == 1 && len(opts.SchedulerOptions) == 0 {
