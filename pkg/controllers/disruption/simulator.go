@@ -84,6 +84,9 @@ type SimOptions struct {
 	TrackUninitialized bool
 	// CandidateGroupSize splits the candidates into groups whose pods never share a node (SimulationOptions).
 	CandidateGroupSize int
+	// WithoutPendingPodSideEffects lists the pending pods without recording scheduling decisions or publishing events
+	// about them (the disruption pipeline).
+	WithoutPendingPodSideEffects bool
 }
 
 // Outcome is the result of one simulation.
@@ -113,8 +116,9 @@ func NewLegacySimulator(kubeClient client.Client, cluster *state.Cluster, provis
 func (s *LegacySimulator) Simulate(ctx context.Context, opts SimOptions, candidates ...*Candidate) (Outcome, error) {
 	start := time.Now()
 	simOpts := SimulationOptions{IncludeBlockedCandidatePods: opts.IncludeBlockedCandidatePods, ExcludeDestinations: opts.ExcludeDestinations,
-		LimitsUsed: opts.LimitsUsed, SkipDeletingNodePods: opts.SkipDeletingNodePods, TrackUninitialized: opts.TrackUninitialized,
-		CandidateGroupSize: opts.CandidateGroupSize}
+		LimitsUsed: opts.LimitsUsed, SkipDeletingNodePods: opts.SkipDeletingNodePods,
+		TrackUninitialized: opts.TrackUninitialized, CandidateGroupSize: opts.CandidateGroupSize,
+		WithoutPendingPodSideEffects: opts.WithoutPendingPodSideEffects}
 	var out Outcome
 	var err error
 	if opts.ReservedFallback && len(candidates) == 1 && len(opts.SchedulerOptions) == 0 {

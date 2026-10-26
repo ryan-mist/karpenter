@@ -26,7 +26,8 @@ import (
 // plans of every lane are unavailable as destinations. Their pods are not re-placed (they aren't deleting yet) and
 // still count at their nodes for topology; whichever simulation runs after such a plan starts re-places them. So no
 // lane plans capacity for another lane's pods before that lane's plan launched its own (decision #9, F26). Nodes of
-// started commands are MarkedForDeletion, and simulations re-place their pods as today.
+// started commands are MarkedForDeletion, and simulations re-place their pods as today. Its simulations list pending pods
+// without side effects (no scheduling decisions recorded, no events), so planning writes nothing (F29).
 type reservingSimulator struct {
 	inner    disruption.Simulator
 	reserved ReservationView
@@ -38,6 +39,8 @@ func NewSimulator(inner disruption.Simulator, reserved ReservationView) disrupti
 }
 
 func (s *reservingSimulator) Simulate(ctx context.Context, opts disruption.SimOptions, candidates ...*disruption.Candidate) (disruption.Outcome, error) {
+	// Planning records nothing about pending pods; the provisioner does on its own loop.
+	opts.WithoutPendingPodSideEffects = true
 	if s.reserved != nil {
 		exclude := s.reserved.Unstarted()
 		if len(exclude) > 0 {
