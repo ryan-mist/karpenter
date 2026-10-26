@@ -173,6 +173,14 @@ var _ = Describe("Asynchronous runners", func() {
 		Eventually(done).Should(BeClosed())
 		Expect(exec.cancelled.Load()).To(BeNumerically(">=", 1))
 	})
+	It("steps again at once after a step that admitted plans while others waited for them", func() {
+		exec.result = pipeline.CommitStepResult{Admitted: 1, Waiting: 1}
+		cancel, done := start(runnables[1])
+		// The fake clock doesn't move: only the immediate re-step makes progress.
+		Eventually(func() int64 { return exec.steps.Load() }).Should(BeNumerically(">", 3))
+		cancel()
+		Eventually(done).Should(BeClosed())
+	})
 	It("drops the waiting plans when the lease is lost during a step", func() {
 		runCtx, cancel := context.WithCancel(ctx)
 		var once sync.Once

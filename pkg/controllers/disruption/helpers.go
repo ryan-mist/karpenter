@@ -81,6 +81,10 @@ type SimulationOptions struct {
 	// WithoutPendingPodSideEffects lists the pending pods without recording scheduling decisions or publishing events
 	// about them (provisioning.WithoutSideEffects). The disruption pipeline sets it.
 	WithoutPendingPodSideEffects bool
+	// AlsoDeleting are providerIDs of nodes simulated as if they were already being disrupted: they receive no pods and
+	// their pods are re-placed. Only the disruption pipeline's reference mode sets it, for the candidates of plans it
+	// reserved but hasn't started, which the disruption controller would have started by then. Empty otherwise.
+	AlsoDeleting sets.Set[string]
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
@@ -93,8 +97,13 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
+	if len(simulationOpts.AlsoDeleting) > 0 {
+		deletingNodes = append(deletingNodes, lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
+			return simulationOpts.AlsoDeleting.Has(n.ProviderID())
+		})...)
+	}
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name()) && !simulationOpts.ExcludeDestinations.Has(n.ProviderID())
+		return !candidateNames.Has(n.Name()) && !simulationOpts.ExcludeDestinations.Has(n.ProviderID()) && !simulationOpts.AlsoDeleting.Has(n.ProviderID())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't

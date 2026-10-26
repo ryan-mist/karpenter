@@ -266,6 +266,12 @@ func (a *admitter) admitOne(ctx context.Context, p *Pending, step *CommitStep, r
 	if err := a.causes(plan, p, step, rebuilt, rv, &in); err != nil {
 		return nil, nil, false, err
 	}
+	// A planner that always re-simulates (consolidation) does so with the method's own validator, which sees only live
+	// state: plans admitted earlier in this step haven't started, so their nodes would look like destinations. The plan
+	// waits for the next step, after they started, as the disruption controller validates after earlier commands started.
+	if rv.AlwaysResimulate() && lo.SomeBy(step.Admitted, func(o *Plan) bool { return o.BatchID != plan.BatchID }) {
+		return nil, nil, true, nil
+	}
 	plans, err := rv.Revalidate(ctx, in)
 	if err != nil {
 		return nil, in.Causes, false, err

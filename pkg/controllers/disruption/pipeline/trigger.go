@@ -76,6 +76,19 @@ func (t PollTrigger) Pace(last StepResult, _ types.WakeSet) time.Duration {
 	return pace
 }
 
+// ReferenceLanes is one lane that plans as a pass of the disruption controller does, for the batch=1 differential
+// (G9), its only user (with DefaultPlanners(..., WithReference())): every planner in the
+// disruption controller's method order, a round ends after the first planner with a plan that isn't a plain delete
+// (FirstWins), and nothing plans while cluster state is unsynced (R45 off).
+func ReferenceLanes(planners map[string]Planner) []LaneSpec {
+	ps := lo.FilterMap([]string{RepairPlanner, EmptinessPlanner, StaticDriftPlanner, DriftPlanner, MultiNodePlanner, SingleNodePlanner},
+		func(n string, _ int) (Planner, bool) {
+			p, ok := planners[n]
+			return p, ok
+		})
+	return []LaneSpec{{ID: types.LaneFast, Planners: ps, SkipWhileUnsynced: true, FirstWins: true, Trigger: PollTrigger{}}}
+}
+
 // DefaultLanes are the default lanes over the given planners (by Name): Fast runs repair, emptiness, static drift and
 // drift; Background runs multi- and single-node consolidation, and skips its rounds while cluster state is unsynced.
 // Missing planners are left out; a lane without planners is left out.

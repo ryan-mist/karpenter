@@ -100,6 +100,10 @@ func (r *commitRunner) Start(ctx context.Context) error {
 			if !res.NextReady.IsZero() {
 				wait = min(wait, max(res.NextReady.Sub(r.clock.Now()), 0))
 			}
+			// Plans that waited for ones admitted in this step to start (rule 9) are ready now.
+			if res.Admitted > 0 {
+				continue
+			}
 		}
 		select {
 		case <-ctx.Done():
