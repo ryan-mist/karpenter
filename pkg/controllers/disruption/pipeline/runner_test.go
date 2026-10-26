@@ -44,8 +44,13 @@ var _ = Describe("PollTrigger", func() {
 		Entry("background: at least a second", pipeline.PollTrigger{Background: true}, pipeline.StepResult{Admitted: 1, Took: time.Millisecond}, time.Second),
 		Entry("a second while plans resolve", pipeline.PollTrigger{}, pipeline.StepResult{Plans: 2}, time.Second),
 		Entry("a second while cluster state syncs", pipeline.PollTrigger{}, pipeline.StepResult{Gated: types.GateSynced}, time.Second),
+		Entry("a second while a planner waits for cluster state to sync", pipeline.PollTrigger{}, pipeline.StepResult{HeldUnsynced: true}, time.Second),
 		Entry("the polling period when idle", pipeline.PollTrigger{}, pipeline.StepResult{}, 10*time.Second),
 		Entry("the polling period when budget is zero", pipeline.PollTrigger{}, pipeline.StepResult{Gated: types.GateBudgetZero}, 10*time.Second),
+		Entry("fast: a second while budget-bound", pipeline.PollTrigger{}, pipeline.StepResult{Gated: types.GateBudgetZero, BudgetBound: true}, time.Second),
+		Entry("fast: a second while one planner is budget-bound", pipeline.PollTrigger{}, pipeline.StepResult{BudgetBound: true}, time.Second),
+		Entry("fast: its duty cycle while budget-bound", pipeline.PollTrigger{}, pipeline.StepResult{BudgetBound: true, Took: time.Second}, 3*time.Second),
+		Entry("background: the polling period while budget-bound", pipeline.PollTrigger{Background: true}, pipeline.StepResult{BudgetBound: true}, 10*time.Second),
 		Entry("the polling period after an error", pipeline.PollTrigger{}, pipeline.StepResult{Err: errors.New("boom")}, 10*time.Second),
 		Entry("a planner's earlier timer", pipeline.PollTrigger{}, pipeline.StepResult{NextTimer: now.Add(3 * time.Second)}, 3*time.Second),
 	)

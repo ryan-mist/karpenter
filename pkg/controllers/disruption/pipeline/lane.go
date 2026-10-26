@@ -62,6 +62,12 @@ type StepResult struct {
 	SnapshotTook, PlanTook time.Duration
 	// Gated is why the whole lane didn't plan, if it didn't.
 	Gated types.GateReason
+	// BudgetBound reports that a planner of the lane didn't plan because no budget was left for it (the whole lane, or
+	// one planner): a disruption in flight frees budget when it finishes.
+	BudgetBound bool
+	// HeldUnsynced reports that cluster state was unsynced and a planner of the lane had candidates it couldn't plan
+	// because of it (only pod-free plans are planned while unsynced).
+	HeldUnsynced bool
 	// NextTimer is the earliest time a planner reported something becomes eligible; zero if none.
 	NextTimer time.Time
 	// Err is the error that ended the round early, if any.
@@ -126,7 +132,7 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 		r.Admitted += l.collect(p.Name())
 	}
 	if gate := l.gate(ctx); gate != types.GateNone {
-		r.Gated = gate
+		r.Gated, r.BudgetBound = gate, gate == types.GateBudgetZero
 		l.deps.Observer.Gated(l.spec.ID, "", gate)
 		return r
 	}
@@ -156,9 +162,11 @@ func (l *lane) Step(ctx context.Context) (r StepResult) {
 		}
 		if !l.hasBudget(ctx, p) {
 			l.deps.Observer.Gated(l.spec.ID, p.Name(), types.GateBudgetZero)
+			r.BudgetBound = true
 			continue
 		}
-		out, candidates, err := l.plan(ctx, p, snapshot, synced)
+		out, candidates, held, err := l.plan(ctx, p, snapshot, synced)
+		r.HeldUnsynced = r.HeldUnsynced || held
 		if err != nil {
 			r.Err = err
 			return r
@@ -206,17 +214,20 @@ func (l *lane) hasBudget(ctx context.Context, p Planner) bool {
 	return ok && bf.BudgetFree()
 }
 
-// plan runs one planner on its candidates. A planner with no candidates doesn't plan.
-func (l *lane) plan(ctx context.Context, p Planner, snapshot *Snapshot, synced bool) (PlanOutput, int, error) {
+// plan runs one planner on its candidates. A planner with no candidates doesn't plan. held reports candidates left out
+// because cluster state is unsynced.
+func (l *lane) plan(ctx context.Context, p Planner, snapshot *Snapshot, synced bool) (out PlanOutput, n int, held bool, err error) {
 	start := l.deps.Clock.Now()
 	candidates := snapshot.CandidatesFor(ctx, p)
 	if !synced && p.Shape() != types.ShapePodFree {
 		// Only a pod-free plan may be admitted while unsynced, so don't plan anything else.
+		all := len(candidates)
 		candidates = lo.Filter(candidates, func(c *disruption.Candidate, _ int) bool { return len(c.ReschedulablePods()) == 0 })
+		held = len(candidates) < all
 	}
 	if len(candidates) == 0 {
 		l.deps.Observer.Planned(l.spec.ID, p, 0, PlanOutput{}, l.deps.Clock.Since(start))
-		return PlanOutput{}, 0, nil
+		return PlanOutput{}, 0, held, nil
 	}
 	in := PlanInput{
 		Candidates: candidates,
@@ -229,9 +240,9 @@ func (l *lane) plan(ctx context.Context, p Planner, snapshot *Snapshot, synced b
 	if tc, ok := p.(TotalsConsumer); ok && tc.NeedsTotals() {
 		in.Evaluator = disruption.NewBalancedEvaluator(snapshot.Totals(ctx, p.Class()), snapshot.Events)
 	}
-	out, err := p.Plan(ctx, in)
+	out, err = p.Plan(ctx, in)
 	l.deps.Observer.Planned(l.spec.ID, p, len(candidates), out, l.deps.Clock.Since(start))
-	return out, len(candidates), err
+	return out, len(candidates), held, err
 }
 
 // complete fills in the fields of a plan that the lane owns.

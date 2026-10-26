@@ -144,7 +144,9 @@ var _ = Describe("Lane", func() {
 		unlaunched.Status.ProviderID = ""
 		cluster.UpdateNodeClaim(unlaunched)
 		Expect(cluster.Synced(ctx)).To(BeFalse())
-		Expect(l.Step(ctx).Err).ToNot(HaveOccurred())
+		r := l.Step(ctx)
+		Expect(r.Err).ToNot(HaveOccurred())
+		Expect(r.HeldUnsynced).To(BeTrue())
 		Expect(moving.planned()[0]).To(ConsistOf(ids[0], ids[2]))
 		Expect(podFree.planned()[0]).To(ConsistOf(ids))
 		Expect(moving.calls[0].Synced).To(BeFalse())
@@ -159,13 +161,19 @@ var _ = Describe("Lane", func() {
 		empty.reason = v1.DisruptionReasonEmpty
 		spec := pipeline.LaneSpec{ID: types.LaneFast, Planners: []pipeline.Planner{drift, empty}}
 		zero := fakeBudgets{zero: sets.New(v1.DisruptionReasonDrifted, v1.DisruptionReasonEmpty)}
-		Expect(newLane(spec, func(d *pipeline.LaneDeps) { d.Budgets = zero }).Step(ctx).Gated).To(Equal(types.GateBudgetZero))
+		r := newLane(spec, func(d *pipeline.LaneDeps) { d.Budgets = zero }).Step(ctx)
+		Expect(r.Gated).To(Equal(types.GateBudgetZero))
+		Expect(r.BudgetBound).To(BeTrue())
 		Expect(drift.planned()).To(BeEmpty())
-		// One reason with budget is enough to run the lane; a planner whose reason has none is skipped.
+		// One reason with budget is enough to run the lane; a planner whose reason has none is skipped, and the lane is
+		// budget-bound.
 		some := fakeBudgets{zero: sets.New(v1.DisruptionReasonDrifted)}
-		Expect(newLane(spec, func(d *pipeline.LaneDeps) { d.Budgets = some }).Step(ctx).Gated).To(Equal(types.GateNone))
+		r = newLane(spec, func(d *pipeline.LaneDeps) { d.Budgets = some }).Step(ctx)
+		Expect(r.Gated).To(Equal(types.GateNone))
+		Expect(r.BudgetBound).To(BeTrue())
 		Expect(drift.planned()).To(BeEmpty())
 		Expect(empty.planned()).To(HaveLen(1))
+		Expect(newLane(spec).Step(ctx).BudgetBound).To(BeFalse())
 	})
 	It("plans for a budget-free planner with no budget left, as repair repairs uninitialized nodes at budget 0", func() {
 		newWorld(1)
