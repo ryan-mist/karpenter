@@ -48,13 +48,36 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 	}
 }
 
-// ComputeCommand generates a disruption command given candidates
-// nolint:gocyclo
+// ComputeCommands generates a disruption command given candidates: the single-node consolidation core with the
+// controller's options.
 func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	if s.IsConsolidated() {
-		return []Command{}, nil
+	res, err := s.Compute(ctx, disruptionBudgetMapping, s.LegacyOptions(), candidates...)
+	return orEmpty(res.Commands), err
+}
+
+// LegacyOptions are the options the disruption controller computes single-node consolidation with: the method's own
+// consolidation state, evaluator and 15 s validator, run inline.
+func (s *SingleNodeConsolidation) LegacyOptions() CoreOptions { return s.legacyOptions(s.validator) }
+
+// Validator is the validator single-node consolidation commands are checked with before they start.
+func (s *SingleNodeConsolidation) Validator() Validator { return s.validator }
+
+// Compute is the single-node consolidation core. It walks the candidates (ordered by opts.Order, or by savings ratio
+// interleaved by NodePool, NodePools left unseen by an earlier timeout first) until SingleNodeConsolidationTimeoutDuration
+// and returns the first command opts.Evaluator approves. With opts.Validator the command is validated before it is
+// returned; if validation fails, nothing is returned.
+//
+// nolint:gocyclo
+func (s *SingleNodeConsolidation) Compute(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates ...*Candidate) (CoreResult, error) {
+	if opts.Dedup != nil && opts.Dedup.IsConsolidated() {
+		return CoreResult{}, nil
 	}
-	candidates = s.SortCandidates(ctx, candidates)
+	if opts.Order != nil {
+		opts.Order(candidates)
+	} else {
+		candidates = s.SortCandidates(ctx, candidates)
+	}
+	evaluator := evaluatorOf(opts)
 
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
@@ -69,7 +92,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 			s.PreviouslyUnseenNodePools = unseenNodePools
 
-			return []Command{}, nil
+			return CoreResult{}, nil
 		}
 		// Track that we've seen this nodepool
 		unseenNodePools.Delete(candidate.NodePool.Name)
@@ -83,12 +106,12 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 		// Skip candidates whose best-case score (delete ratio) cannot pass the
 		// threshold. A DELETE is the upper bound; if it fails, no REPLACE will pass.
-		if !s.evaluator.CanPassThreshold(candidate) {
+		if !evaluator.CanPassThreshold(candidate) {
 			continue
 		}
 
 		// compute a possible consolidation option
-		cmd, err := s.computeConsolidation(ctx, candidate)
+		cmd, err := s.computeConsolidation(ctx, opts, candidate)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed computing consolidation")
 			continue
@@ -97,30 +120,33 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.
-		if approved, _ := s.evaluator.ApproveCommand(ctx, cmd); !approved {
+		if approved, _ := evaluator.ApproveCommand(ctx, cmd); !approved {
 			continue
 		}
-		if _, err = validate(ctx, s.validator, cmd, commandValidationDelay); err != nil {
+		if opts.Validator == nil {
+			return CoreResult{Commands: []Command{cmd}}, nil
+		}
+		if _, err = validate(ctx, opts.Validator, cmd, commandValidationDelay); err != nil {
 			if IsValidationError(err) {
 				reason := getValidationFailureReason(err)
-				cmd.EmitRejectedEvents(s.recorder, reason)
-				return []Command{}, nil
+				cmd.EmitRejectedEvents(opts.Effects, reason)
+				return CoreResult{}, nil
 			}
-			return []Command{}, fmt.Errorf("validating consolidation, %w", err)
+			return CoreResult{}, fmt.Errorf("validating consolidation, %w", err)
 		}
-		return []Command{cmd}, nil
+		return CoreResult{Commands: []Command{cmd}}, nil
 	}
 
-	if !constrainedByBudgets {
+	if !constrainedByBudgets && opts.Dedup != nil {
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
-		s.markConsolidated()
+		opts.Dedup.MarkConsolidated()
 	}
 
 	s.PreviouslyUnseenNodePools = unseenNodePools
 
-	return []Command{}, nil
+	return CoreResult{}, nil
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {

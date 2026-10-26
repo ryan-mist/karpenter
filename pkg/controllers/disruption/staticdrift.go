@@ -57,14 +57,42 @@ func (d *StaticDrift) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	return c.OwnedByStaticNodePool() && c.NodeClaim.StatusConditions().Get(v1.ConditionTypeDrifted).IsTrue()
 }
 
+// ComputeCommands generates disruption commands given candidates: the static drift core with the controller's options.
 func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	res, err := d.Compute(ctx, disruptionBudgetMapping, d.LegacyOptions(), candidates...)
+	return res.Commands, err
+}
+
+// LegacyOptions are the options the disruption controller computes static drift with: limits.nodes slots reserved in
+// cluster state while the commands are computed, and events published right away.
+func (d *StaticDrift) LegacyOptions() CoreOptions {
+	return CoreOptions{Effects: InlineEffects{Recorder: d.recorder, Cluster: d.cluster}}
+}
+
+// Compute is the static drift core. Per static NodePool, within its budget and once it has scaled down to its replicas,
+// it replaces drifted candidates one per command, reserving a limits.nodes slot for each replacement through
+// opts.Effects. A NodePool that can't stage a replacement (its capacity reservations are full, or it is at its node
+// limit) gets delete-only terminate-first commands where allowed, and Blocked events otherwise. With opts.Order the
+// candidates are sorted first and NodePools are handled in the order of their first candidate; without it, in map
+// order, as before.
+//
+//nolint:gocyclo
+func (d *StaticDrift) Compute(ctx context.Context, disruptionBudgetMapping map[string]int, opts CoreOptions, candidates ...*Candidate) (CoreResult, error) {
+	if opts.Order != nil {
+		opts.Order(candidates)
+	}
 	// Group candidates by nodepool name
 	candidatesByNodePool := lo.GroupBy(candidates, func(candidate *Candidate) string {
 		return candidate.NodePool.Name
 	})
+	nodePools := lo.Keys(candidatesByNodePool)
+	if opts.Order != nil {
+		nodePools = lo.Uniq(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name }))
+	}
 
 	var cmds []Command
-	for npName, npCandidates := range candidatesByNodePool {
+	for _, npName := range nodePools {
+		npCandidates := candidatesByNodePool[npName]
 		np := npCandidates[0].NodePool
 
 		if disruptionBudgetMapping[npName] == 0 {
@@ -102,7 +130,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 				// first and is the only one that can terminate first; the rest can't be replaced either way.
 				holdsSlot := func(c *Candidate) bool { return holdsOfferedReservation(c, offered) }
 				eligible, rest := lo.FilterReject(npCandidates, func(c *Candidate, _ int) bool { return holdsSlot(c) })
-				cmds = append(cmds, d.unreplaceableCommands(ctx, np, append(eligible, rest...)[:maxDrifts], holdsSlot, TerminateFirstNoReservedCapacity,
+				cmds = append(cmds, d.unreplaceableCommands(ctx, opts.Effects, np, append(eligible, rest...)[:maxDrifts], holdsSlot, TerminateFirstNoReservedCapacity,
 					"static NodePool's capacity reservations are full and cannot stage a replacement")...)
 				continue
 			}
@@ -111,7 +139,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		// Acquire limits from cluster state without bursting over. maxAllowedDrifts is how many candidates we can drift
 		// while staging a replacement for each without exceeding the NodePool's node limit; 0 means the pool is at its
 		// limit and can't stage any replacement.
-		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+		maxAllowedDrifts := opts.Effects.ReserveNodeCount(npName, nodeLimit, maxDrifts)
 
 		// Terminate-first (RFC #3203): when the NodePool is at its node limit it can't stage a replacement first — a
 		// pre-spun replacement would be an (N+1)th node the operator capped out. Issue budget-paced delete-only commands;
@@ -121,7 +149,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		// no-op in that case (it reserved nothing).
 		// We will not get a negative value here
 		if maxAllowedDrifts == 0 {
-			cmds = append(cmds, d.unreplaceableCommands(ctx, np, npCandidates[:maxDrifts], func(*Candidate) bool { return true }, TerminateFirstStaticAtLimit,
+			cmds = append(cmds, d.unreplaceableCommands(ctx, opts.Effects, np, npCandidates[:maxDrifts], func(*Candidate) bool { return true }, TerminateFirstStaticAtLimit,
 				"static NodePool is at its node limit and cannot stage a replacement")...)
 			continue
 		}
@@ -139,12 +167,12 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			})
 		}
 	}
-	return cmds, nil
+	return CoreResult{Commands: cmds}, nil
 }
 
 // unreplaceableCommands handles a NodePool's candidates when it can't stage a replacement: with TerminateFirstDrift, each
 // candidate that canTerminateFirst gets a delete-only command; every other candidate is reported blocked.
-func (d *StaticDrift) unreplaceableCommands(ctx context.Context, np *v1.NodePool, candidates []*Candidate, canTerminateFirst func(*Candidate) bool,
+func (d *StaticDrift) unreplaceableCommands(ctx context.Context, effects Effects, np *v1.NodePool, candidates []*Candidate, canTerminateFirst func(*Candidate) bool,
 	reason TerminateFirstReason, blockedReason string) []Command {
 	// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand the workload
 	// with no replacement.
@@ -159,7 +187,7 @@ func (d *StaticDrift) unreplaceableCommands(ctx context.Context, np *v1.NodePool
 			})
 			continue
 		}
-		d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, blockedReason)...)
+		effects.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, blockedReason)...)
 	}
 	return cmds
 }

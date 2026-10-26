@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,6 +57,26 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 type SimulationOptions struct {
 	// IncludeBlockedCandidatePods includes candidate pods even when they cannot currently be evicted.
 	IncludeBlockedCandidatePods bool
+	// ExcludeDestinations are providerIDs of nodes that may not receive pods in this simulation. Their own pods are not
+	// moved. Batched drift uses it so each chunk of a split batch plans around the capacity earlier chunks rely on.
+	// Empty for every single-candidate simulation.
+	ExcludeDestinations sets.Set[string]
+	// LimitsUsed counts resources against NodePool limits on top of the cluster's nodes, by NodePool name: excluded
+	// destinations that stay, and replacements that other commands planned but haven't launched.
+	LimitsUsed map[string]corev1.ResourceList
+	// SkipDeletingNodePods leaves out the pods of nodes that are already being disrupted, for a simulation whose plan
+	// already placed them in an earlier simulation.
+	SkipDeletingNodePods bool
+	// TrackUninitialized lets the candidates' pods use nodes that aren't initialized yet (in-flight replacements)
+	// without failing them with UninitializedNodeError: the caller records those nodes as the command's Dependencies
+	// (UninitializedDependencies) and waits for them before deleting the candidates. When a destination isn't
+	// initialized, the candidates' pods are scheduled after pending pods and pods of deleting nodes, so those keep the
+	// capacity launched for them and nothing is provisioned twice for them.
+	TrackUninitialized bool
+	// CandidateGroupSize, if set, splits the candidates, in order, into groups of that size whose pods never share a
+	// node, so no part of the plan that one group's pods need (an existing node or a new NodeClaim) is shared with
+	// another group.
+	CandidateGroupSize int
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
@@ -69,7 +90,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name())
+		return !candidateNames.Has(n.Name()) && !simulationOpts.ExcludeDestinations.Has(n.ProviderID())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
@@ -114,9 +135,11 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidatePods = lo.Map(candidatePods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })
 	pods = append(pods, candidatePods...)
 
-	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
+	var deletingNodePods []*corev1.Pod
+	if !simulationOpts.SkipDeletingNodePods {
+		if deletingNodePods, err = deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder); err != nil {
+			return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
+		}
 	}
 	pods = append(pods, deletingNodePods...)
 
@@ -126,6 +149,22 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
 	opts = append(opts, schedulerOpts...)
+	for np, used := range simulationOpts.LimitsUsed {
+		opts = append(opts, scheduling.CountAgainstLimits(np, used))
+	}
+	// Only uninitialized nodes need the order: without one, the scheduler places pods exactly as it always has.
+	if simulationOpts.TrackUninitialized && lo.SomeBy(stateNodes, func(n *state.StateNode) bool { return !n.Initialized() }) {
+		opts = append(opts, scheduling.CandidatePodsLast)
+	}
+	if size := simulationOpts.CandidateGroupSize; size > 0 && len(candidates) > size {
+		groups := map[types.UID]int{}
+		for i, c := range candidates {
+			for _, p := range c.reschedulablePods {
+				groups[p.UID] = i / size
+			}
+		}
+		opts = append(opts, scheduling.PodGroups(groups))
+	}
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
@@ -153,7 +192,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		// tell us if we can schedule to them or not; however, if these nodes are managed, we will still schedule to them
 		// even if they are still in the middle of their initialization loop. In the case of disruption, we don't want
 		// to proceed disrupting if our scheduling decision relies on nodes that haven't entered a terminal state.
-		if !n.Initialized() {
+		if !n.Initialized() && !simulationOpts.TrackUninitialized {
 			for _, p := range n.Pods {
 				// Only add a pod scheduling error if it isn't on an already deleting node.
 				// If the pod is on a deleting node, we assume one of two things has already happened:
@@ -253,6 +292,30 @@ func (u *UninitializedNodeError) Error() string {
 		info = append(info, fmt.Sprintf("node/%s", u.Node.Name))
 	}
 	return fmt.Sprintf("would schedule against uninitialized %s", strings.Join(info, ", "))
+}
+
+// UninitializedDependencies returns the providerIDs, sorted, of the nodes that aren't initialized yet (and aren't
+// being deleted) to which the results schedule a pod of the candidates: a command of these candidates can delete them
+// only once those nodes are initialized. Pending pods and pods of deleting nodes don't count, as for
+// UninitializedNodeError.
+func UninitializedDependencies(candidates []*Candidate, results scheduling.Results) []string {
+	owned := sets.New[types.UID]()
+	for _, c := range candidates {
+		for _, p := range c.reschedulablePods {
+			owned.Insert(p.UID)
+		}
+	}
+	var deps []string
+	for _, en := range results.ExistingNodes {
+		if en.Initialized() || en.MarkedForDeletion() {
+			continue
+		}
+		if lo.SomeBy(en.Pods, func(p *corev1.Pod) bool { return owned.Has(p.UID) }) {
+			deps = append(deps, en.ProviderID())
+		}
+	}
+	slices.Sort(deps)
+	return deps
 }
 
 // instanceTypesAreSubset returns true if the lhs slice of instance types are a subset of the rhs.

@@ -36,6 +36,7 @@ package disruption_test
 //     10% budget; the loop stops at the first iteration that starts no new command).
 //   - KARPENTER_DISRUPTION_BENCH_OUT: file that JSON lines are appended to. Records are always written to GinkgoWriter.
 //   - KARPENTER_DISRUPTION_BENCH_PROFILE: directory for CPU profiles of the measured sections.
+//   - KARPENTER_DISRUPTION_BENCH_DRIFT_BATCH: if set, the drift fill loop runs with batched drift forced on.
 //
 // Each record has a "scenario" and a "nodes" field. To compare two builds, run both with the same sizes on the same
 // machine, preferably alternating, and compare records with the same (scenario, nodes) key.
@@ -163,6 +164,24 @@ func benchInstanceTypes() []*cloudprovider.InstanceType {
 		}
 	}
 	return its
+}
+
+// batchedDrift is drift as the disruption pipeline will run it: batches sized to BatchSimDeadline, at most
+// ComponentCap candidates per command.
+type batchedDrift struct {
+	*disruption.Drift
+	opts disruption.CoreOptions
+}
+
+func newBatchedDrift(d *disruption.Drift) *batchedDrift {
+	opts := d.LegacyOptions()
+	opts.Batch, opts.Sizer, opts.Deadline = 1<<20, disruption.NewBatchSizer(disruption.BatchSimDeadline), disruption.BatchSimDeadline
+	return &batchedDrift{Drift: d, opts: opts}
+}
+
+func (b *batchedDrift) ComputeCommands(ctx context.Context, budgets map[string]int, candidates ...*disruption.Candidate) ([]disruption.Command, error) {
+	res, err := b.Compute(ctx, budgets, b.opts, candidates...)
+	return res.Commands, err
 }
 
 // newBenchEnv builds the disruption stack on a cache-backed client, mirroring the operator's indexers.
@@ -678,6 +697,20 @@ var _ = Describe("Disruption Scale Benchmark", Label("benchmark"), func() {
 			// Full Controller.Reconcile iterations until Drift stops producing commands (budget full), then that
 			// fall-through iteration (where MultiNode/SingleNode consolidation run) is recorded too. Note the
 			// budget grows as replacements join: allowed = 10% of (N + in-flight replacements).
+			// With KARPENTER_DISRUPTION_BENCH_DRIFT_BATCH set, the fill loop runs with batched drift forced on (test-only):
+			// batches sized to BatchSimDeadline, at most ComponentCap candidates per command.
+			driftBatch := os.Getenv("KARPENTER_DISRUPTION_BENCH_DRIFT_BATCH") != ""
+			ctrl := b.ctrl
+			if driftBatch {
+				methods := lo.Map(b.methods, func(m disruption.Method, _ int) disruption.Method {
+					if d, ok := m.(*disruption.Drift); ok {
+						return newBatchedDrift(d)
+					}
+					return m
+				})
+				ctrl = disruption.NewController(b.ctx, env.Clock, b.client, b.prov, cloudProvider, b.recorder, b.cluster, b.queue, b.clusterCost,
+					disruption.WithMethods(methods...))
+			}
 			iters := benchIters(n)
 			stopProfile := startProfile(fmt.Sprintf("drift-reconcile-%d", n))
 			var iterMs []float64
@@ -693,7 +726,7 @@ var _ = Describe("Disruption Scale Benchmark", Label("benchmark"), func() {
 				var res reconciler.Result
 				t := measure(func() {
 					var err error
-					res, err = b.ctrl.Reconcile(b.ctx)
+					res, err = ctrl.Reconcile(b.ctx)
 					Expect(err).ToNot(HaveOccurred())
 				})
 				cmds := b.queue.GetCommands()
@@ -726,7 +759,10 @@ var _ = Describe("Disruption Scale Benchmark", Label("benchmark"), func() {
 			stopProfile()
 			emit(map[string]any{"scenario": "drift-summary", "nodes": n, "iterations": len(iterMs), "medianIterMs": median(iterMs),
 				"firstIterMs": iterMs[0], "lastFillIterMs": iterMs[max(0, len(iterMs)-2)], "fallThroughIterMs": fallThrough,
-				"sumIterMs": lo.Sum(iterMs), "commandsStarted": len(b.queue.GetCommands()), "events": topEvents(eventCounts)})
+				"sumIterMs": lo.Sum(iterMs), "commandsStarted": len(b.queue.GetCommands()), "events": topEvents(eventCounts), "driftBatch": driftBatch,
+				"nodesDisrupted":  lo.SumBy(b.queue.GetCommands(), func(c *disruption.Command) int { return len(c.Candidates) }),
+				"replacements":    lo.SumBy(b.queue.GetCommands(), func(c *disruption.Command) int { return len(c.Replacements) }),
+				"maxCommandNodes": lo.Max(lo.Map(b.queue.GetCommands(), func(c *disruption.Command, _ int) int { return len(c.Candidates) }))})
 		})
 	}
 
