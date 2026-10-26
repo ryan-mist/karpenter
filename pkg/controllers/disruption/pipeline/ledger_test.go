@@ -131,6 +131,17 @@ var _ = Describe("Ledger", func() {
 			setBudget("1")
 			Expect(pipeline.RejectReasonOf(l.Recheck(ctx, p.ID))).To(Equal(types.ReasonBudget))
 		})
+		It("rechecks several plans against one reading of live state, each without its own reservation", func() {
+			setBudget("2")
+			a := budgetPlan(w.nodePool.Name, v1.DisruptionReasonUnderutilized, ids[0])
+			b := budgetPlan(w.nodePool.Name, v1.DisruptionReasonUnderutilized, ids[1])
+			Expect(l.Reserve(ctx, a, b)).To(Equal([]error{nil, nil}))
+			Expect(l.RecheckAll(ctx, a.ID, b.ID)).To(Equal([]error{nil, nil}))
+			setBudget("1")
+			errs := l.RecheckAll(ctx, a.ID, b.ID, uuid.New())
+			Expect(lo.Map(errs, func(err error, _ int) types.RejectReason { return pipeline.RejectReasonOf(err) })).To(Equal(
+				[]types.RejectReason{types.ReasonBudget, types.ReasonBudget, types.ReasonCanceled}))
+		})
 		It("rejects the rest of a batch once one of its plans doesn't fit", func() {
 			setBudget("2")
 			batch := lo.Map(ids[:3], func(id string, _ int) *pipeline.Plan {

@@ -343,6 +343,23 @@ var _ = Describe("Admitter", func() {
 			}
 			return ps
 		}
+		It("rebuilds a batch's candidates once, and gives each plan only its own rejections", func() {
+			rb := &countingRebuilder{CandidateRebuilder: pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue)}
+			admitter = pipeline.NewAdmitter(l, rb, planner)
+			g := batch(plan(ids[0]), plan(ids[1]), plan(ids[2]))
+			// The third plan's candidate is no longer a candidate.
+			cluster.MarkForDeletion(ids[2])
+			r := admitter.Admit(ctx, g, step())
+			Expect(rb.calls).To(Equal(1))
+			Expect(rb.ids).To(ConsistOf(ids[0], ids[1], ids[2]))
+			Expect(r.Rejected).To(HaveLen(3)) // the batch fails together: one rejection, two siblings
+			for _, in := range planner.inputs {
+				Expect(len(in.Rejected)).To(BeNumerically("<=", 1))
+				for id := range in.Rejected {
+					Expect(providerIDsOf(in.Plan.Candidates)).To(ContainElement(id))
+				}
+			}
+		})
 		It("re-simulates a batch's stale plans with one joint simulation, and starts its plans in their place", func() {
 			jp := &jointPlanner{acceptingPlanner: planner}
 			admitter = pipeline.NewAdmitter(l, pipeline.NewCandidateRebuilder(env.Client, cluster, env.Clock, cloudProvider, queue), jp)
@@ -557,4 +574,17 @@ func (failingRebuilder) Rebuild(ctx context.Context, _ string, _ ...string) (*pi
 		return nil, ctx.Err()
 	}
 	return nil, errors.New("the server is currently unable to handle the request")
+}
+
+// countingRebuilder counts its Rebuild calls and the candidates they asked for.
+type countingRebuilder struct {
+	pipeline.CandidateRebuilder
+	calls int
+	ids   []string
+}
+
+func (r *countingRebuilder) Rebuild(ctx context.Context, class string, providerIDs ...string) (*pipeline.Rebuilt, error) {
+	r.calls++
+	r.ids = append(r.ids, providerIDs...)
+	return r.CandidateRebuilder.Rebuild(ctx, class, providerIDs...)
 }

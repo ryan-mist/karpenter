@@ -132,6 +132,9 @@ type Ledger interface {
 	Reserve(ctx context.Context, plans ...*Plan) []error
 	// Recheck checks a reserved plan against live state, excluding its own reservation.
 	Recheck(ctx context.Context, id uuid.UUID) error
+	// RecheckAll is Recheck for several plans against one reading of live state (a batch: reading it costs a pass over
+	// every node), returning one error per plan.
+	RecheckAll(ctx context.Context, ids ...uuid.UUID) []error
 	// Amend replaces a reserved plan's footprint (a re-simulation changed it), if the new footprint fits.
 	Amend(ctx context.Context, id uuid.UUID, fp types.Footprint) error
 	// Swap replaces reserved plans with re-planned ones, all or nothing.
@@ -575,22 +578,38 @@ func (l *ledger) releaseStatic(held map[string]int64) {
 }
 
 func (l *ledger) Recheck(ctx context.Context, id uuid.UUID) error {
+	return l.RecheckAll(ctx, id)[0]
+}
+
+func (l *ledger) RecheckAll(ctx context.Context, ids ...uuid.UUID) []error {
+	errs := make([]error, len(ids))
+	var fps []types.Footprint
 	l.mu.Lock()
-	r, ok := l.reserved[id]
-	l.mu.Unlock()
-	if !ok {
-		return reject(types.ReasonCanceled, "plan %s is not reserved", id)
+	for _, id := range ids {
+		if r, ok := l.reserved[id]; ok {
+			fps = append(fps, r.footprint)
+		}
 	}
-	in, err := l.inputs(ctx, r.footprint)
+	l.mu.Unlock()
+	in, err := l.inputs(ctx, fps...)
 	if err != nil {
-		return err
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if r, ok = l.reserved[id]; !ok {
-		return reject(types.ReasonCanceled, "plan %s is not reserved", id)
+	live := l.live()
+	for i, id := range ids {
+		r, ok := l.reserved[id]
+		if !ok {
+			errs[i] = reject(types.ReasonCanceled, "plan %s is not reserved", id)
+			continue
+		}
+		errs[i] = l.check(in, live, r.footprint, r.plan.Reason, id)
 	}
-	return l.check(in, l.live(), r.footprint, r.plan.Reason, id)
+	return errs
 }
 
 func (l *ledger) Amend(ctx context.Context, id uuid.UUID, fp types.Footprint) error {
