@@ -3104,8 +3104,7 @@ var _ = Describe("Consolidation", func() {
 			}
 			// Reset the disruption controller so consolidation methods are not cached as consolidated
 			*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(NewMethodsWithNopValidator()...))
+			disruptionController = newSuiteDisruptionController()
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Now consolidation should proceed — consolidateAfter window has expired
@@ -3546,7 +3545,7 @@ var _ = Describe("Consolidation", func() {
 		var nodes []*corev1.Node
 
 		BeforeEach(func() {
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+			disruptionController = newRealValidatorDisruptionController()
 			nodeClaims, nodes = test.NodeClaimsAndNodes(2, v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -4165,7 +4164,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should wait for the node TTL for non-empty nodes before consolidating (multi-node)",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = newRealValidatorDisruptionController()
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4237,7 +4236,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should consolidate multiple empty nodes via multi-nodeclaim consolidation",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = newRealValidatorDisruptionController()
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4300,7 +4299,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should continue to single nodeclaim consolidation when multi-nodeclaim consolidation fails validation after the node ttl",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = newRealValidatorDisruptionController()
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4368,6 +4367,12 @@ var _ = Describe("Consolidation", func() {
 
 						// advance the clock so that the timeout expires for multi-nodeclaim consolidation
 						env.Clock.Step(31 * time.Second)
+						if pipelineTwin {
+							// The pipeline re-plans a plan rejected at admission in the lane's next round, not in the
+							// same pass, so the single-node plan comes from the next Reconcile (below).
+							Eventually(finished.Load, 10*time.Second).Should(BeTrue())
+							return
+						}
 
 						// wait for the controller to block on the validation timeout for single nodeclaim consolidation
 						Eventually(env.Clock.HasWaiters, time.Second*5).Should(BeTrue())
@@ -4378,6 +4383,10 @@ var _ = Describe("Consolidation", func() {
 						Eventually(finished.Load, 10*time.Second).Should(BeTrue())
 					},
 				)
+				if pipelineTwin {
+					Expect(queue.GetCommands()).To(BeEmpty())
+					ExpectSingletonReconciled(ctx, autoStepping(disruptionController))
+				}
 
 				// Process the item so that the nodes can be deleted.
 				cmds := queue.GetCommands()
