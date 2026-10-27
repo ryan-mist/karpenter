@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
@@ -659,6 +660,43 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 	})
 	return multierr.Combine(errs...)
 }
+
+// NoScheduleTaintRemovalNeeded returns true if RequireNoScheduleTaint(addTaint=false) would patch this node when the
+// API server's Node matches the cluster state copy, i.e. the node has a NodeClaim and its Node carries a
+// karpenter.sh/disruption:NoSchedule taint. It only reads the StateNode, so it is safe to call while iterating
+// Cluster.Nodes().
+func (in *StateNode) NoScheduleTaintRemovalNeeded() bool {
+	if in.Node == nil || in.NodeClaim == nil {
+		return false
+	}
+	return lo.ContainsBy(in.Node.Spec.Taints, func(taint corev1.Taint) bool {
+		return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+	})
+}
+
+// NodeClaimConditionClearNeeded returns true if ClearNodeClaimsCondition may patch this node's NodeClaim when the API
+// server's NodeClaim matches the cluster state copy: the condition is present, or one of the root or dependent
+// conditions (Ready, Launched, Registered, Initialized) that StatusConditions() initializes to Unknown, and so writes,
+// is Unknown or missing. Unknown counts because cluster state calls StatusConditions() on its copy, which initializes
+// a missing condition in memory, so an Unknown condition in cluster state may be missing on the API server. It only
+// reads the StateNode, so it is safe to call while iterating Cluster.Nodes().
+func (in *StateNode) NodeClaimConditionClearNeeded(conditionType string) bool {
+	if !in.Initialized() || in.NodeClaim == nil {
+		return false
+	}
+	conditions := in.NodeClaim.Status.Conditions
+	if lo.ContainsBy(conditions, func(c status.Condition) bool { return c.Type == conditionType }) {
+		return true
+	}
+	return lo.SomeBy(nodeClaimInitializedConditionTypes(), func(t string) bool {
+		return !lo.ContainsBy(conditions, func(c status.Condition) bool { return c.Type == t && c.Status != metav1.ConditionUnknown })
+	})
+}
+
+// nodeClaimInitializedConditionTypes returns the condition types that NodeClaim.StatusConditions() initializes.
+var nodeClaimInitializedConditionTypes = sync.OnceValue(func() []string {
+	return lo.Map((&v1.NodeClaim{}).StatusConditions().List(), func(c status.Condition, _ int) string { return c.Type })
+})
 
 // ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
 func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*StateNode) error {
