@@ -17,6 +17,7 @@ limitations under the License.
 package pipeline
 
 import (
+	"context"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -30,9 +31,9 @@ import (
 // authority; a view is only a hint.
 type BudgetView interface {
 	// Remaining is how many more nodes of nodePool may be disrupted for reason.
-	Remaining(nodePool string, reason v1.DisruptionReason) int
+	Remaining(ctx context.Context, nodePool string, reason v1.DisruptionReason) int
 	// AnyRemaining reports whether any NodePool may disrupt another node for reason.
-	AnyRemaining(reason v1.DisruptionReason) bool
+	AnyRemaining(ctx context.Context, reason v1.DisruptionReason) bool
 }
 
 // ReservationView is the live view of the plans that are reserved but not started, in every lane, and of the started
