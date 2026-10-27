@@ -123,3 +123,12 @@ func PrepareReboot(ctx context.Context, cmd *Command) (bool, error) {
 	}
 	return true, nil
 }
+
+// WithCompletionHook makes the queue call hook after it completes a command, successfully or not. Hooks must be added
+// before the queue starts and must not block. Hooks can't be removed, so whatever adds one (the pipeline's
+// NewController) should run once per Queue; tests that build several controllers on one Queue accumulate hooks.
+func (q *Queue) WithCompletionHook(hook func(*Command)) {
+	q.Lock()
+	defer q.Unlock()
+	q.completionHooks = append(q.completionHooks, hook)
+}

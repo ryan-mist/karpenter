@@ -139,7 +139,7 @@ var _ = Describe("Executor", func() {
 		a, b := newPlan(ids[0], ids[1]), newPlan(ids[2])
 		b.BatchID, a.Siblings, b.Siblings = a.ID, 2, 2
 		ch := exec.Submit(ctx, a, b)
-		Expect(drain(ch)).To(Equal([]pipeline.Resolution{{PlanID: b.ID, Kind: pipeline.Rejected, Reason: types.ReasonBudget}}))
+		Expect(drain(ch)).To(Equal([]pipeline.Resolution{{PlanID: b.ID, Kind: pipeline.Rejected, Reason: types.ReasonBudget, AtSubmit: true}}))
 		exec.Step(ctx)
 		Expect(planner.inputs[0].Causes).To(ContainElement(types.ResimSibling))
 	})
@@ -147,7 +147,7 @@ var _ = Describe("Executor", func() {
 		lost, cancel := context.WithCancel(ctx)
 		cancel()
 		p := newPlan(ids[0])
-		Expect(drain(exec.Submit(lost, p))).To(Equal([]pipeline.Resolution{{PlanID: p.ID, Kind: pipeline.Rejected, Reason: types.ReasonCanceled}}))
+		Expect(drain(exec.Submit(lost, p))).To(Equal([]pipeline.Resolution{{PlanID: p.ID, Kind: pipeline.Rejected, Reason: types.ReasonCanceled, AtSubmit: true}}))
 		Expect(l.View().IsReserved(ids[0])).To(BeFalse())
 		Expect(exec.Step(ctx).Waiting).To(BeZero())
 	})
@@ -156,7 +156,7 @@ var _ = Describe("Executor", func() {
 		a.ValidateAt = env.Clock.Now().Add(15 * time.Second)
 		exec.Submit(ctx, a)
 		b := newPlan(ids[1])
-		Expect(drain(exec.Submit(ctx, b))).To(Equal([]pipeline.Resolution{{PlanID: b.ID, Kind: pipeline.Rejected, Reason: types.ReasonBackpressure}}))
+		Expect(drain(exec.Submit(ctx, b))).To(Equal([]pipeline.Resolution{{PlanID: b.ID, Kind: pipeline.Rejected, Reason: types.ReasonBackpressure, AtSubmit: true}}))
 		Expect(l.View().IsReserved(ids[1])).To(BeFalse())
 	})
 	It("admits a plan at its ValidateAt, not before", func() {
