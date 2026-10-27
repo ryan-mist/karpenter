@@ -30,6 +30,17 @@ type RoundEvents struct {
 	mu       sync.Mutex
 	events   []events.Event
 	verdicts []types.Verdict
+	noAction []NoAction
+}
+
+// NoAction explains why a planner did nothing for a NodePool this round, e.g. its budget is exhausted. The Observer
+// publishes it as a NodePool event when the explanation for that planner and NodePool changes.
+type NoAction struct {
+	Planner  string
+	NodePool string
+	// Reason is the event reason, e.g. events.DisruptionBudgetExhausted.
+	Reason  string
+	Message string
 }
 
 func (r *RoundEvents) Publish(evts ...events.Event) {
@@ -57,4 +68,18 @@ func (r *RoundEvents) Verdicts() []types.Verdict {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]types.Verdict(nil), r.verdicts...)
+}
+
+// ExplainNoAction adds an explanation of why a planner did nothing for a NodePool.
+func (r *RoundEvents) ExplainNoAction(n NoAction) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noAction = append(r.noAction, n)
+}
+
+// NoActions returns the round's explanations.
+func (r *RoundEvents) NoActions() []NoAction {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]NoAction(nil), r.noAction...)
 }

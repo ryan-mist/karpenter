@@ -1,0 +1,208 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package pipeline
+
+import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/samber/lo"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/pipeline/types"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+)
+
+// The pipeline's metrics are emitted only with the DisruptionPipeline feature gate on.
+const (
+	subsystem    = "voluntary_disruption"
+	laneLabel    = "lane"
+	phaseLabel   = "phase"
+	resultLabel  = "result"
+	gateLabel    = "gate"
+	plannerLabel = "planner"
+	causeLabel   = "cause"
+)
+
+// Round phases.
+const (
+	phaseSnapshot = "snapshot"
+	phasePlan     = "plan"
+	phaseAdmit    = "admit"
+)
+
+// Planner names of the default planners, in the disruption controller's method order. They are metric label values.
+const (
+	RepairPlanner      = "repair"
+	EmptinessPlanner   = "emptiness"
+	StaticDriftPlanner = "static_drift"
+	DriftPlanner       = "drift"
+	MultiNodePlanner   = "multi"
+	SingleNodePlanner  = "single"
+)
+
+// Round and plan results.
+const (
+	roundPlanned = "planned"
+	roundNoop    = "noop"
+	roundGated   = "gated"
+	planAdmitted = "admitted"
+	planRejected = "rejected"
+	planDropped  = "dropped"
+)
+
+var (
+	LaneDim = opmetrics.Label{
+		Name: laneLabel,
+		Help: "The disruption pipeline lane.",
+		Values: []opmetrics.Value{
+			{Name: string(types.LaneFast), Help: "Repair, emptiness, static drift and drift."},
+			{Name: string(types.LaneBackground), Help: "Multi- and single-node consolidation."},
+		},
+	}
+	RoundPhase = opmetrics.Label{
+		Name: phaseLabel,
+		Help: "The phase of a disruption pipeline round.",
+		Values: []opmetrics.Value{
+			{Name: phaseSnapshot, Help: "Building the round's snapshot of cluster state."},
+			{Name: phasePlan, Help: "Running the lane's planners and submitting their plans."},
+			{Name: phaseAdmit, Help: "Admitting the lane's plans in the commit loop."},
+		},
+	}
+	RoundResult = opmetrics.Label{
+		Name: resultLabel,
+		Help: "What a disruption pipeline round did.",
+		Values: []opmetrics.Value{
+			{Name: roundPlanned, Help: "A planner submitted plans."},
+			{Name: roundNoop, Help: "No planner submitted a plan."},
+			{Name: roundGated, Help: "The lane didn't plan."},
+		},
+	}
+	GateDim = opmetrics.Label{
+		Name: gateLabel,
+		Help: "Why a disruption pipeline lane or planner didn't plan.",
+		Values: []opmetrics.Value{
+			{Name: string(types.GateSynced), Help: "Cluster state isn't synced."},
+			{Name: string(types.GateBudgetZero), Help: "No NodePool has budget left for the lane's reasons."},
+			{Name: string(types.GateBreaker), Help: "The repair breaker tripped."},
+			{Name: string(types.GateUnresolved), Help: "The planner's last plans are unresolved."},
+			{Name: string(types.GatePaced), Help: "The lane is paced."},
+			{Name: string(types.GateHydrating), Help: "The prediction store is hydrating."},
+		},
+	}
+	PlannerDim = opmetrics.Label{
+		Name: plannerLabel,
+		Help: "The disruption pipeline planner, or admitter for admission re-simulations.",
+		Values: []opmetrics.Value{
+			{Name: RepairPlanner, Help: "Node repair."},
+			{Name: EmptinessPlanner, Help: "Empty-node consolidation."},
+			{Name: StaticDriftPlanner, Help: "Drift of static NodePools."},
+			{Name: DriftPlanner, Help: "Drift."},
+			{Name: MultiNodePlanner, Help: "Multi-node consolidation."},
+			{Name: SingleNodePlanner, Help: "Single-node consolidation."},
+		},
+	}
+	PlanResult = opmetrics.Label{
+		Name: resultLabel,
+		Help: "How a disruption pipeline plan ended.",
+		Values: []opmetrics.Value{
+			{Name: planAdmitted, Help: "The plan started."},
+			{Name: planRejected, Help: "The plan was rejected at reservation, admission or start."},
+			{Name: planDropped, Help: "The plan waited too long, or the pipeline stopped."},
+		},
+	}
+	RejectReasonDim = opmetrics.Label{
+		Name: metrics.ReasonLabel,
+		Help: "Why a disruption pipeline plan was rejected or dropped; empty if it started.",
+		Values: append([]opmetrics.Value{{Name: "", Help: "Not rejected: the plan started."}}, lo.Map([]types.RejectReason{
+			types.ReasonConflict, types.ReasonBudget, types.ReasonNodePoolLimit, types.ReasonStaticNodeLimit, types.ReasonCapacityReservation,
+			types.ReasonCandidateInvalid, types.ReasonCandidateBlocked, types.ReasonCandidateNominated, types.ReasonCandidateIneligible,
+			types.ReasonPodsChanged, types.ReasonResimUnschedulable, types.ReasonResimChanged, types.ReasonSiblingRejected, types.ReasonDeferred,
+			types.ReasonStartFailed, types.ReasonBackpressure, types.ReasonDeadline, types.ReasonCanceled, types.ReasonError,
+		}, func(r types.RejectReason, _ int) opmetrics.Value {
+			return opmetrics.Value{Name: string(r), Help: "Rejected or dropped: " + string(r) + "."}
+		})...),
+	}
+	ResimCauseDim = opmetrics.Label{
+		Name: causeLabel,
+		Help: "Why admission re-simulated a plan.",
+		Values: []opmetrics.Value{
+			{Name: string(types.ResimAlways), Help: "Consolidation always re-simulates."},
+			{Name: string(types.ResimCoupled), Help: "A related plan started after the plan's simulation."},
+			{Name: string(types.ResimStale), Help: "The plan is older than the stale limit."},
+			{Name: string(types.ResimCatalog), Help: "Instance types or offerings changed."},
+			{Name: string(types.ResimPodsChanged), Help: "A candidate's pods changed."},
+			{Name: string(types.ResimSibling), Help: "A plan from the same joint simulation was rejected."},
+			{Name: string(types.ResimPending), Help: "A pending pod the plan sized for was placed."},
+		},
+	}
+)
+
+var (
+	RoundDurationSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_round_duration_seconds",
+		Help:    "Duration of a phase of a disruption pipeline lane round in seconds. Labeled by lane and phase.",
+		Buckets: metrics.DurationBuckets(),
+	}, []opmetrics.Label{LaneDim, RoundPhase}, opmetrics.Alpha)
+	RoundsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_rounds_total",
+		Help: "Number of disruption pipeline lane rounds. Labeled by lane and result.",
+	}, []opmetrics.Label{LaneDim, RoundResult}, opmetrics.Alpha)
+	GatedSecondsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_gated_seconds_total",
+		Help: "Seconds a disruption pipeline lane, or one of its planners, didn't plan, by why. Labeled by lane and gate.",
+	}, []opmetrics.Label{LaneDim, GateDim}, opmetrics.Alpha)
+	PlannerDurationSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_planner_duration_seconds",
+		Help:    "Duration of a disruption pipeline planner's round (candidates and Plan) in seconds. Labeled by planner.",
+		Buckets: metrics.DurationBuckets(),
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+	AdmissionDurationSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_admission_duration_seconds",
+		Help:    "Duration of admitting one disruption pipeline plan or batch in seconds. Labeled by planner.",
+		Buckets: metrics.DurationBuckets(),
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+	PlanWaitSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_plan_wait_seconds",
+		Help:    "Seconds from a disruption pipeline plan's submission to its start. Labeled by lane and planner.",
+		Buckets: metrics.DurationBuckets(),
+	}, []opmetrics.Label{LaneDim, PlannerDim}, opmetrics.Alpha)
+	AdmissionResimsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_admission_resims_total",
+		Help: "Number of admission re-simulations of disruption pipeline plans, by cause. Labeled by planner and cause.",
+	}, []opmetrics.Label{PlannerDim, ResimCauseDim}, opmetrics.Alpha)
+	PlansTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_plans_total",
+		Help: "Number of disruption pipeline plans by outcome. Labeled by planner, result and reject reason.",
+	}, []opmetrics.Label{PlannerDim, PlanResult, RejectReasonDim}, opmetrics.Alpha)
+	UnresolvedPlans = opmetrics.NewPrometheusGauge(crmetrics.Registry, prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_unresolved_plans",
+		Help: "Number of submitted disruption pipeline plans that haven't started or been rejected. Labeled by lane.",
+	}, []opmetrics.Label{LaneDim}, opmetrics.Alpha)
+	LedgerReservedNodes = opmetrics.NewPrometheusGauge(crmetrics.Registry, prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_ledger_reserved_nodes",
+		Help: "Number of nodes reserved by disruption pipeline plans that haven't started; they count against the budget. Labeled by nodepool.",
+	}, []opmetrics.Label{metrics.NodePool}, opmetrics.Alpha)
+	LastAdmittedTimestampSeconds = opmetrics.NewPrometheusGauge(crmetrics.Registry, prometheus.GaugeOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_last_admitted_timestamp_seconds",
+		Help: "Unix time at which a disruption pipeline planner's plan last started. Labeled by planner.",
+	}, []opmetrics.Label{PlannerDim}, opmetrics.Alpha)
+	TaintSweepDurationSeconds = opmetrics.NewPrometheusHistogram(crmetrics.Registry, prometheus.HistogramOpts{
+		Namespace: metrics.Namespace, Subsystem: subsystem, Name: "pipeline_taint_sweep_duration_seconds",
+		Help:    "Duration of the disruption pipeline's sweep of leftover disruption taints and conditions in seconds.",
+		Buckets: metrics.DurationBuckets(),
+	}, []opmetrics.Label{}, opmetrics.Alpha)
+)
