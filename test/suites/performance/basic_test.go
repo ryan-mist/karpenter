@@ -49,10 +49,10 @@ var _ = Describe("Performance", Label(debug.NoWatch), func() {
 			// Performance assertions
 			Expect(scaleOutReport.TotalTime).To(BeNumerically("<", TotalTimeThreshold("basic/scaleOut", 2*time.Minute)),
 				"Total scale-out time should be less than 2 minutes")
-			Expect(scaleOutReport.TotalReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("basic/scaleOut", 0.53)),
-				"Average CPU utilization should be greater than 53%")
-			Expect(scaleOutReport.TotalReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("basic/scaleOut", 0.65)),
-				"Average memory utilization should be greater than 65%")
+			Expect(scaleOutReport.NonEmptyReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("basic/scaleOut", 0.53)),
+				"Average CPU utilization of non-empty nodes should be greater than 53%")
+			Expect(scaleOutReport.NonEmptyReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("basic/scaleOut", 0.65)),
+				"Average memory utilization of non-empty nodes should be greater than 65%")
 			Expect(scaleOutReport.KarpenterP95HeapMB).To(BeNumerically("<", HeapThreshold("basic/scaleOut", 120)),
 				"Karpenter controller P95 live heap should be less than 120 MB during scale-out")
 			Expect(scaleOutReport.KarpenterAvgCPUCores).To(BeNumerically("<", CPUThreshold("basic/scaleOut", 0.50)),

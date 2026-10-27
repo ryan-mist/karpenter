@@ -55,8 +55,11 @@ func OutputPerformanceReport(report *PerformanceReport, filePrefix string) {
 	GinkgoWriter.Printf("Total Pods: %d (Net Change: %+d)\n", report.TotalPods, report.PodsNetChange)
 	GinkgoWriter.Printf("Total Nodes: %d (Net Change: %+d)\n", report.TotalNodes, report.NodesNetChange)
 	GinkgoWriter.Printf("Pods Disrupted: %d\n", report.PodsDisrupted)
-	GinkgoWriter.Printf("CPU Utilization: %.2f%%\n", report.TotalReservedCPUUtil*100)
-	GinkgoWriter.Printf("Memory Utilization: %.2f%%\n", report.TotalReservedMemoryUtil*100)
+	GinkgoWriter.Printf("CPU Utilization (all / non-empty nodes): %.2f%% / %.2f%%\n",
+		report.TotalReservedCPUUtil*100, report.NonEmptyReservedCPUUtil*100)
+	GinkgoWriter.Printf("Memory Utilization (all / non-empty nodes): %.2f%% / %.2f%%\n",
+		report.TotalReservedMemoryUtil*100, report.NonEmptyReservedMemoryUtil*100)
+	GinkgoWriter.Printf("Empty Nodes: %d\n", report.EmptyNodes)
 	GinkgoWriter.Printf("Efficiency Score: %.1f%%\n", report.ResourceEfficiencyScore)
 	GinkgoWriter.Printf("Pods per Node: %.1f\n", report.PodsPerNode)
 	GinkgoWriter.Printf("Rounds: %d\n", report.Rounds)
@@ -104,6 +107,19 @@ func writeReportFiles(report *PerformanceReport, filePrefix, outputDir string) {
 	}
 }
 
+// withNonEmptyUtilization records the reserved utilization of the launched nodes that are running
+// workload pods, and the number that are not. Empty nodes are expected transiently: pods that a new
+// node was launched for can be bound to another node that became ready first, and nodes vacated by a
+// scale-down linger until consolidation removes them. How many of them exist when the report is taken
+// depends on timing, so they make the all-node means noisy; reporting them separately keeps the
+// non-empty means a measure of how pods were packed.
+func withNonEmptyUtilization(env *common.Environment, report *PerformanceReport) *PerformanceReport {
+	report.NonEmptyReservedCPUUtil = env.Monitor.AvgNonEmptyUtilization(corev1.ResourceCPU)
+	report.NonEmptyReservedMemoryUtil = env.Monitor.AvgNonEmptyUtilization(corev1.ResourceMemory)
+	report.EmptyNodes = env.Monitor.EmptyNodeCount()
+	return report
+}
+
 // ReportScaleOut monitors a scale-out operation and returns a performance report.
 // This function waits for the specified number of pods to become healthy and measures
 // the time taken, resource utilization, and node efficiency.
@@ -147,7 +163,7 @@ func ReportScaleOut(env *common.Environment, testName string, expectedPods int, 
 		podsPerNode = float64(expectedPods) / float64(nodeCount)
 	}
 
-	return &PerformanceReport{
+	return withNonEmptyUtilization(env, &PerformanceReport{
 		TestName:                testName,
 		TestType:                "scale-out",
 		TotalPods:               expectedPods,
@@ -174,7 +190,7 @@ func ReportScaleOut(env *common.Environment, testName string, expectedPods int, 
 		MetricsSampleCount:      stats.SampleCount,
 		MemoryProfileData:       memProfile,
 		CPUProfileData:          cpuProfile,
-	}, nil
+	}), nil
 }
 
 // ReportConsolidation monitors a consolidation operation and returns a performance report.
@@ -223,7 +239,7 @@ func ReportConsolidation(env *common.Environment, testName string, initialPods, 
 		podsPerNode = float64(finalPods) / float64(finalNodes)
 	}
 
-	return &PerformanceReport{
+	return withNonEmptyUtilization(env, &PerformanceReport{
 		TestName:                testName,
 		TestType:                "consolidation",
 		TotalPods:               finalPods,
@@ -250,7 +266,7 @@ func ReportConsolidation(env *common.Environment, testName string, initialPods, 
 		MetricsSampleCount:      stats.SampleCount,
 		MemoryProfileData:       memProfile,
 		CPUProfileData:          cpuProfile,
-	}, nil
+	}), nil
 }
 
 // ReportDrift monitors a drift operation and returns a performance report.
@@ -343,7 +359,7 @@ func ReportDrift(env *common.Environment, testName string, expectedPods int, tim
 		driftRounds = 1
 	}
 
-	return &PerformanceReport{
+	return withNonEmptyUtilization(env, &PerformanceReport{
 		TestName:                testName,
 		TestType:                "drift",
 		TotalPods:               expectedPods,
@@ -370,7 +386,7 @@ func ReportDrift(env *common.Environment, testName string, expectedPods int, tim
 		MetricsSampleCount:      stats.SampleCount,
 		MemoryProfileData:       memProfile,
 		CPUProfileData:          cpuProfile,
-	}, nil
+	}), nil
 }
 
 // monitorConsolidationRounds monitors node consolidation and returns consolidation rounds.

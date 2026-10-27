@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -215,39 +216,77 @@ func (m *Monitor) poll() state {
 	return st
 }
 
+// AvgUtilization returns the unweighted mean, over Karpenter-launched nodes, of each node's
+// requested/allocatable ratio for the resource. Nodes without workload pods count as (near) zero, so
+// the result also moves with how many empty nodes exist at the moment it is sampled; see
+// AvgNonEmptyUtilization and EmptyNodeCount.
 func (m *Monitor) AvgUtilization(resource corev1.ResourceName) float64 {
-	utilization := m.nodeUtilization(resource)
-	sum := 0.0
-	for _, v := range utilization {
-		sum += v
+	utilization := nodeUtilization(m.poll(), resource, false)
+	return lo.Sum(utilization) / float64(len(utilization))
+}
+
+// AvgNonEmptyUtilization is AvgUtilization over only the Karpenter-launched nodes that are running at
+// least one workload pod (see hasWorkloadPods). Requests of every pod bound to those nodes, including
+// DaemonSet pods, still count. Once the expected pods are running this depends only on how those pods
+// were packed onto nodes, not on how many empty nodes have registered or have already been
+// consolidated away when it is sampled. It returns 0 when no launched node runs a workload pod.
+func (m *Monitor) AvgNonEmptyUtilization(resource corev1.ResourceName) float64 {
+	utilization := nodeUtilization(m.poll(), resource, true)
+	if len(utilization) == 0 {
+		return 0
 	}
-	return sum / float64(len(utilization))
+	return lo.Sum(utilization) / float64(len(utilization))
+}
+
+// EmptyNodeCount returns the number of Karpenter-launched nodes that are not running any workload pod
+// (see hasWorkloadPods), e.g. nodes launched for pods that were bound elsewhere, or nodes vacated by a
+// scale-down that consolidation has not yet removed.
+func (m *Monitor) EmptyNodeCount() int {
+	st := m.poll()
+	return len(lo.Filter(lo.Values(st.nodes), func(n *corev1.Node, _ int) bool {
+		return isLaunched(n) && !hasWorkloadPods(st, n.Name)
+	}))
 }
 
 func (m *Monitor) MinUtilization(resource corev1.ResourceName) float64 {
 	min := math.MaxFloat64
-	for _, v := range m.nodeUtilization(resource) {
+	for _, v := range nodeUtilization(m.poll(), resource, false) {
 		min = math.Min(v, min)
 	}
 	return min
 }
 
-func (m *Monitor) nodeUtilization(resource corev1.ResourceName) []float64 {
-	st := m.poll()
+// nodeUtilization returns requested/allocatable for the resource on each Karpenter-launched node with
+// allocatable for it. If nonEmptyOnly is set, nodes without workload pods are skipped.
+func nodeUtilization(st state, resource corev1.ResourceName, nonEmptyOnly bool) []float64 {
 	var utilization []float64
 	for nodeName, requests := range st.nodeRequests {
-		allocatable := st.nodes[nodeName].Status.Allocatable[resource]
+		node := st.nodes[nodeName]
+		allocatable := node.Status.Allocatable[resource]
 		// skip any nodes we didn't launch
-		if st.nodes[nodeName].Labels[v1.NodePoolLabelKey] == "" {
+		if !isLaunched(node) || allocatable.IsZero() {
 			continue
 		}
-		if allocatable.IsZero() {
+		if nonEmptyOnly && !hasWorkloadPods(st, nodeName) {
 			continue
 		}
 		requested := requests[resource]
 		utilization = append(utilization, requested.AsApproximateFloat64()/allocatable.AsApproximateFloat64())
 	}
 	return utilization
+}
+
+func isLaunched(node *corev1.Node) bool {
+	return node.Labels[v1.NodePoolLabelKey] != ""
+}
+
+// hasWorkloadPods reports whether the node is running a pod other than per-node infrastructure:
+// DaemonSet and static pods run on every node regardless of the workload, and terminal pods hold no
+// capacity.
+func hasWorkloadPods(st state, nodeName string) bool {
+	return lo.ContainsBy(st.nodePods[nodeName], func(p *corev1.Pod) bool {
+		return !podutils.IsTerminal(p) && !podutils.IsOwnedByDaemonSet(p) && !podutils.IsOwnedByNode(p)
+	})
 }
 
 type copyable[T any] interface {

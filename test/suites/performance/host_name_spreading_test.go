@@ -58,10 +58,10 @@ var _ = Describe("Performance", Label(debug.NoWatch), func() {
 			// Performance assertions - hostname spreading may require more nodes
 			Expect(scaleOutReport.TotalTime).To(BeNumerically("<", TotalTimeThreshold("hostNameSpreading/scaleOut", 5*time.Minute)),
 				"Total scale-out time should be less than 5 minutes")
-			Expect(scaleOutReport.TotalReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("hostNameSpreading/scaleOut", 0.38)),
-				"Average CPU utilization should be greater than 38%")
-			Expect(scaleOutReport.TotalReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("hostNameSpreading/scaleOut", 0.40)),
-				"Average memory utilization should be greater than 55%")
+			Expect(scaleOutReport.NonEmptyReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("hostNameSpreading/scaleOut", 0.38)),
+				"Average CPU utilization of non-empty nodes should be greater than 38%")
+			Expect(scaleOutReport.NonEmptyReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("hostNameSpreading/scaleOut", 0.40)),
+				"Average memory utilization of non-empty nodes should be greater than 55%")
 			Expect(scaleOutReport.KarpenterP95HeapMB).To(BeNumerically("<", HeapThreshold("hostNameSpreading/scaleOut", 360)),
 				"Karpenter controller P95 live heap should be less than 360 MB during scale-out")
 			Expect(scaleOutReport.KarpenterAvgCPUCores).To(BeNumerically("<", CPUThreshold("hostNameSpreading/scaleOut", 1.15)),

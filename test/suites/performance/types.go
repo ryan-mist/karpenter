@@ -49,6 +49,13 @@ type PerformanceReport struct {
 	Rounds                  int           `json:"rounds"`
 	Timestamp               time.Time     `json:"timestamp"`
 
+	// The same per-node reserved utilization means over only the launched nodes running a workload
+	// (non-DaemonSet) pod, and the number of launched nodes that are not. Empty nodes come and go with
+	// launch/bind races and consolidation timing, so scale-out gates use the non-empty means.
+	NonEmptyReservedCPUUtil    float64 `json:"non_empty_reserved_cpu_utilization"`
+	NonEmptyReservedMemoryUtil float64 `json:"non_empty_reserved_memory_utilization"`
+	EmptyNodes                 int     `json:"empty_nodes"`
+
 	// Karpenter pod resource usage from Kubernetes Metrics API (container-level)
 	KarpenterP95MemoryMB float64 `json:"karpenter_p95_memory_mb"`
 	KarpenterAvgMemoryMB float64 `json:"karpenter_avg_memory_mb"`
