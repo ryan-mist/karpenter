@@ -50,6 +50,9 @@ type CoreOptions struct {
 	Pending PendingClaims
 	// Dedup, if set, skips consolidation methods while nothing has changed since they last found nothing to do.
 	Dedup Dedup
+	// CachedReboot plans repair reboots from the candidate's cached NodeClaim instead of re-reading it, for a caller that
+	// re-reads it right before the command starts (the pipeline's Starter).
+	CachedReboot bool
 	// Validator, if set, validates consolidation commands before they are returned, waiting out the validation delay
 	// (the disruption controller). Without it, commands are returned unvalidated, for a caller that validates them
 	// later.
