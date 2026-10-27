@@ -40,6 +40,21 @@ var SchedulingID = opmetrics.Label{
 }
 
 var (
+	// TopologyBuildDurationSeconds is a measurement-only metric (topo/measure-newtopology): wall time of NewTopology.
+	TopologyBuildDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "topology_build_duration_seconds",
+			Help:      "Duration of building the scheduling topology (NewTopology) in seconds.",
+			Buckets:   prometheus.ExponentialBuckets(0.0005, 1.5, 32),
+		},
+		[]opmetrics.Label{
+			metrics.Controller,
+		},
+		opmetrics.Beta,
+	)
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
