@@ -58,10 +58,21 @@ type Options struct {
 	// Lanes run in this order every Reconcile.
 	Lanes     []LaneSpec
 	Snapshots SnapshotBuilder
+	Ledger    Ledger
+	Admitter  Admitter
+	Starter   Starter
 	Executor  Executor
 	Budgets   BudgetView
 	Reserved  ReservationView
 	Observers []Observer
+}
+
+func WithLedger(l Ledger) option.Function[Options] {
+	return func(o *Options) { o.Ledger = l }
+}
+
+func WithStarter(s Starter) option.Function[Options] {
+	return func(o *Options) { o.Starter = s }
 }
 
 func WithLanes(lanes ...LaneSpec) option.Function[Options] {
@@ -106,6 +117,35 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	opts ...option.Function[Options],
 ) *Controller {
 	o := option.Resolve(opts...)
+	if o.Ledger == nil {
+		o.Ledger = NewLedger(kubeClient, cluster, cp, clk, queue)
+	}
+	if o.Budgets == nil {
+		o.Budgets = o.Ledger.Budgets()
+	}
+	if o.Reserved == nil {
+		o.Reserved = o.Ledger.View()
+	}
+	if o.Admitter == nil {
+		planners := lo.FlatMap(o.Lanes, func(l LaneSpec, _ int) []Planner { return l.Planners })
+		o.Admitter = NewAdmitter(o.Ledger, NewCandidateRebuilder(kubeClient, cluster, clk, cp, queue), planners...)
+	}
+	if o.Starter == nil {
+		o.Starter = NewQueueStarter(queue, clk)
+	}
+	if o.Executor == nil {
+		o.Executor = NewExecutor(ExecutorDeps{
+			Ledger:   o.Ledger,
+			Admitter: o.Admitter,
+			Starter:  o.Starter,
+			Sweeper:  disruption.NewMarkSweeper(kubeClient, cluster, clk),
+			Queue:    queue,
+			Cluster:  cluster,
+			Clock:    clk,
+			Scorer:   NewScorer(o.Lanes...),
+			Observer: observers(o.Observers),
+		})
+	}
 	if o.Snapshots == nil {
 		o.Snapshots = NewSnapshotBuilder(kubeClient, cluster, clk, cp, queue, clusterCost, o.Reserved)
 	}
@@ -140,12 +180,19 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-// Reconcile runs one round of every lane, each followed by the commit loop. It requeues immediately if a plan started,
-// after a second if plans wait for a gate (as the disruption controller waits for cluster state to sync), and after
-// the polling period otherwise.
+// Reconcile runs one round of every lane, each followed by the commit loop (which also runs once with no lanes, for
+// its sweep). It requeues immediately if a plan started, after a second if plans wait for a gate (as the disruption
+// controller waits for cluster state to sync), and after the polling period otherwise.
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	started, waiting := 0, 0
+	if len(c.lanes) == 0 {
+		n, w, err := c.drain(ctx)
+		if err != nil {
+			return reconciler.Result{}, err
+		}
+		started, waiting = n, w
+	}
 	for _, l := range c.lanes {
 		r := l.Step(ctx)
 		if r.Err != nil {
