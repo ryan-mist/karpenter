@@ -204,17 +204,16 @@ func NewController(cluster *state.Cluster) *Controller {
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
 
-	nodes := lo.Reject(c.cluster.DeepCopyNodes(), func(n *state.StateNode, _ int) bool {
-		return n.Node == nil
-	})
+	nodes, allocatable, podRequests := c.readNodes()
 
 	// Build per-node metrics
-	metricsMap := lo.SliceToMap(nodes, func(n *state.StateNode) (string, []*metrics.StoreMetric) {
-		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n, c.wellKnownLabels)
-	})
+	metricsMap := make(map[string][]*metrics.StoreMetric, len(nodes)+1)
+	for _, n := range nodes {
+		metricsMap[n.key] = buildMetrics(n)
+	}
 
 	// Build cluster level metric
-	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(nodes)
+	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(allocatable, podRequests)
 
 	c.metricStore.ReplaceAll(metricsMap)
 
@@ -232,16 +231,47 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetric {
+// nodeMetricsState is what a node's metrics are built from. It is read from cluster state under the cluster's lock,
+// and owns its resource lists so that it can be used after the lock is released.
+type nodeMetricsState struct {
+	key               string
+	labels            prometheus.Labels
+	creationTimestamp time.Time
+	resources         map[opmetrics.GaugeMetric]corev1.ResourceList
+}
 
-	// Aggregate resources allocated/utilized for all the nodes and pods inside the nodes
-	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
-
-	for _, node := range nodes {
-		resources.MergeInto(allocatableAggregate, node.Allocatable())
-		resources.MergeInto(utilizedAggregate, node.PodRequests())
+// readNodes reads what the metrics need from the nodes in cluster state, rather than deep copying every state node
+// with the resources of each of its pods. It also returns the cluster's allocatable resources and pod requests.
+func (c *Controller) readNodes() (nodes []nodeMetricsState, allocatable, podRequests corev1.ResourceList) {
+	allocatable, podRequests = corev1.ResourceList{}, corev1.ResourceList{}
+	// Nodes() holds the cluster's read lock, so nothing in this loop may call back into the cluster.
+	for n := range c.cluster.Nodes() {
+		if n.Node == nil {
+			continue
+		}
+		// The sums are new lists of new Quantities, but the Node's own lists must be copied: Subtract does arithmetic
+		// on the Quantities of its first argument in place, and the Node is shared cluster state.
+		nodePodRequests := n.PodRequests()
+		resources.MergeInto(allocatable, n.Allocatable())
+		resources.MergeInto(podRequests, nodePodRequests)
+		nodes = append(nodes, nodeMetricsState{
+			key:               client.ObjectKeyFromObject(n.Node).String(),
+			labels:            getNodeLabels(n, c.wellKnownLabels),
+			creationTimestamp: n.Node.GetCreationTimestamp().Time,
+			resources: map[opmetrics.GaugeMetric]corev1.ResourceList{
+				SystemOverhead:      resources.Subtract(n.Node.Status.Capacity.DeepCopy(), n.Node.Status.Allocatable),
+				TotalPodRequests:    nodePodRequests,
+				TotalPodLimits:      n.PodLimits(),
+				TotalDaemonRequests: n.DaemonSetRequests(),
+				TotalDaemonLimits:   n.DaemonSetLimits(),
+				Allocatable:         n.Node.Status.Allocatable.DeepCopy(),
+			},
+		})
 	}
+	return nodes, allocatable, podRequests
+}
 
+func buildClusterUtilizationMetric(allocatableAggregate, utilizedAggregate corev1.ResourceList) []*metrics.StoreMetric {
 	res := make([]*metrics.StoreMetric, 0, len(allocatableAggregate))
 
 	for resourceName, allocatableResource := range allocatableAggregate {
@@ -269,30 +299,22 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 	return res
 }
 
-func buildMetrics(n *state.StateNode, wellKnownLabels map[string]string) (res []*metrics.StoreMetric) {
-	// Every series of a node shares the same node labels, so build them once and derive the per-resource labels
-	nodeLabels := getNodeLabels(n, wellKnownLabels)
-	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
-		SystemOverhead:      resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable),
-		TotalPodRequests:    n.PodRequests(),
-		TotalPodLimits:      n.PodLimits(),
-		TotalDaemonRequests: n.DaemonSetRequests(),
-		TotalDaemonLimits:   n.DaemonSetLimits(),
-		Allocatable:         n.Node.Status.Allocatable,
-	} {
+func buildMetrics(n nodeMetricsState) (res []*metrics.StoreMetric) {
+	// Every series of a node shares the same node labels, so they are built once and the per-resource labels derived
+	for gaugeMetric, resourceList := range n.resources {
 		for resourceName, quantity := range resourceList {
 			res = append(res, &metrics.StoreMetric{
 				GaugeMetric: gaugeMetric,
 				Value:       lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
-				Labels:      withResourceType(nodeLabels, resourceNameToString(resourceName)),
+				Labels:      withResourceType(n.labels, resourceNameToString(resourceName)),
 			})
 		}
 	}
 	return append(res,
 		&metrics.StoreMetric{
 			GaugeMetric: Lifetime,
-			Value:       time.Since(n.Node.GetCreationTimestamp().Time).Seconds(),
-			Labels:      nodeLabels,
+			Value:       time.Since(n.creationTimestamp).Seconds(),
+			Labels:      n.labels,
 		})
 }
 
