@@ -55,8 +55,10 @@ func OutputPerformanceReport(report *PerformanceReport, filePrefix string) {
 	GinkgoWriter.Printf("Total Pods: %d (Net Change: %+d)\n", report.TotalPods, report.PodsNetChange)
 	GinkgoWriter.Printf("Total Nodes: %d (Net Change: %+d)\n", report.TotalNodes, report.NodesNetChange)
 	GinkgoWriter.Printf("Pods Disrupted: %d\n", report.PodsDisrupted)
-	GinkgoWriter.Printf("CPU Utilization: %.2f%%\n", report.TotalReservedCPUUtil*100)
-	GinkgoWriter.Printf("Memory Utilization: %.2f%%\n", report.TotalReservedMemoryUtil*100)
+	GinkgoWriter.Printf("CPU Utilization (aggregate / per-node mean): %.2f%% / %.2f%%\n",
+		report.AggregateReservedCPUUtil*100, report.TotalReservedCPUUtil*100)
+	GinkgoWriter.Printf("Memory Utilization (aggregate / per-node mean): %.2f%% / %.2f%%\n",
+		report.AggregateReservedMemoryUtil*100, report.TotalReservedMemoryUtil*100)
 	GinkgoWriter.Printf("Efficiency Score: %.1f%%\n", report.ResourceEfficiencyScore)
 	GinkgoWriter.Printf("Pods per Node: %.1f\n", report.PodsPerNode)
 	GinkgoWriter.Printf("Rounds: %d\n", report.Rounds)
@@ -137,6 +139,8 @@ func ReportScaleOut(env *common.Environment, testName string, expectedPods int, 
 	nodeCount := env.Monitor.CreatedNodeCount()
 	avgCPUUtil := env.Monitor.AvgUtilization(corev1.ResourceCPU)
 	avgMemUtil := env.Monitor.AvgUtilization(corev1.ResourceMemory)
+	aggregateCPUUtil := env.Monitor.TotalUtilization(corev1.ResourceCPU)
+	aggregateMemUtil := env.Monitor.TotalUtilization(corev1.ResourceMemory)
 	// Calculate delta: only count disruptions during this test
 	podsDisrupted := getPodsDisruptedCount(env) - baselinePodsDisrupted
 
@@ -148,32 +152,34 @@ func ReportScaleOut(env *common.Environment, testName string, expectedPods int, 
 	}
 
 	return &PerformanceReport{
-		TestName:                testName,
-		TestType:                "scale-out",
-		TotalPods:               expectedPods,
-		TotalNodes:              nodeCount,
-		TotalTime:               totalTime,
-		PodsNetChange:           expectedPods,
-		NodesNetChange:          nodeCount,
-		PodsDisrupted:           podsDisrupted,
-		TotalReservedCPUUtil:    avgCPUUtil,
-		TotalReservedMemoryUtil: avgMemUtil,
-		ResourceEfficiencyScore: resourceEfficiencyScore,
-		PodsPerNode:             podsPerNode,
-		Rounds:                  1, // Scale-out is always 1 round
-		Timestamp:               time.Now(),
-		KarpenterP95MemoryMB:    stats.P95MemoryMB,
-		KarpenterAvgMemoryMB:    stats.AvgMemoryMB,
-		KarpenterMaxMemoryMB:    stats.MaxMemoryMB,
-		KarpenterP95HeapMB:      stats.P95HeapMB,
-		KarpenterAvgHeapMB:      stats.AvgHeapMB,
-		KarpenterMaxHeapMB:      stats.MaxHeapMB,
-		KarpenterP95CPUCores:    stats.P95CPUCores,
-		KarpenterAvgCPUCores:    stats.AvgCPUCores,
-		KarpenterMaxCPUCores:    stats.MaxCPUCores,
-		MetricsSampleCount:      stats.SampleCount,
-		MemoryProfileData:       memProfile,
-		CPUProfileData:          cpuProfile,
+		TestName:                    testName,
+		TestType:                    "scale-out",
+		TotalPods:                   expectedPods,
+		TotalNodes:                  nodeCount,
+		TotalTime:                   totalTime,
+		PodsNetChange:               expectedPods,
+		NodesNetChange:              nodeCount,
+		PodsDisrupted:               podsDisrupted,
+		TotalReservedCPUUtil:        avgCPUUtil,
+		TotalReservedMemoryUtil:     avgMemUtil,
+		AggregateReservedCPUUtil:    aggregateCPUUtil,
+		AggregateReservedMemoryUtil: aggregateMemUtil,
+		ResourceEfficiencyScore:     resourceEfficiencyScore,
+		PodsPerNode:                 podsPerNode,
+		Rounds:                      1, // Scale-out is always 1 round
+		Timestamp:                   time.Now(),
+		KarpenterP95MemoryMB:        stats.P95MemoryMB,
+		KarpenterAvgMemoryMB:        stats.AvgMemoryMB,
+		KarpenterMaxMemoryMB:        stats.MaxMemoryMB,
+		KarpenterP95HeapMB:          stats.P95HeapMB,
+		KarpenterAvgHeapMB:          stats.AvgHeapMB,
+		KarpenterMaxHeapMB:          stats.MaxHeapMB,
+		KarpenterP95CPUCores:        stats.P95CPUCores,
+		KarpenterAvgCPUCores:        stats.AvgCPUCores,
+		KarpenterMaxCPUCores:        stats.MaxCPUCores,
+		MetricsSampleCount:          stats.SampleCount,
+		MemoryProfileData:           memProfile,
+		CPUProfileData:              cpuProfile,
 	}, nil
 }
 
@@ -213,6 +219,8 @@ func ReportConsolidation(env *common.Environment, testName string, initialPods, 
 	finalNodes := env.Monitor.CreatedNodeCount()
 	avgCPUUtil := env.Monitor.AvgUtilization(corev1.ResourceCPU)
 	avgMemUtil := env.Monitor.AvgUtilization(corev1.ResourceMemory)
+	aggregateCPUUtil := env.Monitor.TotalUtilization(corev1.ResourceCPU)
+	aggregateMemUtil := env.Monitor.TotalUtilization(corev1.ResourceMemory)
 	// Calculate delta: only count disruptions during this test
 	podsDisrupted := getPodsDisruptedCount(env) - baselinePodsDisrupted
 
@@ -224,32 +232,34 @@ func ReportConsolidation(env *common.Environment, testName string, initialPods, 
 	}
 
 	return &PerformanceReport{
-		TestName:                testName,
-		TestType:                "consolidation",
-		TotalPods:               finalPods,
-		TotalNodes:              finalNodes,
-		TotalTime:               totalTime,
-		PodsNetChange:           finalPods - initialPods,
-		NodesNetChange:          finalNodes - initialNodes,
-		PodsDisrupted:           podsDisrupted,
-		TotalReservedCPUUtil:    avgCPUUtil,
-		TotalReservedMemoryUtil: avgMemUtil,
-		ResourceEfficiencyScore: resourceEfficiencyScore,
-		PodsPerNode:             podsPerNode,
-		Rounds:                  len(consolidationRounds),
-		Timestamp:               time.Now(),
-		KarpenterP95MemoryMB:    stats.P95MemoryMB,
-		KarpenterAvgMemoryMB:    stats.AvgMemoryMB,
-		KarpenterMaxMemoryMB:    stats.MaxMemoryMB,
-		KarpenterP95HeapMB:      stats.P95HeapMB,
-		KarpenterAvgHeapMB:      stats.AvgHeapMB,
-		KarpenterMaxHeapMB:      stats.MaxHeapMB,
-		KarpenterP95CPUCores:    stats.P95CPUCores,
-		KarpenterAvgCPUCores:    stats.AvgCPUCores,
-		KarpenterMaxCPUCores:    stats.MaxCPUCores,
-		MetricsSampleCount:      stats.SampleCount,
-		MemoryProfileData:       memProfile,
-		CPUProfileData:          cpuProfile,
+		TestName:                    testName,
+		TestType:                    "consolidation",
+		TotalPods:                   finalPods,
+		TotalNodes:                  finalNodes,
+		TotalTime:                   totalTime,
+		PodsNetChange:               finalPods - initialPods,
+		NodesNetChange:              finalNodes - initialNodes,
+		PodsDisrupted:               podsDisrupted,
+		TotalReservedCPUUtil:        avgCPUUtil,
+		TotalReservedMemoryUtil:     avgMemUtil,
+		AggregateReservedCPUUtil:    aggregateCPUUtil,
+		AggregateReservedMemoryUtil: aggregateMemUtil,
+		ResourceEfficiencyScore:     resourceEfficiencyScore,
+		PodsPerNode:                 podsPerNode,
+		Rounds:                      len(consolidationRounds),
+		Timestamp:                   time.Now(),
+		KarpenterP95MemoryMB:        stats.P95MemoryMB,
+		KarpenterAvgMemoryMB:        stats.AvgMemoryMB,
+		KarpenterMaxMemoryMB:        stats.MaxMemoryMB,
+		KarpenterP95HeapMB:          stats.P95HeapMB,
+		KarpenterAvgHeapMB:          stats.AvgHeapMB,
+		KarpenterMaxHeapMB:          stats.MaxHeapMB,
+		KarpenterP95CPUCores:        stats.P95CPUCores,
+		KarpenterAvgCPUCores:        stats.AvgCPUCores,
+		KarpenterMaxCPUCores:        stats.MaxCPUCores,
+		MetricsSampleCount:          stats.SampleCount,
+		MemoryProfileData:           memProfile,
+		CPUProfileData:              cpuProfile,
 	}, nil
 }
 
@@ -328,6 +338,8 @@ func ReportDrift(env *common.Environment, testName string, expectedPods int, tim
 	// Collect metrics
 	avgCPUUtil := env.Monitor.AvgUtilization(corev1.ResourceCPU)
 	avgMemUtil := env.Monitor.AvgUtilization(corev1.ResourceMemory)
+	aggregateCPUUtil := env.Monitor.TotalUtilization(corev1.ResourceCPU)
+	aggregateMemUtil := env.Monitor.TotalUtilization(corev1.ResourceMemory)
 	// Calculate delta: only count disruptions during this test
 	podsDisrupted := getPodsDisruptedCount(env) - baselinePodsDisrupted
 
@@ -344,32 +356,34 @@ func ReportDrift(env *common.Environment, testName string, expectedPods int, tim
 	}
 
 	return &PerformanceReport{
-		TestName:                testName,
-		TestType:                "drift",
-		TotalPods:               expectedPods,
-		TotalNodes:              finalNodeCount,
-		TotalTime:               totalTime,
-		PodsNetChange:           0,                                 // Pods don't change in drift
-		NodesNetChange:          finalNodeCount - initialNodeCount, // Net change in nodes (should be ~0 for drift)
-		PodsDisrupted:           podsDisrupted,
-		TotalReservedCPUUtil:    avgCPUUtil,
-		TotalReservedMemoryUtil: avgMemUtil,
-		ResourceEfficiencyScore: resourceEfficiencyScore,
-		PodsPerNode:             podsPerNode,
-		Rounds:                  driftRounds,
-		Timestamp:               time.Now(),
-		KarpenterP95MemoryMB:    stats.P95MemoryMB,
-		KarpenterAvgMemoryMB:    stats.AvgMemoryMB,
-		KarpenterMaxMemoryMB:    stats.MaxMemoryMB,
-		KarpenterP95HeapMB:      stats.P95HeapMB,
-		KarpenterAvgHeapMB:      stats.AvgHeapMB,
-		KarpenterMaxHeapMB:      stats.MaxHeapMB,
-		KarpenterP95CPUCores:    stats.P95CPUCores,
-		KarpenterAvgCPUCores:    stats.AvgCPUCores,
-		KarpenterMaxCPUCores:    stats.MaxCPUCores,
-		MetricsSampleCount:      stats.SampleCount,
-		MemoryProfileData:       memProfile,
-		CPUProfileData:          cpuProfile,
+		TestName:                    testName,
+		TestType:                    "drift",
+		TotalPods:                   expectedPods,
+		TotalNodes:                  finalNodeCount,
+		TotalTime:                   totalTime,
+		PodsNetChange:               0,                                 // Pods don't change in drift
+		NodesNetChange:              finalNodeCount - initialNodeCount, // Net change in nodes (should be ~0 for drift)
+		PodsDisrupted:               podsDisrupted,
+		TotalReservedCPUUtil:        avgCPUUtil,
+		TotalReservedMemoryUtil:     avgMemUtil,
+		AggregateReservedCPUUtil:    aggregateCPUUtil,
+		AggregateReservedMemoryUtil: aggregateMemUtil,
+		ResourceEfficiencyScore:     resourceEfficiencyScore,
+		PodsPerNode:                 podsPerNode,
+		Rounds:                      driftRounds,
+		Timestamp:                   time.Now(),
+		KarpenterP95MemoryMB:        stats.P95MemoryMB,
+		KarpenterAvgMemoryMB:        stats.AvgMemoryMB,
+		KarpenterMaxMemoryMB:        stats.MaxMemoryMB,
+		KarpenterP95HeapMB:          stats.P95HeapMB,
+		KarpenterAvgHeapMB:          stats.AvgHeapMB,
+		KarpenterMaxHeapMB:          stats.MaxHeapMB,
+		KarpenterP95CPUCores:        stats.P95CPUCores,
+		KarpenterAvgCPUCores:        stats.AvgCPUCores,
+		KarpenterMaxCPUCores:        stats.MaxCPUCores,
+		MetricsSampleCount:          stats.SampleCount,
+		MemoryProfileData:           memProfile,
+		CPUProfileData:              cpuProfile,
 	}, nil
 }
 

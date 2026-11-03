@@ -176,10 +176,10 @@ var _ = Describe("Performance", Label(debug.NoWatch), func() {
 			// Performance assertions for wide deployments
 			Expect(scaleOutReport.TotalTime).To(BeNumerically("<", TotalTimeThreshold("wideDeployments/scaleOut", 5*time.Minute)),
 				"Total scale-out time should be less than 10 minutes")
-			Expect(scaleOutReport.TotalReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("wideDeployments/scaleOut", 0.2)),
-				"Average CPU utilization should be greater than 20%")
-			Expect(scaleOutReport.TotalReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("wideDeployments/scaleOut", 0.20)),
-				"Average memory utilization should be greater than 20%")
+			Expect(scaleOutReport.AggregateReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("wideDeployments/scaleOut", 0.2)),
+				"Aggregate CPU utilization should be greater than 20%")
+			Expect(scaleOutReport.AggregateReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("wideDeployments/scaleOut", 0.20)),
+				"Aggregate memory utilization should be greater than 20%")
 			Expect(scaleOutReport.KarpenterP95HeapMB).To(BeNumerically("<", HeapThreshold("wideDeployments/scaleOut", 150)),
 				"Karpenter controller P95 live heap should be less than 150 MB during scale-out")
 			Expect(scaleOutReport.KarpenterAvgCPUCores).To(BeNumerically("<", CPUThreshold("wideDeployments/scaleOut", 0.70)),
@@ -208,10 +208,10 @@ var _ = Describe("Performance", Label(debug.NoWatch), func() {
 			// Wide consolidation assertions
 			Expect(consolidationReport.TotalTime).To(BeNumerically("<", TotalTimeThreshold("wideDeployments/consolidation", 40*time.Minute)),
 				"Wide consolidation should complete within 40 minutes")
-			Expect(consolidationReport.TotalReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("wideDeployments/consolidation", 0.20)),
-				"Average CPU utilization should be greater than 20%")
-			Expect(consolidationReport.TotalReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("wideDeployments/consolidation", 0.20)),
-				"Average memory utilization should be greater than 20%")
+			Expect(consolidationReport.AggregateReservedCPUUtil).To(BeNumerically(">", CPUUtilThreshold("wideDeployments/consolidation", 0.20)),
+				"Aggregate CPU utilization should be greater than 20%")
+			Expect(consolidationReport.AggregateReservedMemoryUtil).To(BeNumerically(">", MemoryUtilThreshold("wideDeployments/consolidation", 0.20)),
+				"Aggregate memory utilization should be greater than 20%")
 			Expect(consolidationReport.KarpenterP95HeapMB).To(BeNumerically("<", HeapThreshold("wideDeployments/consolidation", 210)),
 				"Karpenter controller P95 live heap should be less than 210 MB during consolidation")
 			Expect(consolidationReport.KarpenterAvgCPUCores).To(BeNumerically("<", CPUThreshold("wideDeployments/consolidation", 0.30)),

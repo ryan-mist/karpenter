@@ -30,7 +30,9 @@ import (
 // variable, keyed by "<testCase>/<phase>", e.g.
 //   {"basic/scaleOut": {"heap_mb": 200, "cpu_cores": 1.2, "total_time_minutes": 3}}
 // An override wins for the metric it sets; otherwise the inline base default is
-// used.
+// used. The cpu_util and memory_util bounds apply to the aggregate reserved
+// utilization (sum of requests / sum of allocatable over launched nodes), not to
+// the per-node mean that is also reported.
 
 // thresholdOverride is the per-test-case, per-metric absolute override. A nil
 // field means "no override for this metric; use the inline base default".
@@ -38,8 +40,8 @@ type thresholdOverride struct {
 	HeapMB           *float64 `json:"heap_mb,omitempty"`            // P95 Go live heap upper bound, MB
 	CPUCores         *float64 `json:"cpu_cores,omitempty"`          // avg CPU upper bound, cores
 	TotalTimeMinutes *float64 `json:"total_time_minutes,omitempty"` // total time upper bound, minutes
-	CPUUtil          *float64 `json:"cpu_util,omitempty"`           // reserved CPU utilization lower bound, fraction
-	MemoryUtil       *float64 `json:"memory_util,omitempty"`        // reserved memory utilization lower bound, fraction
+	CPUUtil          *float64 `json:"cpu_util,omitempty"`           // aggregate reserved CPU utilization lower bound, fraction
+	MemoryUtil       *float64 `json:"memory_util,omitempty"`        // aggregate reserved memory utilization lower bound, fraction
 }
 
 var (

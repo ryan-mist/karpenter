@@ -49,6 +49,17 @@ type PerformanceReport struct {
 	Rounds                  int           `json:"rounds"`
 	Timestamp               time.Time     `json:"timestamp"`
 
+	// AggregateReservedCPUUtil and AggregateReservedMemoryUtil are the sum of pod requests divided by
+	// the sum of allocatable over Karpenter-launched nodes (Monitor.TotalUtilization), i.e. per-node
+	// utilization weighted by node size. They don't depend on how pods are distributed across the
+	// nodes, and they are what the utilization thresholds assert on. TotalReservedCPUUtil and
+	// TotalReservedMemoryUtil (and ResourceEfficiencyScore, which is derived from them) keep their
+	// original meaning, the unweighted mean of per-node utilization (Monitor.AvgUtilization), and are
+	// reported for continuity only: with mixed node sizes they vary with which nodes pods happen to
+	// bind to.
+	AggregateReservedCPUUtil    float64 `json:"aggregate_reserved_cpu_utilization"`
+	AggregateReservedMemoryUtil float64 `json:"aggregate_reserved_memory_utilization"`
+
 	// Karpenter pod resource usage from Kubernetes Metrics API (container-level)
 	KarpenterP95MemoryMB float64 `json:"karpenter_p95_memory_mb"`
 	KarpenterAvgMemoryMB float64 `json:"karpenter_avg_memory_mb"`
