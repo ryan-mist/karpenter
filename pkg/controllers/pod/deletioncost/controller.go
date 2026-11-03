@@ -113,8 +113,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{RequeueAfter: reconcileInterval}, nil
 	}
 
-	// Shared with consolidation so both resolve instance types identically.
-	nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, c.kubeClient, c.cloudProvider)
+	// Shared with consolidation so both resolve instance types identically. Ranking only looks up instance types for
+	// each node's own NodePool, so skip resolving them for NodePools without nodes.
+	nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMapForNodes(ctx, c.kubeClient, c.cloudProvider, nodes)
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("building node pool map, %w", err)
 	}
