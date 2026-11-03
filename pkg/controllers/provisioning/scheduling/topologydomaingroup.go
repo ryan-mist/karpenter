@@ -39,16 +39,26 @@ func (t TopologyDomainGroup) Insert(domain string, taints ...v1.Taint) {
 	// proper subset, and removing the superset reduces the number of taint sets we need to traverse. For now we only
 	// implement the simplest case, the empty set, but we could do additional performance testing to determine if
 	// implementing the general case is worth the precomputation cost.
-	if _, ok := t[domain]; !ok || len(taints) == 0 {
-		t[domain] = [][]v1.Taint{taints}
-		return
-	}
-	if len(t[domain][0]) == 0 {
+	existing, ok := t[domain]
+	if ok && len(existing[0]) == 0 {
 		// This is the base case, where we're already tracking the empty set of taints for the domain. Pods will always
 		// be eligible for NodeClaims with this domain (based on taints), so there is no need to track additional taints.
 		return
 	}
-	t[domain] = append(t[domain], taints)
+	if !ok || len(taints) == 0 {
+		t[domain] = [][]v1.Taint{taints}
+		return
+	}
+	// A domain is inserted once per (NodePool, instance type) that offers it, so without this check a domain's taint sets
+	// grow with NodePools x instance types even though they hold only a handful of distinct values. A taint set that is
+	// identical (element by element, every field) to one already tracked can't change the result of ForEachDomain, which
+	// only asks whether any tracked set is tolerated, so it isn't tracked again.
+	for _, tracked := range existing {
+		if taintsIdentical(tracked, taints) {
+			return
+		}
+	}
+	t[domain] = append(existing, taints)
 }
 
 // ForEachDomain calls f on each domain tracked by the topology group. If the taintHonorPolicy is honor, only domains
@@ -69,4 +79,21 @@ func (t TopologyDomainGroup) ForEachDomain(pod *v1.Pod, taintHonorPolicy v1.Node
 			}
 		}
 	}
+}
+
+// taintsIdentical returns true if a and b contain the same taints in the same order, comparing every field.
+func taintsIdentical(a, b []v1.Taint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) > 0 && &a[0] == &b[0] {
+		// The common case: the same NodePool's taints, inserted once per instance type.
+		return true
+	}
+	for i := range a {
+		if a[i].Key != b[i].Key || a[i].Value != b[i].Value || a[i].Effect != b[i].Effect || !a[i].TimeAdded.Equal(b[i].TimeAdded) {
+			return false
+		}
+	}
+	return true
 }

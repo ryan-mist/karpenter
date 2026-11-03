@@ -890,6 +890,33 @@ var _ = Describe("Requirement", func() {
 			Entry(nil, lessThan9, math.MaxInt64),
 		)
 	})
+	Context("ForEachValue and ForEachIntersectionValue", func() {
+		collect := func(iterate func(func(string))) []string {
+			values := []string{}
+			iterate(func(v string) { values = append(values, v) })
+			return values
+		}
+		requirements := []*Requirement{
+			exists, doesNotExist, inA, inB, inAB, notInA, in1, in9, in19, notIn12, greaterThan1, greaterThan9, lessThan1, lessThan9,
+			NewRequirement("key", corev1.NodeSelectorOpNotIn, "1", "5", "9", "A"),
+			NewRequirement("key", corev1.NodeSelectorOpIn, "0", "1", "5", "9", "10", "A"),
+			NewRequirement("key", v1.NodeSelectorOpGte, "5"),
+			NewRequirement("key", v1.NodeSelectorOpLte, "5"),
+			NewRequirement("key", corev1.NodeSelectorOpGt, strconv.Itoa(math.MaxInt)),
+		}
+		It("should iterate the same values as Values", func() {
+			for _, r := range requirements {
+				Expect(collect(r.ForEachValue)).To(ConsistOf(r.Values()), r.String())
+			}
+		})
+		It("should iterate the same values as Intersection(...).Values", func() {
+			for _, a := range requirements {
+				for _, b := range requirements {
+					Expect(collect(func(f func(string)) { a.ForEachIntersectionValue(b, f) })).To(ConsistOf(a.Intersection(b).Values()), "%s ∩ %s", a, b)
+				}
+			}
+		})
+	})
 	Context("Any", func() {
 		It("should return any", func() {
 			Expect(exists.Any()).ToNot(BeEmpty())

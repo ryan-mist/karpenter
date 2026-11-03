@@ -286,6 +286,64 @@ func (r *Requirement) Any() string {
 	return ""
 }
 
+// ForEachValue calls f on each value in r.Values() without allocating a slice.
+func (r *Requirement) ForEachValue(f func(string)) {
+	for v := range r.values {
+		f(v)
+	}
+}
+
+// ForEachIntersectionValue calls f on each value in r.Intersection(requirement).Values() without allocating the
+// intersected requirement or its value set.
+// nolint:gocyclo
+func (r *Requirement) ForEachIntersectionValue(requirement *Requirement, f func(string)) {
+	gte := maxIntPtr(r.gte, requirement.gte)
+	lte := minIntPtr(r.lte, requirement.lte)
+	if gte != nil && lte != nil && *gte > *lte {
+		// The intersection is DoesNotExist, which has no values
+		return
+	}
+	emit := func(v string) {
+		if withinBounds(v, gte, lte) {
+			f(v)
+		}
+	}
+	switch {
+	case r.complement && requirement.complement:
+		// Intersection's values are the union of the excluded values
+		for v := range r.values {
+			emit(v)
+		}
+		for v := range requirement.values {
+			if !r.values.Has(v) {
+				emit(v)
+			}
+		}
+	case r.complement && !requirement.complement:
+		for v := range requirement.values {
+			if !r.values.Has(v) {
+				emit(v)
+			}
+		}
+	case !r.complement && requirement.complement:
+		for v := range r.values {
+			if !requirement.values.Has(v) {
+				emit(v)
+			}
+		}
+	default:
+		small, large := r.values, requirement.values
+		if small.Len() > large.Len() {
+			small, large = large, small
+		}
+		for v := range small {
+			if large.Has(v) {
+				emit(v)
+			}
+		}
+	}
+}
+
 // Has returns true if the requirement allows the value
 func (r *Requirement) Has(value string) bool {
 	if r.complement {

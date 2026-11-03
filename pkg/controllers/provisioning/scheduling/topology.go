@@ -107,35 +107,53 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 		return np.Name, np
 	})
 	domainGroups := map[string]TopologyDomainGroup{}
+	groupFor := func(key string) TopologyDomainGroup {
+		group, ok := domainGroups[key]
+		if !ok {
+			group = NewTopologyDomainGroup()
+			domainGroups[key] = group
+		}
+		return group
+	}
 	for npName, its := range instanceTypes {
 		np := nodePoolIndex[npName]
-		for _, it := range its {
-			// We need to intersect the instance type requirements with the current nodePool requirements.  This
-			// ensures that something like zones from an instance type don't expand the universe of valid domains.
-			requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-			requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-			requirements.Add(it.Requirements.Values()...)
+		taints := np.Spec.Template.Spec.Taints
+		// The NodePool's requirements are the same for every instance type, so they're built once per NodePool.
+		npRequirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
+		npRequirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
 
-			for topologyKey, requirement := range requirements {
-				if _, ok := domainGroups[topologyKey]; !ok {
-					domainGroups[topologyKey] = NewTopologyDomainGroup()
+		// We need to intersect the instance type requirements with the current nodePool requirements.  This
+		// ensures that something like zones from an instance type don't expand the universe of valid domains.
+		// For each instance type this inserts exactly the values of the merged (NodePool + instance type) requirements,
+		// but walks the two requirements directly rather than allocating the merged requirements for every instance type.
+		npOnlyKeys := sets.New[string]()
+		for _, it := range its {
+			for key, itRequirement := range it.Requirements {
+				group := groupFor(key)
+				insert := func(domain string) { group.Insert(domain, taints...) }
+				if npRequirement, ok := npRequirements[key]; ok {
+					itRequirement.ForEachIntersectionValue(npRequirement, insert)
+				} else {
+					itRequirement.ForEachValue(insert)
 				}
-				for _, domain := range requirement.Values() {
-					domainGroups[topologyKey].Insert(domain, np.Spec.Template.Spec.Taints...)
+			}
+			for key := range npRequirements {
+				if !it.Requirements.Has(key) {
+					npOnlyKeys.Insert(key)
 				}
 			}
 		}
+		// A key that only the NodePool constrains merges to the NodePool's requirement for every instance type that
+		// doesn't define it, so its values only need to be inserted once.
+		for key := range npOnlyKeys {
+			group := groupFor(key)
+			npRequirements[key].ForEachValue(func(domain string) { group.Insert(domain, taints...) })
+		}
 
-		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-		for key, requirement := range requirements {
+		for key, requirement := range npRequirements {
 			if requirement.Operator() == corev1.NodeSelectorOpIn {
-				if _, ok := domainGroups[key]; !ok {
-					domainGroups[key] = NewTopologyDomainGroup()
-				}
-				for _, value := range requirement.Values() {
-					domainGroups[key].Insert(value, np.Spec.Template.Spec.Taints...)
-				}
+				group := groupFor(key)
+				requirement.ForEachValue(func(domain string) { group.Insert(domain, taints...) })
 			}
 		}
 	}
