@@ -286,6 +286,60 @@ var _ = Describe("Store Apply Correctness", func() {
 			_, exists := instanceType.Capacity["hugepages-2Mi"]
 			Expect(exists).To(BeFalse(), "original instance type should not have hugepages added")
 		})
+		It("should compute allocatable from the overlaid capacity when the original allocatable was already computed", func() {
+			instanceType := fake.NewInstanceType("m5.large",
+				fake.WithResources(corev1.ResourceList{
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+					corev1.ResourceCPU:    resource.MustParse("2"),
+				}),
+			)
+			originalAllocatableMemory := instanceType.Allocatable()[corev1.ResourceMemory]
+
+			store := newInternalInstanceTypeStore()
+			store.evaluatedNodePools.Insert("default")
+			store.updates = map[string]map[string]*instanceTypeUpdate{
+				"default": {
+					instanceType.Name: &instanceTypeUpdate{
+						Capacity: &capacityUpdate{
+							OverlayUpdate: corev1.ResourceList{
+								"hugepages-2Mi": resource.MustParse("100Mi"),
+							},
+						},
+					},
+				},
+			}
+
+			result := store.apply("default", instanceType)
+			Expect(result.IsCapacityOverlayApplied()).To(BeTrue())
+
+			// Hugepages are subtracted from allocatable memory of the overlaid copy only
+			expected := originalAllocatableMemory.DeepCopy()
+			expected.Sub(resource.MustParse("100Mi"))
+			resultMemory, originalMemory := result.Allocatable()[corev1.ResourceMemory], instanceType.Allocatable()[corev1.ResourceMemory]
+			Expect(resultMemory.Cmp(expected)).To(Equal(0))
+			Expect(originalMemory.Cmp(originalAllocatableMemory)).To(Equal(0))
+			Expect(instanceType.IsCapacityOverlayApplied()).To(BeFalse())
+		})
+		It("should compute the same allocatable as the original for a price only overlay", func() {
+			instanceType := fake.NewInstanceType("m5.large")
+			store := newInternalInstanceTypeStore()
+			store.evaluatedNodePools.Insert("default")
+			store.updates = map[string]map[string]*instanceTypeUpdate{
+				"default": {
+					instanceType.Name: &instanceTypeUpdate{
+						Price: map[string]*priceUpdate{
+							instanceType.Offerings[0].Requirements.String(): {OverlayUpdate: new("+10%")},
+						},
+						Capacity: &capacityUpdate{},
+					},
+				},
+			}
+
+			result := store.apply("default", instanceType)
+			Expect(result.Offerings[0]).ToNot(BeIdenticalTo(instanceType.Offerings[0]))
+			Expect(result.IsCapacityOverlayApplied()).To(BeFalse())
+			Expect(result.Allocatable()).To(Equal(instanceType.Allocatable()))
+		})
 	})
 })
 

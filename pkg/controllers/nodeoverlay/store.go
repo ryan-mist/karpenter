@@ -124,27 +124,21 @@ func (s *internalInstanceTypeStore) apply(nodePoolName string, it *cloudprovider
 		return it
 	}
 
-	// Create a shallow copy of the instance type, sharing immutable fields
-	overriddenInstanceType := &cloudprovider.InstanceType{
-		Name:                   it.Name,
-		Requirements:           it.Requirements,           // Shared - never modified
-		Overhead:               it.Overhead,               // Shared - never modified
-		VolumeAttachmentLimits: it.VolumeAttachmentLimits, // Shared - never modified
-		DynamicResources:       it.DynamicResources,       // Shared - never modified
-		Capacity:               it.Capacity,
+	// Handle offerings - copy-on-write only for offerings that need price overlay
+	offerings := it.Offerings // Shared - not modified
+	if len(instanceTypeUpdate.Price) != 0 {
+		offerings = s.applyPriceOverlays(it.Offerings, instanceTypeUpdate.Price)
 	}
+
+	// Create a shallow copy of the instance type, sharing immutable fields (Requirements, Overhead,
+	// VolumeAttachmentLimits, DynamicResources, Capacity) and the base allocatable computed from them
+	overriddenInstanceType := it.WithOfferings(offerings)
 
 	// Handle capacity overlay - only deep copy if we're modifying it
 	if len(instanceTypeUpdate.Capacity.OverlayUpdate) != 0 {
-		// ApplyCapacityOverlay replaces Capacity with a new merged map (original untouched)
+		// ApplyCapacityOverlay replaces Capacity with a new merged map (original untouched) and stops sharing
+		// the base allocatable computed for the original capacity
 		overriddenInstanceType.ApplyCapacityOverlay(instanceTypeUpdate.Capacity.OverlayUpdate)
-	}
-
-	// Handle offerings - copy-on-write only for offerings that need price overlay
-	if len(instanceTypeUpdate.Price) != 0 {
-		overriddenInstanceType.Offerings = s.applyPriceOverlays(it.Offerings, instanceTypeUpdate.Price)
-	} else {
-		overriddenInstanceType.Offerings = it.Offerings // Shared - not modified
 	}
 
 	return overriddenInstanceType
