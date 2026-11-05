@@ -600,6 +600,50 @@ var _ = Describe("TerminateFirstDrift", func() {
 			Expect(cmds[0].Replacements).To(HaveLen(1))
 		})
 
+		// kubernetes-sigs/karpenter#3415: the reservation is full and the on-demand fallback is only transiently unavailable
+		// (e.g. ICE). Freeing the slot would let the refill launch, but so would waiting for on-demand to recover, so the
+		// dynamic NodePool waits (Blocked) like a static one rather than terminating first.
+		It("blocks instead of terminating first when the reservation is full and on-demand is transiently unavailable", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+			for _, o := range mostExpensiveInstance.Offerings {
+				o.Available = false
+			}
+			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			ExpectSingletonReconciled(ctx, driftController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+		})
+
+		// The on-demand offerings can never launch (e.g. the NodeClass can't run them), so the only way to reschedule is
+		// into the slot the candidate frees: terminate first, as for a reserved-only NodePool.
+		It("issues a delete-only command when the reservation is full and on-demand is Incompatible", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+			for _, o := range mostExpensiveInstance.Offerings {
+				o.Available = false
+				o.Incompatible = true
+			}
+			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			ExpectSingletonReconciled(ctx, driftController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+			Expect(cmds[0].Replacements).To(HaveLen(0))
+			Expect(cmds[0].Results.NewNodeClaims).To(HaveLen(1))
+			Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(cloudprovider.ReservationIDLabel).Has(reservationID)).To(BeTrue())
+		})
+
 		It("replaces-first when the reservation still has a spare slot", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
 			setupReservedOffering(5, true, v1.CapacityTypeReserved) // spare reservation capacity -> can grow in place

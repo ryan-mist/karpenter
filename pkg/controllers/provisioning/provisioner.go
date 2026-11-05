@@ -327,6 +327,9 @@ func (p *Provisioner) NewScheduler(
 		}
 		instanceTypes[np.Name] = its
 	}
+	// Apply instance-type-shaping options once, before topology is built, so the topology's domains and the scheduler see
+	// the same instance types. NewScheduler re-applies them idempotently.
+	instanceTypes = scheduler.ApplyInstanceTypeOptions(instanceTypes, opts...)
 
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.

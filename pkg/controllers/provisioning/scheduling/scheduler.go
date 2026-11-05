@@ -102,6 +102,9 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// assumeTransientCapacityRecovers schedules as if transiently unavailable non-reserved capacity had recovered. See
+	// AssumeTransientCapacityRecovers.
+	assumeTransientCapacityRecovers bool
 }
 
 type Options = option.Function[options]
@@ -119,6 +122,33 @@ var CreditReservationCapacity = func(reservationID string, count int) Options {
 		}
 		opts.creditReservationCapacity[reservationID] += count
 	}
+}
+
+// AssumeTransientCapacityRecovers schedules as if every non-reserved offering that is transiently unavailable
+// (Available=false, Incompatible=false; e.g. on-demand/spot under an insufficient-capacity error or a zonal shift) were
+// Available, while Incompatible offerings stay unavailable. Disruption uses it to tell "the replacement is blocked until
+// capacity recovers" (wait) apart from "the replacement can never launch" (terminate-first). See ApplyInstanceTypeOptions.
+var AssumeTransientCapacityRecovers = func(opts *options) {
+	opts.assumeTransientCapacityRecovers = true
+}
+
+// ApplyInstanceTypeOptions returns the instance types the scheduler should see under opts. Without
+// AssumeTransientCapacityRecovers it returns instanceTypes unchanged and allocates nothing. With it, every instance type
+// with recoverable capacity is replaced by a copy (cloudprovider.InstanceType.WithTransientCapacityRecovered): the
+// scheduler reads allocatable offerings that each InstanceType computes once from its Available offerings, so shared
+// instance types must not be mutated. The result is idempotent, so applying it again (e.g. once for topology in the
+// provisioner and again in NewScheduler) returns the same instance type objects.
+func ApplyInstanceTypeOptions(instanceTypes map[string][]*cloudprovider.InstanceType, opts ...Options) map[string][]*cloudprovider.InstanceType {
+	if !option.Resolve(opts...).assumeTransientCapacityRecovers {
+		return instanceTypes
+	}
+	out := make(map[string][]*cloudprovider.InstanceType, len(instanceTypes))
+	for nodePoolName, its := range instanceTypes {
+		out[nodePoolName] = lo.Map(its, func(it *cloudprovider.InstanceType, _ int) *cloudprovider.InstanceType {
+			return it.WithTransientCapacityRecovered()
+		})
+	}
+	return out
 }
 
 var IgnorePreferences = func(opts *options) {
@@ -160,6 +190,7 @@ func NewScheduler(
 ) *Scheduler {
 	resolved := option.Resolve(opts...)
 	minValuesPolicy := resolved.minValuesPolicy
+	instanceTypes = ApplyInstanceTypeOptions(instanceTypes, opts...)
 
 	// Seed the reservation manager, then credit back any slots the caller expects a disruption candidate to free on
 	// termination (terminate-first "would the pods fit once freed?" pass).

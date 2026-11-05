@@ -401,6 +401,65 @@ func (i *InstanceType) IsCapacityOverlayApplied() bool {
 	return i.capacityOverlayApplied
 }
 
+// WithTransientCapacityRecovered returns a copy of the instance type that models its transiently unavailable capacity
+// (e.g. insufficient capacity, a zonal shift) having recovered: every non-reserved offering that is transiently
+// unavailable (Available=false, Incompatible=false) is Available in the copy. Reserved offerings are left as-is, since a
+// reservation's availability isn't capacity that recovers on its own. Incompatible offerings stay unavailable. Providers typically derive the zone
+// and capacity-type requirements from Available offerings, so those requirements are widened to cover the recovered
+// offerings.
+//
+// The receiver is never mutated. The allocatable offerings it caches are computed from Available offerings, so the
+// copy is a new InstanceType rather than an in-place edit. Recovered offerings and the widened requirements are copied;
+// the other offerings and requirements, and every other exported field, are shared with the receiver and must be
+// treated as read-only. When no offering recovers, the receiver itself is returned.
+func (i *InstanceType) WithTransientCapacityRecovered() *InstanceType {
+	var offerings Offerings
+	var recovered Offerings
+	for idx, o := range i.Offerings {
+		// Skip offerings that are available, can never launch (Incompatible), or reserved.
+		if o.Available || o.Incompatible || o.CapacityType() == v1.CapacityTypeReserved {
+			continue
+		}
+		if offerings == nil {
+			offerings = append(Offerings(nil), i.Offerings...)
+		}
+		c := *o
+		c.Available = true
+		offerings[idx] = &c
+		recovered = append(recovered, &c)
+	}
+	if offerings == nil {
+		return i
+	}
+	requirements := maps.Clone(i.Requirements)
+	for _, key := range []string{corev1.LabelTopologyZone, v1.CapacityTypeLabelKey} {
+		existing, ok := i.Requirements[key]
+		// Only widen an enumerated (In, or In emptied to DoesNotExist) requirement; a complement already admits the values.
+		if !ok || existing == nil || (existing.Operator() != corev1.NodeSelectorOpIn && existing.Operator() != corev1.NodeSelectorOpDoesNotExist) {
+			continue
+		}
+		widened := &scheduling.Requirement{}
+		existing.DeepCopyInto(widened)
+		for _, o := range recovered {
+			if req, ok := o.Requirements[key]; ok && req.Operator() == corev1.NodeSelectorOpIn {
+				widened.Insert(req.Values()...)
+			}
+		}
+		requirements[key] = widened
+	}
+	return &InstanceType{
+		Name:                   i.Name,
+		Requirements:           requirements,
+		Offerings:              offerings,
+		Capacity:               i.Capacity,
+		VolumeAttachmentLimits: i.VolumeAttachmentLimits,
+		DynamicResources:       i.DynamicResources,
+		AttributeBindings:      i.AttributeBindings,
+		Overhead:               i.Overhead,
+		capacityOverlayApplied: i.capacityOverlayApplied,
+	}
+}
+
 // AllocatableOfferingsList returns all allocatable groups for this instance type.
 // Each group pairs an allocatable resource set with the offerings that produce it.
 // The first entry is always the base allocatable (no overrides).

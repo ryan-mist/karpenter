@@ -286,6 +286,98 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		})
 	})
 
+	// kubernetes-sigs/karpenter#3415: disruption's "would the replacement launch once transient capacity recovers?" pass.
+	Context("AssumeTransientCapacityRecovers", func() {
+		mixedNodePool := func(instanceTypeName string) *v1.NodePool {
+			return test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
+				Requirements: []v1.NodeSelectorRequirementWithMinValues{
+					{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{instanceTypeName}},
+					{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeReserved, v1.CapacityTypeOnDemand}},
+				},
+			}}}})
+		}
+		// fullReservationODUnavailable builds an instance type whose reservation is full and whose on-demand offerings are
+		// unavailable, with incompatible marking them structurally unlaunchable. The fake derives the instance type's
+		// zone and capacity-type requirements from Available offerings at construction, as providers do, so on-demand and
+		// test-zone-2 are absent from them.
+		fullReservationODUnavailable := func(incompatible bool) *cloudprovider.InstanceType {
+			od := func(zone string) cloudprovider.Offering {
+				return cloudprovider.Offering{
+					Available: false, Incompatible: incompatible, Price: 1,
+					Requirements: pscheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: zone}),
+				}
+			}
+			return fake.NewInstanceType("reserved-type",
+				fake.WithResources(map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("4Gi")}),
+				fake.WithOfferings(*reservedOffering("r-full", true, 0), od("test-zone-1"), od("test-zone-2")),
+			)
+		}
+
+		It("schedules onto transiently unavailable on-demand capacity, widening the instance type's requirements", func() {
+			it := fullReservationODUnavailable(false)
+			Expect(it.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeFalse())
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{it}
+			ExpectApplied(ctx, env.Client, mixedNodePool("reserved-type"))
+
+			// Without the option the reservation is full and on-demand is unavailable, so the pod can't be placed.
+			pod := smallPod()
+			Expect(solveWith([]*corev1.Pod{pod}).PodErrors).To(HaveKey(pod))
+
+			// With it, the on-demand offerings count as available: offeringsToReserve sees an unreserved fallback, so the
+			// full reservation doesn't fail the pod. The zone requirement is widened too, so test-zone-2 is reachable.
+			zonal := test.UnschedulablePod(test.PodOptions{
+				NodeSelector:         map[string]string{corev1.LabelTopologyZone: "test-zone-2"},
+				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}},
+			})
+			results := solveWith([]*corev1.Pod{zonal}, scheduling.AssumeTransientCapacityRecovers)
+			Expect(results.PodErrors).ToNot(HaveKey(zonal))
+			Expect(results.NewNodeClaims).To(HaveLen(1))
+			Expect(results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
+			Expect(results.NewNodeClaims[0].Requirements.Has(v1alpha1.LabelReservationID)).To(BeFalse())
+
+			// The shared instance type is never mutated.
+			Expect(lo.CountBy(it.Offerings, func(o *cloudprovider.Offering) bool { return o.Available })).To(Equal(1))
+			Expect(it.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeFalse())
+			Expect(it.Requirements.Get(corev1.LabelTopologyZone).Has("test-zone-2")).To(BeFalse())
+		})
+
+		It("does not schedule onto Incompatible on-demand capacity", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fullReservationODUnavailable(true)}
+			ExpectApplied(ctx, env.Client, mixedNodePool("reserved-type"))
+
+			pod := smallPod()
+			results := solveWith([]*corev1.Pod{pod}, scheduling.AssumeTransientCapacityRecovers)
+			Expect(results.NewNodeClaims).To(HaveLen(0))
+			Expect(results.PodErrors).To(HaveKey(pod))
+		})
+
+		// Without the option the field is inert: provisioning treats every unavailable offering the same, so providers that
+		// don't set Incompatible (or set it) see today's behavior.
+		DescribeTable("Incompatible doesn't change scheduling without the option",
+			func(incompatible bool) {
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fullReservationODUnavailable(incompatible)}
+				ExpectApplied(ctx, env.Client, mixedNodePool("reserved-type"))
+
+				pod := smallPod()
+				results := solveWith([]*corev1.Pod{pod})
+				Expect(results.NewNodeClaims).To(HaveLen(0))
+				Expect(results.PodErrors).To(HaveKey(pod))
+			},
+			Entry("zero-value Incompatible", false),
+			Entry("Incompatible", true),
+		)
+
+		It("does not recover a transiently unavailable reservation", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType(reservedOffering("r-unavail", false, 5))}
+			ExpectApplied(ctx, env.Client, reservedOnlyNodePool("reserved-type"))
+
+			pod := smallPod()
+			results := solveWith([]*corev1.Pod{pod}, scheduling.AssumeTransientCapacityRecovers)
+			Expect(results.NewNodeClaims).To(HaveLen(0))
+			Expect(results.PodErrors).To(HaveKey(pod))
+		})
+	})
+
 	// https://github.com/kubernetes-sigs/karpenter/issues/3451: under PreferencePolicy=Respect, a preferred
 	// capacity-type=reserved is treated as required on the first pass, which hides the on-demand/spot fallback once the
 	// reservation is full. The scheduler must relax the preference or fall through to another NodePool instead of

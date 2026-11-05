@@ -17,9 +17,12 @@ limitations under the License.
 package cloudprovider_test
 
 import (
+	"reflect"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -100,7 +103,7 @@ var _ = Describe("Offering Launchability", func() {
 	})
 })
 
-var _ = Describe("Incompatible offerings", func() {
+var _ = Describe("Transient unavailability", func() {
 	It("Launchable is false for an Incompatible offering, even if it's left Available", func() {
 		od := onDemandOffering(1.0)
 		Expect(od.Launchable()).To(BeTrue())
@@ -110,5 +113,61 @@ var _ = Describe("Incompatible offerings", func() {
 		Expect(reserved.Launchable()).To(BeTrue())
 		reserved.Incompatible = true
 		Expect(reserved.Launchable()).To(BeFalse())
+	})
+	It("WithTransientCapacityRecovered returns the receiver when nothing recovers", func() {
+		incompatible := onDemandOffering(1.0)
+		incompatible.Available, incompatible.Incompatible = false, true
+		it := &cloudprovider.InstanceType{Name: "it", Offerings: cloudprovider.Offerings{onDemandOffering(1.0), reservedOffering(false, 1), incompatible}}
+		Expect(it.WithTransientCapacityRecovered()).To(BeIdenticalTo(it))
+	})
+	It("WithTransientCapacityRecovered recovers only non-reserved offerings, without mutating the receiver", func() {
+		od := onDemandOffering(1.0)
+		od.Available = false
+		reserved := reservedOffering(false, 1)
+		it := &cloudprovider.InstanceType{
+			Name:         "it",
+			Requirements: scheduling.NewRequirements(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeReserved)),
+			Offerings:    cloudprovider.Offerings{reserved, od},
+			Overhead:     &cloudprovider.InstanceTypeOverhead{},
+		}
+		Expect(it.AllocatableOfferingsList()[0].Offerings).To(BeEmpty())
+
+		recovered := it.WithTransientCapacityRecovered()
+		Expect(recovered).ToNot(BeIdenticalTo(it))
+		Expect(recovered.Offerings[0]).To(BeIdenticalTo(reserved))
+		Expect(recovered.Offerings[1].Available).To(BeTrue())
+		Expect(recovered.AllocatableOfferingsList()[0].Offerings).To(HaveLen(1))
+		Expect(recovered.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
+		// Idempotent: nothing left to recover.
+		Expect(recovered.WithTransientCapacityRecovered()).To(BeIdenticalTo(recovered))
+
+		Expect(od.Available).To(BeFalse())
+		Expect(it.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeFalse())
+		Expect(it.AllocatableOfferingsList()[0].Offerings).To(BeEmpty())
+	})
+	It("WithTransientCapacityRecovered carries every exported field other than Requirements and Offerings", func() {
+		od := onDemandOffering(1.0)
+		od.Available = false
+		it := &cloudprovider.InstanceType{
+			Name:                   "it",
+			Requirements:           scheduling.NewRequirements(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeReserved)),
+			Offerings:              cloudprovider.Offerings{od},
+			Capacity:               corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			VolumeAttachmentLimits: map[string]int{"driver": 1},
+			DynamicResources:       []*cloudprovider.DynamicResources{{}},
+			AttributeBindings:      []*cloudprovider.AttributeBinding{{}},
+			Overhead:               &cloudprovider.InstanceTypeOverhead{},
+		}
+		recovered := it.WithTransientCapacityRecovered()
+		Expect(recovered).ToNot(BeIdenticalTo(it))
+		want, got := reflect.ValueOf(it).Elem(), reflect.ValueOf(recovered).Elem()
+		for idx := range want.NumField() {
+			field := want.Type().Field(idx)
+			if !field.IsExported() || field.Name == "Requirements" || field.Name == "Offerings" {
+				continue
+			}
+			Expect(got.Field(idx).Interface()).To(Equal(want.Field(idx).Interface()), field.Name)
+			Expect(want.Field(idx).IsZero()).To(BeFalse(), "set %s in this test so a dropped copy is caught", field.Name)
+		}
 	})
 })

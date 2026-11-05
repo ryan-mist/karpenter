@@ -172,7 +172,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 // replacement; the returned Results are the credit-back (pass 2) simulation so it can nominate the existing nodes that
 // absorb the freed pods. When terminateFirst is false the Results are the pass-1 (replace-first / Blocked) simulation.
 //
-// It simulates up to twice:
+// It simulates up to three times:
 //
 //  1. The normal fallback simulation. In fallback mode a full reservation (Available=true, ReservationCapacity=0) does
 //     not satisfy a pod, so the scheduler falls through to a lower-weight NodePool (e.g. on-demand) or a different
@@ -185,6 +185,13 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 //     what unblocks the reschedule. Strict mode makes surplus pods that wouldn't fit the freed slot fail rather than
 //     fall back, and a reservation that is unavailable for another reason stays unschedulable, so we don't terminate
 //     uselessly.
+//
+//  3. Only if pass 2 would terminate-first: re-simulate in the default (fallback) mode, without the credit, assuming
+//     transiently unavailable non-reserved capacity has recovered (scheduling.AssumeTransientCapacityRecovers). If every
+//     pod then places, the replacement is only blocked on capacity that is expected to come back (e.g. on-demand under
+//     an insufficient-capacity error), so terminateFirst is false and the pass-1 Results are returned: the candidate is
+//     Blocked and waits, matching a static NodePool (see staticReservations). Only capacity that can never launch
+//     (Incompatible, or not offered at all) lets terminate-first proceed. kubernetes-sigs/karpenter#3415.
 //
 // A false terminateFirst with pods still pending in the returned Results is the caller's Blocked signal, unchanged.
 func SimulateSchedulingWithReservedFallback(
@@ -219,13 +226,24 @@ func SimulateSchedulingWithReservedFallback(
 	if err != nil {
 		return results, false, err
 	}
-	if tfResults.AllNonPendingPodsScheduled() {
-		// Return the credit-back Results, not pass 1's: this is the accurate post-termination picture (reactive
-		// provisioning runs strict with the freed slot available), so the caller nominates the existing nodes that
-		// absorb the freed pods without spuriously reporting the reserved-bound pods as unschedulable.
-		return tfResults, true, nil
+	if !tfResults.AllNonPendingPodsScheduled() {
+		return results, false, nil
 	}
-	return results, false, nil
+
+	// Pass 3: would the replacement launch once transiently unavailable non-reserved capacity recovers? If so, wait for
+	// it (Blocked) rather than terminating first.
+	recoveredResults, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
+		[]scheduling.Options{scheduling.AssumeTransientCapacityRecovers}, simulationOpts, candidate)
+	if err != nil {
+		return results, false, err
+	}
+	if recoveredResults.AllNonPendingPodsScheduled() {
+		return results, false, nil
+	}
+	// Return the credit-back Results, not pass 1's: this is the accurate post-termination picture (reactive
+	// provisioning runs strict with the freed slot available), so the caller nominates the existing nodes that
+	// absorb the freed pods without spuriously reporting the reserved-bound pods as unschedulable.
+	return tfResults, true, nil
 }
 
 // UninitializedNodeError tracks a special pod error for disruption where pods schedule to a node
