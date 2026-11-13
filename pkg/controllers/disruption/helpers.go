@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"iter"
 	"strings"
 	"time"
 
@@ -184,7 +185,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 //     will free on termination). If every pod then places, terminateFirst is true — deleting the candidate is exactly
 //     what unblocks the reschedule. Strict mode makes surplus pods that wouldn't fit the freed slot fail rather than
 //     fall back, and a reservation that is unavailable for another reason stays unschedulable, so we don't terminate
-//     uselessly.
+//     uselessly. Even then, if the NodePool's non-reserved fallback is only transiently unavailable (e.g. ICE), we wait
+//     for it rather than terminating first, as a static NodePool does (see awaitsTransientCapacity).
 //
 // A false terminateFirst with pods still pending in the returned Results is the caller's Blocked signal, unchanged.
 func SimulateSchedulingWithReservedFallback(
@@ -219,7 +221,9 @@ func SimulateSchedulingWithReservedFallback(
 	if err != nil {
 		return results, false, err
 	}
-	if tfResults.AllNonPendingPodsScheduled() {
+	// A replacement only blocked on capacity that may come back (e.g. ICE'd on-demand) waits, as a static NodePool does,
+	// rather than taking the workload down until the refill launches (kubernetes-sigs/karpenter#3415).
+	if tfResults.AllNonPendingPodsScheduled() && !awaitsTransientCapacity(candidate) {
 		// Return the credit-back Results, not pass 1's: this is the accurate post-termination picture (reactive
 		// provisioning runs strict with the freed slot available), so the caller nominates the existing nodes that
 		// absorb the freed pods without spuriously reporting the reserved-bound pods as unschedulable.
@@ -445,32 +449,72 @@ func mapCandidates(proposed, current []*Candidate) []*Candidate {
 	})
 }
 
+// templateOfferings yields the offerings a NodePool template could launch into, with their instance types.
+// GetInstanceTypes is NodeClass-scoped, so offerings are filtered by the template's requirements. An offering outside its
+// instance type's zones (e.g. one the type isn't offered in, or the NodeClass has no subnet in) can never launch, so it
+// isn't yielded.
+func templateOfferings(its []*cloudprovider.InstanceType, nct *scheduling.NodeClaimTemplate) iter.Seq2[*cloudprovider.InstanceType, *cloudprovider.Offering] {
+	return func(yield func(*cloudprovider.InstanceType, *cloudprovider.Offering) bool) {
+		for _, it := range its {
+			if !nct.Requirements.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) {
+				continue
+			}
+			zones := it.Requirements.Get(corev1.LabelTopologyZone)
+			for _, o := range it.Offerings.Compatible(nct.Requirements) {
+				if zones.Has(o.Zone()) && !yield(it, o) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // staticReservations reports whether a static NodePool's replacement can only land in full capacity reservations, so
 // pre-spinning it would fail to launch until a reserved node frees its slot, and which compatible reservations are still
-// offered (Available, even if full). A compatible non-reserved offering, even an unavailable one, means the replacement
-// doesn't depend on a reservation slot, so the NodePool waits for that capacity rather than terminating first. A static
+// offered (Available, even if full). A compatible non-reserved offering, even a transiently unavailable one, means the
+// replacement doesn't depend on a reservation slot, so the NodePool waits for that capacity rather than terminating
+// first. A non-reserved offering that isn't Compatible can never launch, so it doesn't count. A static
 // replacement is the bare NodePool template, so this is an offering lookup rather than a scheduling simulation.
-// GetInstanceTypes is NodeClass-scoped, so offerings are filtered by the template's requirements.
 func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudProvider, np *v1.NodePool, nct *scheduling.NodeClaimTemplate) (bool, sets.Set[string], error) {
 	its, err := cloudProvider.GetInstanceTypes(ctx, np)
 	if err != nil {
 		return false, nil, serrors.Wrap(fmt.Errorf("getting instance types, %w", err), "NodePool", klog.KObj(np))
 	}
 	offered := sets.New[string]()
-	for _, it := range its {
-		if !nct.Requirements.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) {
+	for _, o := range templateOfferings(its, nct) {
+		// A non-reserved offering that isn't Compatible can never launch, so it isn't a fallback worth waiting for.
+		if o.CapacityType() != v1.CapacityTypeReserved && !o.Compatible {
 			continue
 		}
-		for _, o := range it.Offerings.Compatible(nct.Requirements) {
-			if o.CapacityType() != v1.CapacityTypeReserved || o.Launchable() {
-				return false, nil, nil
-			}
-			if o.Available {
-				offered.Insert(o.ReservationID())
-			}
+		if o.CapacityType() != v1.CapacityTypeReserved || o.Launchable() {
+			return false, nil, nil
+		}
+		if o.Available {
+			offered.Insert(o.ReservationID())
 		}
 	}
 	return true, offered, nil
+}
+
+// awaitsTransientCapacity reports whether the candidate's NodePool has a non-reserved offering that's only transiently
+// unavailable (Compatible but not Available) and that every reschedulable pod could use, so its replacement may
+// launch without the candidate's reservation slot once that capacity comes back. It's the dynamic counterpart of
+// staticReservations' non-reserved fallback check.
+func awaitsTransientCapacity(c *Candidate) bool {
+	podReqs := lo.Map(c.reschedulablePods, func(p *corev1.Pod, _ int) pkgscheduling.Requirements {
+		return pkgscheduling.NewStrictPodRequirements(p)
+	})
+	for it, o := range templateOfferings(lo.Values(c.nodePoolInstanceTypes), scheduling.NewNodeClaimTemplate(c.NodePool)) {
+		if o.CapacityType() == v1.CapacityTypeReserved || o.Available || !o.Compatible {
+			continue
+		}
+		if lo.EveryBy(podReqs, func(r pkgscheduling.Requirements) bool {
+			return r.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) && r.IsCompatible(o.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels)
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 // holdsOfferedReservation reports whether the candidate holds a slot in a reservation that's still offered, so
