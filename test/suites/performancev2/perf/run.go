@@ -207,6 +207,27 @@ func (r *Run) Scale(replicas int, deps ...*appsv1.Deployment) {
 	}
 }
 
+// Patch applies mutate to o and merge-patches the change, for example to drift a NodePool by changing its template.
+func (r *Run) Patch(o client.Object, mutate func()) {
+	GinkgoHelper()
+	base := o.DeepCopyObject().(client.Object)
+	mutate()
+	Expect(r.Provider.Client.Patch(r.ctx, o, client.MergeFrom(base))).To(Succeed())
+}
+
+// AwaitHealthyPods waits for the scenario to have exactly n healthy pods without ending a phase, for scenarios that
+// change the workload several times inside one phase.
+func (r *Run) AwaitHealthyPods(n int, timeout time.Duration) {
+	GinkgoHelper()
+	r.awaitHealthyPods(n, r.timeout(timeout))
+}
+
+// Nodes returns the nodes in the run's NodePools.
+func (r *Run) Nodes() []corev1.Node { return r.nodes() }
+
+// Pods returns the scenario's pods.
+func (r *Run) Pods() []corev1.Pod { return r.scenarioPods() }
+
 func (r *Run) cleanup(ctx context.Context) {
 	c := r.Provider.Client
 	r.ctx = ctx

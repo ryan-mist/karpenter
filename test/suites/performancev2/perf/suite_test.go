@@ -162,6 +162,11 @@ var _ = Describe("Result accessors", func() {
 		Expect(r.Histogram("x", nil).P99).To(Equal(3.0))
 		Expect(r.Histogram("x", map[string]string{"a": "1"}).P99).To(Equal(2.0))
 	})
+	It("lists every matching histogram series", func() {
+		Expect(r.Histograms("x", nil)).To(HaveLen(2))
+		Expect(r.Histograms("x", map[string]string{"a": "2"})).To(ConsistOf(HaveField("Count", BeEquivalentTo(9))))
+		Expect(r.Histograms("y", nil)).To(BeEmpty())
+	})
 })
 
 var _ = Describe("env.NodePool", func() {
