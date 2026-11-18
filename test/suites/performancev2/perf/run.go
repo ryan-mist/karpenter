@@ -108,7 +108,7 @@ func (r *Run) Deployment(name string, replicas int, cpu, memory string, opts ...
 		cpu, memory = lo.CoalesceOrEmpty(sh.CPU, cpu), lo.CoalesceOrEmpty(sh.Memory, memory)
 	}
 	opts = append(opts, test.WithLabels(map[string]string{ScenarioLabel: r.Scenario.Name}))
-	return test.Deployment(test.CreateDeploymentOptions(fmt.Sprintf("%s-%s", r.Scenario.Name, name), int32(replicas), cpu, memory, opts...)) //nolint:gosec // scenario sizes are far below MaxInt32
+	return test.Deployment(test.CreateDeploymentOptions(strings.ToLower(fmt.Sprintf("%s-%s", r.Scenario.Name, name)), int32(replicas), cpu, memory, opts...)) //nolint:gosec // scenario sizes are far below MaxInt32
 }
 
 func (r *Run) label(o client.Object) {
