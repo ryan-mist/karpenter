@@ -42,7 +42,7 @@ func KWOKCI(c env.Clients) *perf.Provider {
 	// at least 2x above every observed baseline and only where a planted regression breaches them; Experimental
 	// gates sit about 1.3x above the slowest baseline seen on either host.
 	p.Calibration = perf.MustLoadCalibration(kwokCICalibration)
-	p.Levels = perf.Levels{
+	p.Levels = withMigrated(perf.Levels{
 		"pods/scaleOut": {
 			perf.PodReady.P95.Experimental(36), perf.PodReady.P99.Experimental(38), perf.PodReady.Max.Experimental(38),
 			perf.Nodes.Experimental(57), perf.HeapMB.Experimental(45.9), perf.CPUCores.Experimental(0.271),
@@ -61,6 +61,6 @@ func KWOKCI(c env.Clients) *perf.Provider {
 			perf.PodReady.P95.Stable(80), perf.PodReady.P99.Experimental(80), perf.PodReady.Max.Experimental(80),
 			perf.Nodes.Experimental(187), perf.HeapMB.Experimental(89.3), perf.CPUCores.Experimental(0.432),
 		},
-	}
+	}, func(l scenarioLevels) perf.Levels { return l.KWOKCI })
 	return p
 }

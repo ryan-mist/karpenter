@@ -73,7 +73,7 @@ func KWOK(c env.Clients) *perf.Provider {
 		// core reproduces the November numbers, so the environment moved, not core. Heap stays Experimental until it
 		// holds across environments.
 		Calibration: perf.MustLoadCalibration(kwokCalibration),
-		Levels: perf.Levels{
+		Levels: withMigrated(perf.Levels{
 			"pods/scaleOut": {
 				perf.PodReady.P95.Stable(18), perf.PodReady.P99.Stable(18), perf.PodReady.Max.Experimental(21),
 				perf.CPUUtil.Experimental(0.741), perf.MemoryUtil.Experimental(0.689), perf.Nodes.Experimental(200),
@@ -93,6 +93,6 @@ func KWOK(c env.Clients) *perf.Provider {
 				perf.PodReady.P95.Experimental(35), perf.PodReady.P99.Experimental(36), perf.PodReady.Max.Experimental(41),
 				perf.Nodes.Experimental(874), perf.HeapMB.Experimental(316), perf.CPUCores.Experimental(1.265),
 			},
-		},
+		}, func(l scenarioLevels) perf.Levels { return l.KWOK }),
 	}
 }

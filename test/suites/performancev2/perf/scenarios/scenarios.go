@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
 )
 
-var All = []perf.Scenario{Pods, NodePools, Topology}
+var All = []perf.Scenario{Pods, NodePools, Topology, Drift, DoNotDisrupt, HostnameSpread, Interference, WideDeployments, DiverseNodePools, TargetedNodePools, BalancedBasic, BalancedChurn, BalancedHeterogeneous}
 
 var Pods = perf.Scenario{
 	Name:    "pods",
