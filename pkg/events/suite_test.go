@@ -131,6 +131,16 @@ var _ = Describe("Dedupe", func() {
 		}
 		Expect(internalRecorder.Calls(terminatorevents.EvictPod(PodWithUID(), "").Reason)).To(Equal(100))
 	})
+	It("should create pod termination events for different pods that share a name", func() {
+		// e.g. StatefulSet pods with the same name in different namespaces, or a pod recreated under the same name
+		first, second := PodWithUID(), PodWithUID()
+		second.Name = first.Name
+		second.Namespace = "other-namespace"
+		eventRecorder.Publish(terminatorevents.EvictPod(first, ""), terminatorevents.EvictPod(second, ""))
+		eventRecorder.Publish(terminatorevents.DisruptPodDelete(first, nil, nil), terminatorevents.DisruptPodDelete(second, nil, nil))
+		Expect(internalRecorder.Calls(terminatorevents.EvictPod(first, "").Reason)).To(Equal(2))
+		Expect(internalRecorder.Calls(terminatorevents.DisruptPodDelete(first, nil, nil).Reason)).To(Equal(2))
+	})
 })
 
 var _ = Describe("Rate Limiting", func() {
