@@ -136,7 +136,7 @@ var BalancedHeterogeneous = perf.Scenario{
 		{Name: "consolidation", Summary: "Scale both to 60% until nodes stop being disrupted; every scored move must belong to one of the two NodePools."},
 	},
 	Run: func(r *perf.Run) {
-		if _, ok := r.NodeClass.(*v1alpha1.KWOKNodeClass); !ok {
+		if !isKWOK(r) {
 			Skip("balancedHeterogeneous selects KWOK instance families")
 		}
 		balancedPool(r)

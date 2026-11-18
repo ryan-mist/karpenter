@@ -16,6 +16,9 @@ limitations under the License.
 package scenarios
 
 import (
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
@@ -30,4 +33,13 @@ func ownPool(r *perf.Run) test.DeploymentOptionModifier {
 // frac returns n*num/den, at least 1, so scaled-down sizes keep every deployment.
 func frac(n, num, den int) int {
 	return max(1, n*num/den)
+}
+
+// isKWOK reports whether the run's NodeClass is a KWOKNodeClass, typed or unstructured, for scenarios that select
+// KWOK's synthetic zones, architectures, sizes and families.
+func isKWOK(r *perf.Run) bool {
+	if _, ok := r.NodeClass.(*v1alpha1.KWOKNodeClass); ok {
+		return true
+	}
+	return r.NodeClass.GetObjectKind().GroupVersionKind().GroupKind() == schema.GroupKind{Group: "karpenter.kwok.sh", Kind: "KWOKNodeClass"}
 }

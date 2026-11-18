@@ -40,7 +40,7 @@ var diverseToleration = corev1.Toleration{Key: diverseTaint, Operator: corev1.To
 // template label everywhere, and on KWOK also a rotating zone, architecture and instance size ceiling, since other
 // providers' zones and catalogs vary by account. Every third pool carries a taint the scenario's pods tolerate.
 func diverseNodePools(r *perf.Run, n int) []*v1.NodePool {
-	_, kwok := r.NodeClass.(*v1alpha1.KWOKNodeClass)
+	kwok := isKWOK(r)
 	capacityTypes := [][]string{{v1.CapacityTypeSpot}, {v1.CapacityTypeOnDemand}, {v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}}
 	zones := [][]string{{"test-zone-a"}, {"test-zone-b"}, {"test-zone-c"}, {"test-zone-d"}, {"test-zone-a", "test-zone-b"}}
 	arches := [][]string{{v1.ArchitectureAmd64}, {v1.ArchitectureArm64}}
