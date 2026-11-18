@@ -89,7 +89,7 @@ func (n *NodePoolState) MarkNodeClaimDeleting(npName, ncName string) {
 	n.nodePoolNameToNodeClaimState[npName].Active.Delete(ncName)
 }
 
-// Marks the given NodeClaim as Deleting in NodePoolState
+// Marks the given NodeClaim as PendingDisruption in NodePoolState
 func (n *NodePoolState) MarkNodeClaimPendingDisruption(npName, ncName string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -199,8 +199,25 @@ func (n *NodePoolState) UpdateNodeClaim(nodeClaim *v1.NodeClaim, markedForDeleti
 	if markedForDeletion {
 		n.MarkNodeClaimDeleting(npName, nodeClaim.Name)
 	} else {
-		n.MarkNodeClaimActive(npName, nodeClaim.Name)
+		n.markNodeClaimActiveUnlessPendingDisruption(npName, nodeClaim.Name)
 	}
+}
+
+// markNodeClaimActiveUnlessPendingDisruption marks the NodeClaim Active unless it's PendingDisruption. The disruption
+// queue marks a candidate PendingDisruption before it creates the replacement and patches the candidate's NodeClaim in
+// between, so a NodeClaim update alone must not move it back to Active. Otherwise static deprovisioning counts both the
+// candidate and its replacement as Active and deletes the replacement as surplus. The queue moves the candidate out of
+// PendingDisruption itself, to Deleting via MarkForDeletion or back to Active via UnmarkForDeletion.
+func (n *NodePoolState) markNodeClaimActiveUnlessPendingDisruption(npName, ncName string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ensureNodePoolEntry(npName)
+
+	if n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Has(ncName) {
+		return
+	}
+	n.nodePoolNameToNodeClaimState[npName].Deleting.Delete(ncName)
+	n.nodePoolNameToNodeClaimState[npName].Active.Insert(ncName)
 }
 
 func (n *NodePoolState) ensureNodePoolEntry(np string) {

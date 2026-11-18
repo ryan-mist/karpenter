@@ -405,6 +405,33 @@ var _ = Describe("Queue", func() {
 			Entry("for a node that goes before its replacement because its NodePool is at its node limit", disruption.TerminateFirstStaticAtLimit,
 				", terminating it before its replacement because its NodePool is at its node limit"),
 		)
+		It("should move a static candidate out of PendingDisruption when its replacement fails to launch", func() {
+			nodePool.Spec.Replicas = new(int64(1))
+			nodePool.Spec.Limits = nil
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, nodePoolBackoff),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+			}
+			// Delete the NodePool so the provisioner can't create the replacement
+			ExpectDeleted(ctx, env.Client, nodePool)
+			err := queue.StartCommand(ctx, cmd)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("launching replacement nodeclaim"))
+
+			// The command never enters the queue, so StartCommand itself must move the candidate back to Active
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
 		It("should finish two commands in order as replacements are initialized", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})

@@ -2754,6 +2754,29 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(2))
 			})
+
+			It("should keep a NodeClaim PendingDisruption when the NodeClaim is updated", func() {
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+
+				// The disruption queue sets the DisruptionReason condition after marking the candidate PendingDisruption
+				nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(1))
+
+				// Only an explicit unmark moves it back to Active
+				cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
+				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(1))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(0))
+			})
 		})
 
 		Context("DeleteNodeClaim", func() {
