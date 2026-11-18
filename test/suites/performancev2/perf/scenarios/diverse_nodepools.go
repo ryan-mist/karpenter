@@ -31,7 +31,7 @@ import (
 
 const (
 	diverseTaint = "perf.karpenter.sh/dedicated"
-	diversePool  = "perf.karpenter.sh/diverse-pool"
+	diversePool  = "perf.example.com/diverse-pool" // template labels can't use the restricted karpenter.sh domain
 )
 
 var diverseToleration = corev1.Toleration{Key: diverseTaint, Operator: corev1.TolerationOpExists}
@@ -50,7 +50,7 @@ func diverseNodePools(r *perf.Run, n int) []*v1.NodePool {
 		np := r.NodePool.DeepCopy()
 		np.Name = fmt.Sprintf("%s-%d", r.NodePool.Name, i)
 		np.Spec.Weight = lo.ToPtr(int32(1 + i%50)) //nolint:gosec // i%50 fits
-		np.Spec.Template.Labels = lo.Assign(np.Spec.Template.Labels, map[string]string{diversePool: r.Scenario.Name, "perf.karpenter.sh/pool-index": fmt.Sprint(i)})
+		np.Spec.Template.Labels = lo.Assign(np.Spec.Template.Labels, map[string]string{diversePool: r.Scenario.Name, "perf.example.com/pool-index": fmt.Sprint(i)})
 		reqs := []v1.NodeSelectorRequirementWithMinValues{{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: capacityTypes[i%len(capacityTypes)]}}
 		if kwok {
 			reqs = append(reqs,
