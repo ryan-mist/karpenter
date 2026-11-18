@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -143,6 +144,60 @@ var _ = Describe("Topology", func() {
 			)
 			ExpectSkew(ctx, env.Client, "default", &topology[0]).To(ConsistOf(1, 1, 2))
 		})
+		DescribeTable("should count existing pods selected by match expressions",
+			func(expression metav1.LabelSelectorRequirement, selected, notSelected map[string]string) {
+				// Two selected pods already occupy test-zone-1 and two pods the selector must skip occupy test-zone-2, and
+				// only those two zones can be provisioned, so the assertion discriminates regardless of map-iteration
+				// order. Counted correctly, test-zone-1 is over-full and both new pods go to test-zone-2 (2/2). Counting
+				// nothing, or counting every pod, both zones tie and the new pods balance one per zone.
+				topology := []corev1.TopologySpreadConstraint{{
+					TopologyKey:       corev1.LabelTopologyZone,
+					WhenUnsatisfiable: corev1.DoNotSchedule,
+					LabelSelector:     &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{expression}},
+					MaxSkew:           1,
+				}}
+				nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
+					{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-1", "test-zone-2"}}}
+				zone1Node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{corev1.LabelTopologyZone: "test-zone-1"},
+				}})
+				zone2Node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{corev1.LabelTopologyZone: "test-zone-2"},
+				}})
+				ExpectApplied(ctx, env.Client, nodePool, zone1Node, zone2Node)
+				ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(zone1Node))
+				ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(zone2Node))
+				ExpectApplied(ctx, env.Client,
+					test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: selected}, NodeName: zone1Node.Name}),
+					test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: selected}, NodeName: zone1Node.Name}),
+					test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: notSelected}, NodeName: zone2Node.Name}),
+					test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: notSelected}, NodeName: zone2Node.Name}),
+				)
+				// The client is uncached, so wait until countDomains' List can see the existing pods
+				Eventually(func(g Gomega) {
+					podList := &corev1.PodList{}
+					g.Expect(env.Client.List(ctx, podList, &client.ListOptions{Namespace: "default"})).To(Succeed())
+					g.Expect(podList.Items).To(HaveLen(4))
+				}, time.Second).Should(Succeed())
+
+				newPods := test.UnschedulablePods(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: selected}, TopologySpreadConstraints: topology}, 2)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, newPods...)
+				for _, p := range newPods {
+					node := ExpectScheduled(ctx, env.Client, p)
+					Expect(node.Labels[corev1.LabelTopologyZone]).To(Equal("test-zone-2"))
+				}
+				ExpectSkew(ctx, env.Client, "default", &topology[0]).To(ConsistOf(2, 2))
+			},
+			Entry("Exists",
+				metav1.LabelSelectorRequirement{Key: "app", Operator: metav1.LabelSelectorOpExists},
+				map[string]string{"app": "web"}, map[string]string{"tier": "frontend"}),
+			Entry("NotIn",
+				metav1.LabelSelectorRequirement{Key: "app", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"db"}},
+				map[string]string{"app": "web"}, map[string]string{"app": "db"}),
+			Entry("DoesNotExist",
+				metav1.LabelSelectorRequirement{Key: "skip-spread", Operator: metav1.LabelSelectorOpDoesNotExist},
+				map[string]string{"app": "web"}, map[string]string{"app": "web", "skip-spread": "true"}),
+		)
 		It("should respect NodePool zonal constraints", func() {
 			nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
 				{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"test-zone-1", "test-zone-2", "test-zone-3"}}}
@@ -3582,3 +3637,60 @@ func ownerReferenceFor(replicaSet *appsv1.ReplicaSet) metav1.OwnerReference {
 		Controller: new(true),
 	}
 }
+
+var _ = Describe("TopologyListOptions", func() {
+	DescribeTable("should translate a label selector into a pod list selector",
+		func(selector *metav1.LabelSelector, matching, notMatching []map[string]string) {
+			opts := scheduling.TopologyListOptions("default", selector)
+			Expect(opts.Namespace).To(Equal("default"))
+			for _, l := range matching {
+				Expect(opts.LabelSelector.Matches(k8slabels.Set(l))).To(BeTrue(), "expected %v to match", l)
+			}
+			for _, l := range notMatching {
+				Expect(opts.LabelSelector.Matches(k8slabels.Set(l))).To(BeFalse(), "expected %v not to match", l)
+			}
+		},
+		Entry("nil selector",
+			nil,
+			[]map[string]string{{}, {"app": "web"}}, nil),
+		Entry("match labels",
+			&metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			[]map[string]string{{"app": "web"}, {"app": "web", "tier": "frontend"}},
+			[]map[string]string{{}, {"app": "db"}}),
+		Entry("In",
+			&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpIn, Values: []string{"web", "api"}}}},
+			[]map[string]string{{"app": "web"}, {"app": "api"}},
+			[]map[string]string{{}, {"app": "db"}}),
+		Entry("NotIn",
+			&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"db"}}}},
+			[]map[string]string{{}, {"app": "web"}},
+			[]map[string]string{{"app": "db"}}),
+		Entry("Exists",
+			&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpExists}}},
+			[]map[string]string{{"app": "web"}, {"app": ""}},
+			[]map[string]string{{}, {"tier": "frontend"}}),
+		Entry("DoesNotExist",
+			&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpDoesNotExist}}},
+			[]map[string]string{{}, {"tier": "frontend"}},
+			[]map[string]string{{"app": "web"}}),
+		Entry("match labels and expressions together",
+			&metav1.LabelSelector{
+				MatchLabels:      map[string]string{"tier": "frontend"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"db"}}},
+			},
+			[]map[string]string{{"tier": "frontend", "app": "web"}, {"tier": "frontend"}},
+			[]map[string]string{{"tier": "frontend", "app": "db"}, {"app": "web"}}),
+	)
+	DescribeTable("should select nothing for a selector that can't be converted",
+		func(selector *metav1.LabelSelector) {
+			opts := scheduling.TopologyListOptions("default", selector)
+			Expect(opts.LabelSelector.Empty()).To(BeFalse())
+			Expect(opts.LabelSelector.Matches(k8slabels.Set{})).To(BeFalse())
+			Expect(opts.LabelSelector.Matches(k8slabels.Set{"app": "web"})).To(BeFalse())
+		},
+		Entry("invalid match labels key", &metav1.LabelSelector{MatchLabels: map[string]string{"not a valid key!": "web"}}),
+		Entry("In without values", &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpIn}}}),
+		Entry("Exists with values", &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpExists, Values: []string{"web"}}}}),
+		Entry("unknown operator", &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: "Gt", Values: []string{"1"}}}}),
+	)
+})
