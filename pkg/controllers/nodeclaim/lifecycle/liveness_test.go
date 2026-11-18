@@ -17,6 +17,7 @@ limitations under the License.
 package lifecycle_test
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/awslabs/operatorpkg/object"
@@ -30,8 +31,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -448,5 +451,110 @@ var _ = Describe("Liveness", func() {
 		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	Context("NodeRegistrationHealthy reason", func() {
+		ownedNodeClaim := func() *v1.NodeClaim {
+			return test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey: nodePool.Name,
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         object.GVK(nodePool).GroupVersion().String(),
+							Kind:               object.GVK(nodePool).Kind,
+							Name:               nodePool.Name,
+							UID:                nodePool.UID,
+							BlockOwnerDeletion: new(true),
+						},
+					},
+				},
+			})
+		}
+		It("should report RegistrationFailed when launched NodeClaims never register", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodeClaims := []*v1.NodeClaim{ownedNodeClaim(), ownedNodeClaim()}
+			for _, nodeClaim := range nodeClaims {
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched).IsTrue()).To(BeTrue())
+			}
+
+			// Neither Node registers within the registration timeout
+			env.Clock.Step(time.Minute * 20)
+			for _, nodeClaim := range nodeClaims {
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			}
+
+			// The NodeClaims launched, so the NodePool reports a registration failure rather than a launch failure
+			operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{
+				Type:    v1.ConditionTypeNodeRegistrationHealthy,
+				Status:  metav1.ConditionFalse,
+				Reason:  "RegistrationFailed",
+				Message: "Failed to register node",
+			})
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 2, map[string]string{
+				metrics.ReasonLabel:   metrics.RegistrationTimeoutReason,
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+		})
+		It("should report the launch failure reason when NodeClaims never launch", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodeClaims := []*v1.NodeClaim{ownedNodeClaim(), ownedNodeClaim()}
+			launchErr := cloudprovider.NewCreateError(fmt.Errorf("no capacity"), "TestLaunchFailure", "test launch failure message")
+			ExpectApplied(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+			for _, nodeClaim := range nodeClaims {
+				cloudProvider.NextCreateErr = launchErr
+				_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
+			}
+
+			env.Clock.Step(time.Minute * 6)
+			for _, nodeClaim := range nodeClaims {
+				// Launch is retried, and fails the same way, before liveness times the NodeClaim out
+				cloudProvider.NextCreateErr = launchErr
+				_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
+			}
+
+			// The NodeClaims never launched, so the NodePool surfaces why from their Launched condition
+			operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{
+				Type:    v1.ConditionTypeNodeRegistrationHealthy,
+				Status:  metav1.ConditionFalse,
+				Reason:  "TestLaunchFailure",
+				Message: "test launch failure message",
+			})
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 2, map[string]string{
+				metrics.ReasonLabel:   metrics.LaunchTimeoutReason,
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+		})
+		It("should not mark the NodePool unhealthy for a NodeClaim it doesn't own", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			// Labeled with the NodePool, but without an owner reference to it
+			nodeClaims := []*v1.NodeClaim{
+				test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}}),
+				test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}}),
+			}
+			for _, nodeClaim := range nodeClaims {
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			}
+
+			env.Clock.Step(time.Minute * 20)
+			for _, nodeClaim := range nodeClaims {
+				ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			}
+
+			operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{
+				Type:   v1.ConditionTypeNodeRegistrationHealthy,
+				Status: metav1.ConditionUnknown,
+			})
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodeClaims[1])
+		})
 	})
 })
