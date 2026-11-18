@@ -36,7 +36,7 @@ func EvictPod(pod *corev1.Pod, reason string) events.Event {
 		Type:           corev1.EventTypeNormal,
 		Reason:         events.Evicted,
 		Message:        "Evicted pod: " + reason,
-		DedupeValues:   []string{pod.Name},
+		DedupeValues:   []string{string(pod.UID)},
 	}
 }
 
@@ -46,7 +46,7 @@ func DisruptPodDelete(pod *corev1.Pod, gracePeriodSeconds *int64, nodeGracePerio
 		Type:           corev1.EventTypeNormal,
 		Reason:         events.Disrupted,
 		Message:        fmt.Sprintf("Deleting the pod to accommodate the terminationTime %v of the node. The pod was granted %v seconds of grace-period of its %v terminationGracePeriodSeconds. This bypasses the PDB of the pod and the do-not-disrupt annotation.", lo.FromPtr(nodeGracePeriodTerminationTime), lo.FromPtr(gracePeriodSeconds), lo.FromPtr(pod.Spec.TerminationGracePeriodSeconds)),
-		DedupeValues:   []string{pod.Name},
+		DedupeValues:   []string{string(pod.UID)},
 	}
 }
 
