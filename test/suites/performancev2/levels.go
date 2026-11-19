@@ -34,6 +34,7 @@ var migrated = []scenarioLevels{
 	driftLevels,
 	doNotDisruptLevels,
 	hostnameSpreadLevels,
+	interferenceLevels,
 }
 
 // withMigrated adds every migrated scenario's levels, picked by pick, to base.

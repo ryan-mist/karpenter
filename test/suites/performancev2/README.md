@@ -82,6 +82,7 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `drift` | pods=600 | `initial`, `drift` | drift replacement under hostname spread: every node is replaced after a NodePool template change (perfv1 Drift) |
 | `doNotDisrupt` | pods=1100 | `scaleOut`, `consolidation` | consolidation around nodes hosting `karpenter.sh/do-not-disrupt` pods, which must survive (perfv1 Do Not Disrupt) |
 | `hostnameSpread` | pods=1000 (kwok: 2000) | `scaleOut`, `consolidation` | hostname topology spread, whose domains grow with every node (perfv1 Host Name Spreading Reg and XL) |
+| `interference` | pods=1000 | `scaleOut`, `interference`, `consolidation` | two self anti-affine deployments scaled in opposite directions at once (perfv1 Self Anti-Affinity Interference) |
 
 ## Writing a scenario
 
