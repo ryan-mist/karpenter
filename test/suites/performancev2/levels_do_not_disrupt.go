@@ -18,19 +18,16 @@ package performancev2
 
 import "sigs.k8s.io/karpenter/test/suites/performancev2/perf"
 
-// doNotDisruptLevels follow kwok_provider.go's rule.
-//   - kwok: calibration/kwok.json, 5 EKS baselines with the rv2013 control counted as a baseline, and planted regressions
-//     mconc1, rv1973, m959, m1966 and m1822. Stable only where a regression breaches the bound by 10% or more. Stable
-//     pod-ready bounds are whole seconds and at least 1.5x the slowest baseline; heap, max and wall time stay Experimental.
-//   - kwok-ci: Experimental only, from perfv1's 35-37 GitHub-runner runs of the same workload (the same heap and CPU
-//     series), until perf-periodic has the 20 runs a Stable gate needs.
+// doNotDisruptLevels: see levels.go for the rule. No Stable gates: mconc1 makes scaleOut time out, which fails the
+// spec but leaves no report to count, and the one other catch (rv1973, pod_ready p95 22 s to 31 s) is a single run of
+// a patch whose catches don't repeat.
 var doNotDisruptLevels = scenarioLevels{
 	KWOK: perf.Levels{
 		"doNotDisrupt/scaleOut": {
-			perf.PodReady.P95.Experimental(33), perf.PodReady.P99.Experimental(45), perf.PodReady.Max.Experimental(45), perf.CPUUtil.Experimental(0.684), perf.MemoryUtil.Experimental(0.741), perf.Nodes.Experimental(662), perf.HeapMB.Experimental(283), perf.CPUCores.Experimental(1.41),
+			perf.PodReady.P95.Experimental(33), perf.PodReady.P99.Experimental(45), perf.PodReady.Max.Experimental(45), perf.CPUUtil.Experimental(0.684), perf.MemoryUtil.Experimental(0.741), perf.Nodes.Experimental(663), perf.HeapMB.Experimental(283), perf.CPUCores.Experimental(1.41),
 		},
 		"doNotDisrupt/consolidation": {
-			perf.TotalTimeSeconds.Experimental(1549), perf.CPUUtil.Experimental(0.694), perf.MemoryUtil.Experimental(0.733), perf.Nodes.Experimental(362), perf.PodsDisrupted.Experimental(167), perf.HeapMB.Experimental(202), perf.CPUCores.Experimental(0.638),
+			perf.TotalTimeSeconds.Experimental(1549), perf.CPUUtil.Experimental(0.694), perf.MemoryUtil.Experimental(0.733), perf.Nodes.Experimental(363), perf.PodsDisrupted.Experimental(167), perf.HeapMB.Experimental(202), perf.CPUCores.Experimental(0.638),
 		},
 	},
 	KWOKCI: perf.Levels{

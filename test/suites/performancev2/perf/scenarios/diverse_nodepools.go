@@ -23,7 +23,6 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 
-	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
@@ -37,14 +36,11 @@ const (
 var diverseToleration = corev1.Toleration{Key: diverseTaint, Operator: corev1.TolerationOpExists}
 
 // diverseNodePools builds n NodePools that no two collapse to the same shape: a rotating capacity type, weight and
-// template label everywhere, and on KWOK also a rotating zone, architecture and instance size ceiling, since other
-// providers' zones and catalogs vary by account. Every third pool carries a taint the scenario's pods tolerate.
+// template label everywhere, plus whichever of zone, architecture and instance size ceiling the provider's Catalog
+// names. Every third pool carries a taint the scenario's pods tolerate.
 func diverseNodePools(r *perf.Run, n int) []*v1.NodePool {
-	kwok := isKWOK(r)
+	cat := r.Provider.Catalog
 	capacityTypes := [][]string{{v1.CapacityTypeSpot}, {v1.CapacityTypeOnDemand}, {v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}}
-	zones := [][]string{{"test-zone-a"}, {"test-zone-b"}, {"test-zone-c"}, {"test-zone-d"}, {"test-zone-a", "test-zone-b"}}
-	arches := [][]string{{v1.ArchitectureAmd64}, {v1.ArchitectureArm64}}
-	sizes := []string{"8", "16", "32"}
 	pools := make([]*v1.NodePool, 0, n)
 	for i := range n {
 		np := r.NodePool.DeepCopy()
@@ -52,12 +48,14 @@ func diverseNodePools(r *perf.Run, n int) []*v1.NodePool {
 		np.Spec.Weight = new(int32(1 + i%50)) //nolint:gosec // i%50 fits
 		np.Spec.Template.Labels = lo.Assign(np.Spec.Template.Labels, map[string]string{diversePool: r.Scenario.Name, "perf.example.com/pool-index": fmt.Sprint(i)})
 		reqs := []v1.NodeSelectorRequirementWithMinValues{{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: capacityTypes[i%len(capacityTypes)]}}
-		if kwok {
-			reqs = append(reqs,
-				v1.NodeSelectorRequirementWithMinValues{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: zones[i%len(zones)]},
-				v1.NodeSelectorRequirementWithMinValues{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: arches[i%len(arches)]},
-				v1.NodeSelectorRequirementWithMinValues{Key: v1alpha1.InstanceSizeLabelKey, Operator: corev1.NodeSelectorOpLt, Values: []string{sizes[i%len(sizes)]}},
-			)
+		if len(cat.Zones) > 0 {
+			reqs = append(reqs, v1.NodeSelectorRequirementWithMinValues{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: cat.Zones[i%len(cat.Zones)]})
+		}
+		if len(cat.Arches) > 0 {
+			reqs = append(reqs, v1.NodeSelectorRequirementWithMinValues{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{cat.Arches[i%len(cat.Arches)]}})
+		}
+		if cat.SizeKey != "" && len(cat.SizeCeilings) > 0 {
+			reqs = append(reqs, v1.NodeSelectorRequirementWithMinValues{Key: cat.SizeKey, Operator: corev1.NodeSelectorOpLt, Values: []string{cat.SizeCeilings[i%len(cat.SizeCeilings)]}})
 		}
 		test.ReplaceRequirements(np, reqs...)
 		if i%3 == 0 {
@@ -71,7 +69,7 @@ func diverseNodePools(r *perf.Run, n int) []*v1.NodePool {
 // DiverseNodePools is perfv1's "Many Diverse NodePools": NodePool cardinality, not pod count, is the load.
 var DiverseNodePools = perf.Scenario{
 	Name:    "diverseNodePools",
-	Summary: "N diverse NodePools (capacity type, weight, a third tainted, and on KWOK zone, arch and size) and a few zonally spread 50m/128Mi pods that can use any of them: per-NodePool cost in cluster state, cost tracking and scheduling, where nodepools has one usable pool.",
+	Summary: "N diverse NodePools (capacity type, weight, a third tainted, plus the zone, arch and size ceiling in the provider's Catalog) and a few zonally spread 50m/128Mi pods that can use any of them: per-NodePool cost in cluster state, cost tracking and scheduling, where nodepools has one usable pool.",
 	Vectors: map[perf.Vector]int{perf.VectorNodePools: 500, perf.VectorPods: 100},
 	Phases: []perf.PhaseSpec{
 		{Name: "scaleOut", Summary: "Pods across the diverse NodePools: NodePool selection and topology/taint bookkeeping over every pool."},

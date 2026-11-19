@@ -20,39 +20,41 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
 )
 
 // BalancedHeterogeneous is perfv1's "Balanced Heterogeneous NodePools": Balanced across two NodePools with different
-// instance families and workload densities. KWOK only, since it selects KWOK's instance-family label.
+// instance families and workload densities. It needs two instance families from the provider's Catalog.
 var BalancedHeterogeneous = perf.Scenario{
 	Name:    "balancedHeterogeneous",
-	Summary: "Two Balanced NodePools restricted to KWOK instance families c and m, a dense workload (300 per 400, 500m/1Gi) on c and a sparse one (100 per 400, 2500m/8Gi) on m, scaled to 60%: Balanced scoring per NodePool.",
+	Summary: "Two Balanced NodePools restricted to the first two Catalog instance families (c and m on KWOK), a dense workload (300 per 400, 500m/1Gi) on the first and a sparse one (100 per 400, 2500m/8Gi) on the second, scaled to 60%: Balanced scoring per NodePool.",
 	Vectors: map[perf.Vector]int{perf.VectorPods: 400},
 	Phases: []perf.PhaseSpec{
 		{Name: "scaleOut", Summary: "Both workloads until all pods are healthy."},
 		{Name: "consolidation", Summary: "Scale both to 60% until nodes stop being disrupted; every scored move must belong to one of the two NodePools."},
 	},
-	Run: func(r *perf.Run) {
-		if !isKWOK(r) {
-			Skip("balancedHeterogeneous selects KWOK instance families")
+	Requires: func(p *perf.Provider) error {
+		if p.Catalog.FamilyKey == "" || len(p.Catalog.Families) < 2 {
+			return fmt.Errorf("needs Catalog.FamilyKey and two Catalog.Families")
 		}
+		return nil
+	},
+	Run: func(r *perf.Run) {
 		balancedPool(r)
+		cat := r.Provider.Catalog
 		pool := func(family string) *v1.NodePool {
 			np := r.NodePool.DeepCopy()
 			np.Name = fmt.Sprintf("%s-%s", r.NodePool.Name, family)
-			test.ReplaceRequirements(np, v1.NodeSelectorRequirementWithMinValues{Key: v1alpha1.InstanceFamilyLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{family}})
+			test.ReplaceRequirements(np, v1.NodeSelectorRequirementWithMinValues{Key: cat.FamilyKey, Operator: corev1.NodeSelectorOpIn, Values: []string{family}})
 			return np
 		}
-		c, m := pool("c"), pool("m")
+		c, m := pool(cat.Families[0]), pool(cat.Families[1])
 		n := r.Size(perf.VectorPods)
 		denseN, sparseN := n*3/4, n-n*3/4
 		dense := r.Deployment("dense", denseN, "500m", "1Gi", test.WithNodeSelector(map[string]string{v1.NodePoolLabelKey: c.Name}))

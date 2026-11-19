@@ -16,7 +16,7 @@ To show the smoke test catches a regression, dispatch `perf-smoke` with `regress
 
 ## Audit it: `go run ./test/suites/performancev2/cmd/inventory`
 
-The inventory prints every phase's gated and measured metrics, grouped by kind (duration, outcome, resource). Each bound comes with the calibration evidence behind it. It's generated from the same values the suite runs, plus the checked-in `calibration/<provider>.json`, and it needs no cluster.
+The inventory prints every phase's gated and measured metrics, grouped by kind (duration, outcome, resource). Each bound comes with the calibration evidence behind it. It's generated from the same values the suite runs, plus the checked-in `calibration/<provider>/<scenario>.json`, and it needs no cluster.
 
 The command fails in two cases:
 - A level names an undeclared phase.
@@ -41,16 +41,15 @@ The command fails in two cases:
 Stable needs n >= 3, CV <= 20%, FPR <= 1% and at least one catch. An unlisted phase of an enabled scenario is measured. MDE50 and MDE80 are the smallest regressions one run catches half and 80% of the time, and FPR is the chance a baseline run breaches, assuming a normal spread with the baseline CV; with few baselines these are estimates.
 ```
 
-To recalibrate, put baselines in `base-*/` and regressions in `<patch>/` directories, then run:
+To recalibrate, put each run's reports in its own directory: `base-*` for baselines, and `<patch>` or `reg-<patch>` for a planted regression (directories may nest, for example `runs/<cluster>-<time>/base-1/`). Then run:
 
 ```sh
-go run ./test/suites/performancev2/cmd/calibrate -dir runs/ -source "cluster, controller size" > /tmp/kwok.json \
-  && mv /tmp/kwok.json test/suites/performancev2/calibration/kwok.json
-go run ./test/suites/performancev2/cmd/calibrate -dir runs/ -provider kwok-ci -source "GitHub kind runner" > /tmp/kwok-ci.json \
-  && mv /tmp/kwok-ci.json test/suites/performancev2/calibration/kwok-ci.json
+go run ./test/suites/performancev2/cmd/calibrate -dir runs/ -source "cluster, controller size" -out test/suites/performancev2/calibration/kwok
+go run ./test/suites/performancev2/cmd/calibrate -dir runs/ -provider kwok-ci -source "GitHub kind runner" -out test/suites/performancev2/calibration/kwok-ci
+go run ./test/suites/performancev2/cmd/calibrate -dir runs/ -levels   # the calibration rule's levels, as Go
 ```
 
-Write to a temp file first: the calibration is embedded, and redirecting straight into it empties it before `go run` compiles.
+Each scenario has its own `<scenario>.json` with its own source and baseline commit, and `-out` rewrites only the scenarios in `runs/`. Negative controls (`-controls`, by default `rv2013,rv2008`) are kept apart from planted regressions: they never count as a catch, a Stable bound they breach fails the inventory, and the rule counts them as baselines. The rule itself is in `perf/suggest.go`: bounds, whole-second pod latency, and when a gate may be Stable.
 
 How to read the evidence columns:
 - **MDE50 and MDE80:** the smallest regression a single run breaches the bound with 50% and 80% power. MDE50 is the median's distance from the bound.

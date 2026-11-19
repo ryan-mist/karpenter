@@ -53,7 +53,10 @@ type Scenario struct {
 	Vectors map[Vector]int
 	Sweep   map[Vector][]int
 	Phases  []PhaseSpec
-	Run     func(*Run)
+	// Requires reports why a provider can't run the scenario, for example a Catalog dimension it needs. Validate
+	// fails a provider that enables a scenario it can't run, so the gap shows in cmd/inventory rather than as a skip.
+	Requires func(*Provider) error
+	Run      func(*Run)
 }
 
 type PhaseSpec struct {

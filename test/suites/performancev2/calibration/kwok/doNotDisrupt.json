@@ -1,0 +1,373 @@
+{
+  "provider": "kwok",
+  "source": "EKS us-west-2, tier-xl provisioned control plane, controller 8 CPU / 24Gi on m7i.4xlarge, 5 baselines over 4 clusters",
+  "baseline_commit": "8ea58d7",
+  "generated": "2026-11-19T18:43:30Z",
+  "phases": {
+    "doNotDisrupt/consolidation": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 0.521,
+        "min": 0.5,
+        "max": 0.532,
+        "cv": 0.026,
+        "suggested_bound": 0.638,
+        "variants": {
+          "m1822": 0.522,
+          "m1966": 0.563,
+          "m959": 0.497,
+          "rv1973": 0.453
+        },
+        "controls": {
+          "rv2013": 0.527
+        }
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.802,
+        "min": 0.798,
+        "max": 0.811,
+        "cv": 0.006,
+        "suggested_bound": 0.694,
+        "variants": {
+          "m1822": 0.799,
+          "m1966": 0.802,
+          "m959": 0.808,
+          "rv1973": 0.796
+        },
+        "controls": {
+          "rv2013": 0.804
+        }
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 157.037,
+        "min": 156.034,
+        "max": 168.384,
+        "cv": 0.035,
+        "suggested_bound": 202,
+        "variants": {
+          "m1822": 151.061,
+          "m1966": 148.609,
+          "m959": 157.069,
+          "rv1973": 154.477
+        },
+        "controls": {
+          "rv2013": 156.303
+        }
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.85,
+        "min": 0.843,
+        "max": 0.855,
+        "cv": 0.005,
+        "suggested_bound": 0.733,
+        "variants": {
+          "m1822": 0.847,
+          "m1966": 0.849,
+          "m959": 0.853,
+          "rv1973": 0.835
+        },
+        "controls": {
+          "rv2013": 0.853
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 293,
+        "min": 265,
+        "max": 302,
+        "cv": 0.044,
+        "suggested_bound": 363,
+        "variants": {
+          "m1822": 280,
+          "m1966": 273,
+          "m959": 307,
+          "rv1973": 303
+        },
+        "controls": {
+          "rv2013": 296
+        }
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 1,
+        "min": 1,
+        "max": 1,
+        "cv": 0,
+        "suggested_bound": 2,
+        "variants": {
+          "m1822": 0,
+          "m1966": 0,
+          "m959": 1,
+          "rv1973": 0
+        },
+        "controls": {
+          "rv2013": 1
+        }
+      },
+      "pod_ready_seconds_p50": {
+        "n": 5,
+        "median": 0,
+        "min": 0,
+        "max": 1,
+        "cv": 1.225,
+        "suggested_bound": 2,
+        "variants": {
+          "m1822": 0,
+          "m1966": 0,
+          "m959": 1,
+          "rv1973": 0
+        },
+        "controls": {
+          "rv2013": 1
+        }
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 1,
+        "min": 0,
+        "max": 1,
+        "cv": 0.816,
+        "suggested_bound": 3,
+        "variants": {
+          "m1822": 0,
+          "m1966": 0,
+          "m959": 1,
+          "rv1973": 0
+        },
+        "controls": {
+          "rv2013": 1
+        }
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 1,
+        "min": 0,
+        "max": 1,
+        "cv": 0.5,
+        "suggested_bound": 3,
+        "variants": {
+          "m1822": 0,
+          "m1966": 0,
+          "m959": 1,
+          "rv1973": 0
+        },
+        "controls": {
+          "rv2013": 1
+        }
+      },
+      "pods_disrupted": {
+        "n": 5,
+        "median": 120,
+        "min": 110,
+        "max": 139,
+        "cv": 0.078,
+        "suggested_bound": 167,
+        "variants": {
+          "m1822": 124,
+          "m1966": 94,
+          "m959": 147,
+          "rv1973": 138
+        },
+        "controls": {
+          "rv2013": 126
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 1017.771,
+        "min": 682.087,
+        "max": 1254.982,
+        "cv": 0.224,
+        "suggested_bound": 1549,
+        "variants": {
+          "m1822": 916.043,
+          "m1966": 1505.082,
+          "m959": 992.619,
+          "rv1973": 1025.509
+        },
+        "controls": {
+          "rv2013": 744.639
+        }
+      }
+    },
+    "doNotDisrupt/scaleOut": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 1.116,
+        "min": 1.064,
+        "max": 1.175,
+        "cv": 0.038,
+        "suggested_bound": 1.41,
+        "variants": {
+          "m1822": 1.162,
+          "m1966": 1.092,
+          "m959": 1.066,
+          "rv1973": 1.085
+        },
+        "controls": {
+          "rv2013": 1.082
+        }
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.792,
+        "min": 0.787,
+        "max": 0.809,
+        "cv": 0.01,
+        "suggested_bound": 0.684,
+        "variants": {
+          "m1822": 0.798,
+          "m1966": 0.801,
+          "m959": 0.789,
+          "rv1973": 0.784
+        },
+        "controls": {
+          "rv2013": 0.794
+        }
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 195.996,
+        "min": 182.085,
+        "max": 236.14,
+        "cv": 0.092,
+        "suggested_bound": 283,
+        "variants": {
+          "m1822": 211.043,
+          "m1966": 214.908,
+          "m959": 199.876,
+          "rv1973": 187.167
+        },
+        "controls": {
+          "rv2013": 214.006
+        }
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.855,
+        "min": 0.852,
+        "max": 0.867,
+        "cv": 0.006,
+        "suggested_bound": 0.741,
+        "variants": {
+          "m1822": 0.858,
+          "m1966": 0.859,
+          "m959": 0.857,
+          "rv1973": 0.855
+        },
+        "controls": {
+          "rv2013": 0.859
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 543,
+        "min": 514,
+        "max": 552,
+        "cv": 0.024,
+        "suggested_bound": 663,
+        "variants": {
+          "m1822": 530,
+          "m1966": 523,
+          "m959": 556,
+          "rv1973": 559
+        },
+        "controls": {
+          "rv2013": 545
+        }
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 30,
+        "min": 29,
+        "max": 32,
+        "cv": 0.037,
+        "suggested_bound": 39,
+        "variants": {
+          "m1822": 29,
+          "m1966": 32,
+          "m959": 29,
+          "rv1973": 34
+        },
+        "controls": {
+          "rv2013": 31
+        }
+      },
+      "pod_ready_seconds_p50": {
+        "n": 5,
+        "median": 16,
+        "min": 16,
+        "max": 16,
+        "cv": 0,
+        "suggested_bound": 24,
+        "variants": {
+          "m1822": 16,
+          "m1966": 17,
+          "m959": 16,
+          "rv1973": 15
+        },
+        "controls": {
+          "rv2013": 16
+        }
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 22,
+        "min": 22,
+        "max": 22,
+        "cv": 0,
+        "suggested_bound": 33,
+        "variants": {
+          "m1822": 22,
+          "m1966": 22,
+          "m959": 24,
+          "rv1973": 31
+        },
+        "controls": {
+          "rv2013": 22
+        }
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 29,
+        "min": 29,
+        "max": 30,
+        "cv": 0.017,
+        "suggested_bound": 45,
+        "variants": {
+          "m1822": 29,
+          "m1966": 32,
+          "m959": 29,
+          "rv1973": 33
+        },
+        "controls": {
+          "rv2013": 30
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 32,
+        "min": 30,
+        "max": 32,
+        "cv": 0.031,
+        "suggested_bound": 38.4,
+        "variants": {
+          "m1822": 30,
+          "m1966": 34,
+          "m959": 31,
+          "rv1973": 35
+        },
+        "controls": {
+          "rv2013": 32
+        }
+      }
+    }
+  },
+  "kinds": {
+    "doNotDisrupt/consolidation": "consolidation",
+    "doNotDisrupt/scaleOut": "scale-out"
+  }
+}
