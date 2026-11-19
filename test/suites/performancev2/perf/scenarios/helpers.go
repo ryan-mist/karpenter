@@ -18,6 +18,7 @@ package scenarios
 
 import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -43,4 +44,13 @@ func isKWOK(r *perf.Run) bool {
 		return true
 	}
 	return r.NodeClass.GetObjectKind().GroupVersionKind().GroupKind() == schema.GroupKind{Group: "karpenter.kwok.sh", Kind: "KWOKNodeClass"}
+}
+
+// objects converts typed objects for Run.Create and Run.CreateParallel.
+func objects[T client.Object](in []T) []client.Object {
+	out := make([]client.Object, 0, len(in))
+	for _, o := range in {
+		out = append(out, o)
+	}
+	return out
 }

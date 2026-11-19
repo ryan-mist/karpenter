@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/samber/lo"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
@@ -93,40 +92,5 @@ var DiverseNodePools = perf.Scenario{
 		consolidation := r.StartPhase("consolidation")
 		r.Scale(pods*2/5, app)
 		consolidation.AwaitConsolidation(pods, pods*2/5, 15*time.Minute)
-	},
-}
-
-// TargetedNodePools is perfv1's "should stay within resource bounds when pods target many NodePools": one pinned
-// single-pod deployment per targeted pool, so many pools get real nodes and cost tracking entries at once.
-var TargetedNodePools = perf.Scenario{
-	Name:    "targetedNodePools",
-	Summary: "N diverse NodePools, with one single-pod 50m/128Mi deployment pinned (karpenter.sh/nodepool selector) to each of the first P: many pools provision at once, one node each.",
-	Vectors: map[perf.Vector]int{perf.VectorNodePools: 500, perf.VectorPods: 150},
-	Phases: []perf.PhaseSpec{
-		{Name: "scaleOut", Summary: "P pinned pods, about one node per targeted NodePool: per-NodePool provisioning and cost tracking population."},
-		{Name: "consolidation", Summary: "Zero half the deployments until their nodes are gone: emptiness across many NodePools."},
-	},
-	Run: func(r *perf.Run) {
-		targets := r.Size(perf.VectorPods)
-		pools := diverseNodePools(r, r.Size(perf.VectorNodePools))
-		r.Create(r.NodeClass)
-		r.CreateParallel(objects(pools))
-		r.AwaitNodePoolsReady(15 * time.Minute)
-		deps := make([]*appsv1.Deployment, 0, targets)
-		for i := range targets {
-			deps = append(deps, r.Deployment(fmt.Sprintf("t%03d", i), 1, "50m", "128Mi",
-				test.WithNodeSelector(map[string]string{v1.NodePoolLabelKey: pools[i%len(pools)].Name}),
-				test.WithTolerations([]corev1.Toleration{diverseToleration})))
-		}
-
-		scaleOut := r.StartPhase("scaleOut")
-		r.CreateParallel(objects(deps))
-		scaleOut.AwaitScaleOut(targets, 15*time.Minute)
-
-		consolidation := r.StartPhase("consolidation")
-		for _, d := range deps[targets/2:] {
-			r.Scale(0, d)
-		}
-		consolidation.AwaitConsolidation(targets, targets/2, 20*time.Minute)
 	},
 }

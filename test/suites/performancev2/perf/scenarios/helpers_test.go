@@ -19,6 +19,8 @@ package scenarios
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"sigs.k8s.io/karpenter/kwok/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/test/suites/performancev2/env"
@@ -46,5 +48,11 @@ func TestFrac(t *testing.T) {
 		if got := frac(tc.n, tc.num, tc.den); got != tc.want {
 			t.Errorf("frac(%d, %d, %d) = %d, want %d", tc.n, tc.num, tc.den, got, tc.want)
 		}
+	}
+}
+
+func TestObjects(t *testing.T) {
+	if got := objects([]*corev1.Pod{{}, {}}); len(got) != 2 {
+		t.Errorf("objects returned %d objects, want 2", len(got))
 	}
 }

@@ -21,7 +21,6 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
@@ -80,12 +79,4 @@ var WideDeployments = perf.Scenario{
 		}
 		consolidation.AwaitConsolidation(total, totalScaled, 30*time.Minute)
 	},
-}
-
-func objects[T client.Object](in []T) []client.Object {
-	out := make([]client.Object, 0, len(in))
-	for _, o := range in {
-		out = append(out, o)
-	}
-	return out
 }
