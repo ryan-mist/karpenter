@@ -79,6 +79,7 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `pods` | pods=1000 | `scaleOut`, `consolidation` | provisioning throughput and disruption cost |
 | `nodepools` | nodepools=1000, pods=100 | `scheduling`, `startup` | per-NodePool cost: N-1 NodePools carry a tenant taint the pods don't tolerate |
 | `topology` | pods=1000 | `scaleOut` | hard constraints: hostname anti-affinity, zonal and hostname topology spread |
+| `drift` | pods=600 | `initial`, `drift` | drift replacement under hostname spread: every node is replaced after a NodePool template change (perfv1 Drift) |
 
 ## Writing a scenario
 

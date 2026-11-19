@@ -32,6 +32,7 @@ var All = []perf.Scenario{
 	Pods,
 	NodePools,
 	Topology,
+	Drift,
 }
 
 var Pods = perf.Scenario{

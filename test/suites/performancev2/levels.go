@@ -30,7 +30,9 @@ import "sigs.k8s.io/karpenter/test/suites/performancev2/perf"
 // perf-periodic has the 20 runs a Stable gate needs; recalibrate them from those reports with cmd/calibrate.
 type scenarioLevels struct{ KWOK, KWOKCI perf.Levels }
 
-var migrated = []scenarioLevels{}
+var migrated = []scenarioLevels{
+	driftLevels,
+}
 
 // withMigrated adds every migrated scenario's levels, picked by pick, to base.
 func withMigrated(base perf.Levels, pick func(scenarioLevels) perf.Levels) perf.Levels {
