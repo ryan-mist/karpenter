@@ -33,7 +33,17 @@ func InventoryMain(scenarios []Scenario, providers ...*Provider) {
 	mde := flag.Float64("mde", 0.10, "regression size for the repeats table, as a fraction")
 	fpr := flag.Float64("fpr", 0.01, "false positive rate for the repeats table")
 	power := flag.Float64("power", 0.80, "power for the repeats table")
+	list := flag.String("list", "", "print the scenarios this provider enables as a JSON array (for a workflow matrix) and exit")
 	flag.Parse()
+	if *list != "" {
+		p, ok := lo.Find(providers, func(p *Provider) bool { return p.Name == *list })
+		if !ok {
+			fail(fmt.Errorf("unknown provider %q", *list))
+		}
+		b, _ := json.Marshal(EnabledScenarios(p, scenarios))
+		fmt.Println(string(b))
+		return
+	}
 	out, err := Inventory(scenarios, providers...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

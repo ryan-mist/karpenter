@@ -178,6 +178,10 @@ licenses: download ## Verifies dependency licenses
 	go tool -modfile=go.tools.mod go-licenses csv ./... > $$LICENSEFILE && \
 	awk -F, '$$3 !~ /^(Apache-2.0|0BSD|BSD-2-Clause|BSD-2-Clause-FreeBSD|BSD-3-Clause|MIT|MIT-0|ISC|OpenSSL|OpenSSL-standalone|PSF-2.0|Python-2.0|Python-2.0.1|PostgreSQL|SSLeay-standalone|UPL-1.0|X11|Zlib)$$/ { print; bad = 1 } END { exit bad }' $$LICENSEFILE
 
+perf-verify: ## Unit-test performancev2 and check every level's calibration evidence (no cluster needed)
+	go test ./test/suites/performancev2/perf/... ./test/suites/performancev2/cmd/...
+	go run ./test/suites/performancev2/cmd/inventory > /dev/null
+
 verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatting, etc
 	go mod tidy
 	go generate ./...
@@ -194,6 +198,7 @@ verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatt
 	go tool -modfile=go.tools.mod nwa config -c add
 	go vet ./...
 	go tool -modfile=go.tools.mod golangci-lint-kube-api-linter run
+	$(MAKE) perf-verify
 	cd kwok/charts && go tool -modfile=../../go.tools.mod helm-docs
 	@git diff --quiet ||\
 		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
@@ -208,4 +213,4 @@ download: ## Recursively "go mod download" on all directories where go.mod exist
 gen_instance_types:
 	go run kwok/tools/gen_instance_types.go > kwok/cloudprovider/instance_types.json
 
-.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory test-dra e2etest-dra benchmark deflake karpenterlint test-karpenterlint vulncheck licenses verify download gen_instance_types setup-kind setup-kind-dra delete-kind-dra apply-with-kind-dra
+.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test perf-verify test-memory test-dra e2etest-dra benchmark deflake karpenterlint test-karpenterlint vulncheck licenses verify download gen_instance_types setup-kind setup-kind-dra delete-kind-dra apply-with-kind-dra
