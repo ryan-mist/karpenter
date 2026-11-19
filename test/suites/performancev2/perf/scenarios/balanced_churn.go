@@ -40,7 +40,7 @@ var BalancedChurn = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(app)
-		scaleOut.AwaitScaleOut(n, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
 		settle := 2 * time.Minute
@@ -49,9 +49,9 @@ var BalancedChurn = perf.Scenario{
 		}
 		for _, replicas := range []int{n / 2, n, n / 2} {
 			r.Scale(replicas, app)
-			r.AwaitHealthyPods(replicas, 10*time.Minute)
+			r.AwaitHealthyPods(r.Replicas(), 10*time.Minute)
 			time.Sleep(settle)
 		}
-		expectBalancedDecisions(consolidation.AwaitConsolidation(n, n/2, 20*time.Minute))
+		expectBalancedDecisions(consolidation.AwaitConsolidation(n, r.Replicas(), 20*time.Minute))
 	},
 }

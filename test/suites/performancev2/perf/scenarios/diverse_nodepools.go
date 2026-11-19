@@ -85,10 +85,11 @@ var DiverseNodePools = perf.Scenario{
 
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(app)
-		scaleOut.AwaitScaleOut(pods, 10*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 10*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(pods*2/5, app)
-		consolidation.AwaitConsolidation(pods, pods*2/5, 15*time.Minute)
+		consolidation.AwaitConsolidation(from, r.Replicas(), 15*time.Minute)
 	},
 }

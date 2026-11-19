@@ -32,6 +32,8 @@ func KWOKCI(c env.Clients) *perf.Provider {
 	p := KWOK(c)
 	p.Name = "kwok-ci"
 	p.Summary = "Per-PR smoke and periodics on a GitHub Actions kind runner. Stable only for gross regressions."
+	// Replaces kwok's Sizes rather than adding to them: kwok-ci runs every scenario at its default size unless listed
+	// here, so kwok's larger reference sizes (hostnameSpread's XL) don't reach the runner.
 	p.Sizes = map[string]map[perf.Vector]int{
 		"pods":      {perf.VectorPods: 300},
 		"nodepools": {perf.VectorNodePools: 100, perf.VectorPods: 100},

@@ -53,12 +53,12 @@ var TargetedNodePools = perf.Scenario{
 
 		scaleOut := r.StartPhase("scaleOut")
 		r.CreateParallel(objects(deps))
-		scaleOut.AwaitScaleOut(targets, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
 		for _, d := range deps[targets/2:] {
 			r.Scale(0, d)
 		}
-		consolidation.AwaitConsolidation(targets, targets/2, 20*time.Minute)
+		consolidation.AwaitConsolidation(targets, r.Replicas(), 20*time.Minute)
 	},
 }

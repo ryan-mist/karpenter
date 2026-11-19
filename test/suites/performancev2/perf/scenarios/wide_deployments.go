@@ -50,13 +50,11 @@ var WideDeployments = perf.Scenario{
 		n := r.Size(perf.VectorPods)
 		deps := make([]*appsv1.Deployment, len(wideShapes))
 		initial, scaled := make([]int, len(wideShapes)), make([]int, len(wideShapes))
-		total, totalScaled := 0, 0
 		for i, sh := range wideShapes {
 			initial[i], scaled[i] = frac(n, 35, 1000), frac(n, 25, 1000)
 			if i >= 20 {
 				initial[i], scaled[i] = frac(n, 30, 1000), frac(n, 20, 1000)
 			}
-			total, totalScaled = total+initial[i], totalScaled+scaled[i]
 			opts := []test.DeploymentOptionModifier{ownPool(r), zoneSpread()}
 			switch {
 			case i < 3:
@@ -71,12 +69,13 @@ var WideDeployments = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(objects(deps)...)
-		scaleOut.AwaitScaleOut(total, 20*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 20*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		for i, d := range deps {
 			r.Scale(scaled[i], d)
 		}
-		consolidation.AwaitConsolidation(total, totalScaled, 30*time.Minute)
+		consolidation.AwaitConsolidation(from, r.Replicas(), 30*time.Minute)
 	},
 }

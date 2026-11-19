@@ -41,10 +41,11 @@ var HostnameSpread = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(spread, large)
-		scaleOut.AwaitScaleOut(2*half, 25*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 25*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(half*7/10, spread, large)
-		consolidation.AwaitConsolidation(2*half, 2*(half*7/10), 30*time.Minute)
+		consolidation.AwaitConsolidation(from, r.Replicas(), 30*time.Minute)
 	},
 }

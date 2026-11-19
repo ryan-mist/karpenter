@@ -64,12 +64,13 @@ var BalancedHeterogeneous = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(dense, sparse)
-		scaleOut.AwaitScaleOut(n, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(denseN*3/5, dense)
 		r.Scale(sparseN*3/5, sparse)
-		pools := expectBalancedDecisions(consolidation.AwaitConsolidation(n, denseN*3/5+sparseN*3/5, 25*time.Minute))
+		pools := expectBalancedDecisions(consolidation.AwaitConsolidation(from, r.Replicas(), 25*time.Minute))
 		Expect(pools.Difference(sets.New(c.Name, m.Name)).UnsortedList()).To(BeEmpty(), "Balanced scored a move against a NodePool this scenario didn't create")
 	},
 }

@@ -225,6 +225,18 @@ func (r *Run) AwaitHealthyPods(n int, timeout time.Duration) {
 	r.awaitHealthyPods(n, r.timeout(timeout))
 }
 
+// Replicas is the scenario's pod count: the replicas of every deployment the run created, as last set by Create or
+// Scale. It's what the Await methods wait for, so scenarios don't sum pod counts by hand.
+func (r *Run) Replicas() int {
+	n := 0
+	for _, o := range r.created {
+		if d, ok := o.(*appsv1.Deployment); ok {
+			n += int(lo.FromPtr(d.Spec.Replicas))
+		}
+	}
+	return n
+}
+
 // Nodes returns the nodes in the run's NodePools.
 func (r *Run) Nodes() []corev1.Node { return r.nodes() }
 

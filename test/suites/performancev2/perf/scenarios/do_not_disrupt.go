@@ -42,13 +42,12 @@ var DoNotDisrupt = perf.Scenario{
 		spread := r.Deployment("spread", each, "900m", "3100Mi", ownPool(r), test.WithHostnameSpread())
 		large := r.Deployment("large", each, "3500m", "28Gi", ownPool(r))
 		protected := r.Deployment("protected", protectedN, "900m", "450Mi", ownPool(r), test.WithDoNotDisrupt())
-		total := 2*each + protectedN
 
 		r.Create(r.NodeClass, r.NodePool)
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(spread, large, protected)
-		scaleOut.AwaitScaleOut(total, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		protectedNodes := sets.New[string]()
 		for _, p := range r.Pods() {
@@ -57,8 +56,9 @@ var DoNotDisrupt = perf.Scenario{
 			}
 		}
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(each/2, spread, large)
-		if consolidation.AwaitConsolidation(total, 2*(each/2)+protectedN, 25*time.Minute) == nil {
+		if consolidation.AwaitConsolidation(from, r.Replicas(), 25*time.Minute) == nil {
 			return
 		}
 		remaining := sets.New[string]()

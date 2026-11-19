@@ -41,10 +41,11 @@ var BalancedBasic = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(small, large)
-		scaleOut.AwaitScaleOut(2*half, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(half*7/10, small, large)
-		expectBalancedDecisions(consolidation.AwaitConsolidation(2*half, 2*(half*7/10), 20*time.Minute))
+		expectBalancedDecisions(consolidation.AwaitConsolidation(from, r.Replicas(), 20*time.Minute))
 	},
 }

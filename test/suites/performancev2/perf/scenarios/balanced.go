@@ -27,9 +27,14 @@ import (
 	"sigs.k8s.io/karpenter/test/suites/performancev2/perf"
 )
 
-// scoreBucketBelowThreshold is the karpenter_consolidation_score bucket bound just below 1/BalancedK: an approved move's
-// lowest bucket must start at or above it.
-const scoreBucketBelowThreshold = 0.33
+// The report keeps a histogram's bucket edges, not its samples, so the check works in buckets of
+// karpenter_consolidation_score (pkg/controllers/disruption/metrics.go): an approved move's lowest bucket must start
+// at or above scoreBucketBelowThreshold, the edge just below 1/BalancedK, and a rejected move's highest bucket must
+// end at or below 1/BalancedK, which must itself be an edge.
+const (
+	scoreBucketBelowThreshold = 0.33
+	scoreThresholdBucket      = 0.5
+)
 
 // expectBalancedDecisions checks every Balanced consolidation score the phase recorded against the policy's
 // threshold, and returns the NodePools that scored moves. A skipped phase has no Result and isn't checked.
@@ -40,6 +45,7 @@ func expectBalancedDecisions(rep *perf.Result) sets.Set[string] {
 		return pools
 	}
 	threshold := 1.0 / float64(v1.BalancedK)
+	Expect(threshold).To(Equal(scoreThresholdBucket), "1/BalancedK moved off the consolidation_score bucket edges this check assumes; update them")
 	scored := uint64(0)
 	for _, s := range rep.Histograms("karpenter_consolidation_score", map[string]string{"policy": string(v1.ConsolidationPolicyBalanced)}) {
 		switch decision := s.Labels["decision"]; decision {

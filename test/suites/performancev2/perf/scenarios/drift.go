@@ -42,7 +42,7 @@ var Drift = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		initial := r.StartPhase("initial")
 		r.Create(spread, large)
-		initial.AwaitScaleOut(n, 20*time.Minute)
+		initial.AwaitScaleOut(r.Replicas(), 20*time.Minute)
 
 		drift := r.StartPhase("drift")
 		r.Patch(r.NodePool, func() {
@@ -51,6 +51,6 @@ var Drift = perf.Scenario{
 			}
 			r.NodePool.Spec.Template.Annotations["perf.karpenter.sh/drift"] = fmt.Sprint(time.Now().Unix())
 		})
-		drift.AwaitDrift(n, 45*time.Minute)
+		drift.AwaitDrift(r.Replicas(), 45*time.Minute)
 	},
 }

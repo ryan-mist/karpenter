@@ -104,7 +104,7 @@ var Topology = perf.Scenario{
 		...
 		p := r.StartPhase("scaleOut")
 		r.Create(r.NodeClass, r.NodePool, anti, zone, host)
-		p.AwaitScaleOut(n, 20*time.Minute)
+		p.AwaitScaleOut(r.Replicas(), 20*time.Minute)
 	},
 }
 ```
@@ -113,6 +113,21 @@ How it works:
 - `Run` labels and cleans up everything it creates. A spec fails up front if an earlier one left labeled objects behind.
 - `StartPhase` fails on an undeclared phase, and on a phase the provider hasn't set levels for. An empty levels entry means measure only.
 - The phase scrapes the leader's `/metrics` every 2 s through the API server proxy, and fails if the controller restarts mid-phase.
+
+What a scenario can use:
+- **Workload:** `r.Deployment` (names are lowercased, `Provider.Shapes` keys keep the scenario's own case), `r.Create` and `r.CreateParallel` for many objects, `r.Scale`, and `r.Patch` for any other change, such as drifting a NodePool template.
+- **Waiting:** `r.Replicas()` is the pod count every deployment the run created adds up to, so pass it to the Await methods rather than summing by hand. `AwaitScaleOut` and `AwaitConsolidation` end a phase. `AwaitDrift` ends one once every node from its start has been replaced. `r.AwaitHealthyPods` waits inside a phase, for workloads that change several times.
+- **Checking outcomes:** `r.Nodes()`, `r.Pods()`, and on the returned `Result`, `Histograms`, `Histogram`, `Counter` and `Gauge`. An Await method returns nil for a skipped phase, so check that before asserting on the result.
+- **Provider specifics:** read the provider's instance type dimensions from `r.Provider.Catalog`, never the provider's own label keys or zones, so the scenario runs unchanged in other provider plugins. A scenario that can't run without a Catalog dimension says so in `Requires`, and `Validate` (so `cmd/inventory`) fails a provider that enables it anyway.
+- **Placement:** `ownPool` in `perf/scenarios/helpers.go` pins pods to the run's NodePool, so topology constraints don't count a real cluster's own nodes as domains.
+
+Adding a scenario to core:
+1. `perf/scenarios/<scenario>.go`, plus one entry in `scenarios.All`.
+2. `levels_<scenario>.go` with its `kwok` and `kwok-ci` levels, plus one entry in `levels.go`'s `migrated` list. Start with empty entries (measure only).
+3. Run baselines and planted regressions, then `cmd/calibrate -out calibration/kwok` writes `calibration/kwok/<scenario>.json`, and `cmd/calibrate -levels` prints the levels to paste.
+4. A row in the scenario table above.
+
+`make perf-verify` checks it: every scenario is enabled for both core providers, every level validates, and every Stable gate has evidence. perf-periodic picks the scenario up from `cmd/inventory -list kwok-ci`, with no workflow change.
 
 ## Levels (per provider)
 

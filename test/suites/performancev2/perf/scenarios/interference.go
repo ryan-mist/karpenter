@@ -43,16 +43,17 @@ var Interference = perf.Scenario{
 		r.AwaitNodePoolsReady(5 * time.Minute)
 		scaleOut := r.StartPhase("scaleOut")
 		r.Create(small)
-		scaleOut.AwaitScaleOut(n/2, 15*time.Minute)
+		scaleOut.AwaitScaleOut(r.Replicas(), 15*time.Minute)
 
 		interference := r.StartPhase("interference")
 		r.Scale(n/4, small)
 		r.Create(large)
-		interference.AwaitScaleOut(n/4+n/2, 10*time.Minute)
+		interference.AwaitScaleOut(r.Replicas(), 10*time.Minute)
 
 		consolidation := r.StartPhase("consolidation")
+		from := r.Replicas()
 		r.Scale(n*2/5, small)
 		r.Scale(n/5, large)
-		consolidation.AwaitConsolidation(n/4+n/2, n*2/5+n/5, 15*time.Minute)
+		consolidation.AwaitConsolidation(from, r.Replicas(), 15*time.Minute)
 	},
 }
