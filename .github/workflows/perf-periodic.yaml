@@ -11,7 +11,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: ["pods", "nodepools", "topology"]
+        # Scenarios migrated from perfv1 run here rather than in perf-smoke, as perfv1 ran after merge and not per PR.
+        scenario:
+          - pods
+          - nodepools
+          - topology
+          - drift
+          - doNotDisrupt
+          - hostnameSpread
+          - interference
+          - wideDeployments
+          - diverseNodePools
+          - targetedNodePools
+          - balancedBasic
+          - balancedChurn
+          - balancedHeterogeneous
         run: [1, 2, 3]
     uses: ./.github/workflows/e2e.yaml
     with:

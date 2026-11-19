@@ -80,6 +80,16 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `pods` | pods=1000 | `scaleOut`, `consolidation` | provisioning throughput and disruption cost |
 | `nodepools` | nodepools=1000, pods=100 | `scheduling`, `startup` | per-NodePool cost: N-1 NodePools carry a tenant taint the pods don't tolerate |
 | `topology` | pods=1000 | `scaleOut` | hard constraints: hostname anti-affinity, zonal and hostname topology spread |
+| `drift` | pods=600 | `initial`, `drift` | drift replacement under hostname spread: every node is replaced after a NodePool template change (perfv1 Drift) |
+| `doNotDisrupt` | pods=1100 | `scaleOut`, `consolidation` | consolidation around nodes hosting `karpenter.sh/do-not-disrupt` pods, which must survive (perfv1 Do Not Disrupt) |
+| `hostnameSpread` | pods=1000 (kwok: 2000) | `scaleOut`, `consolidation` | hostname topology spread, whose domains grow with every node (perfv1 Host Name Spreading Reg and XL) |
+| `interference` | pods=1000 | `scaleOut`, `interference`, `consolidation` | two self anti-affine deployments scaled in opposite directions at once (perfv1 Self Anti-Affinity Interference) |
+| `wideDeployments` | pods=1000 | `scaleOut`, `consolidation` | 30 deployments with varied shapes and zonal spread, some anti-affine or hostname-spread (perfv1 Wide Deployments) |
+| `diverseNodePools` | nodepools=500, pods=100 | `scaleOut`, `consolidation` | NodePool cardinality: diverse pools that pods can all use, a third tainted (perfv1 Many Diverse NodePools) |
+| `targetedNodePools` | nodepools=500, pods=150 | `scaleOut`, `consolidation` | one pinned single-pod deployment per targeted pool, so many pools provision at once (perfv1 Many NodePools Targeted) |
+| `balancedBasic` | pods=1000 | `scaleOut`, `consolidation` | the `pods` workload under consolidationPolicy Balanced, with every scored move checked against 1/BalancedK |
+| `balancedChurn` | pods=400 | `scaleOut`, `consolidation` | Balanced while the workload is halved, restored and halved again inside one phase |
+| `balancedHeterogeneous` | pods=400 | `scaleOut`, `consolidation` | Balanced across two KWOK instance-family NodePools with different densities (KWOK only) |
 
 ## Writing a scenario
 
