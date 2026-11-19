@@ -39,6 +39,9 @@ var All = []perf.Scenario{
 	WideDeployments,
 	DiverseNodePools,
 	TargetedNodePools,
+	BalancedBasic,
+	BalancedChurn,
+	BalancedHeterogeneous,
 }
 
 var Pods = perf.Scenario{

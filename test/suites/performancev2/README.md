@@ -86,6 +86,9 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `wideDeployments` | pods=1000 | `scaleOut`, `consolidation` | 30 deployments with varied shapes and zonal spread, some anti-affine or hostname-spread (perfv1 Wide Deployments) |
 | `diverseNodePools` | nodepools=500, pods=100 | `scaleOut`, `consolidation` | NodePool cardinality: diverse pools that pods can all use, a third tainted (perfv1 Many Diverse NodePools) |
 | `targetedNodePools` | nodepools=500, pods=150 | `scaleOut`, `consolidation` | one pinned single-pod deployment per targeted pool, so many pools provision at once (perfv1 Many NodePools Targeted) |
+| `balancedBasic` | pods=1000 | `scaleOut`, `consolidation` | the `pods` workload under consolidationPolicy Balanced, with every scored move checked against 1/BalancedK |
+| `balancedChurn` | pods=400 | `scaleOut`, `consolidation` | Balanced while the workload is halved, restored and halved again inside one phase |
+| `balancedHeterogeneous` | pods=400 | `scaleOut`, `consolidation` | Balanced across two KWOK instance-family NodePools with different densities (KWOK only) |
 
 ## Writing a scenario
 
