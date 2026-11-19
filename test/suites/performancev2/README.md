@@ -124,6 +124,8 @@ Levels: perf.Levels{
 },
 ```
 
+The core providers keep the levels of scenarios migrated from perfv1 in `levels_<scenario>.go`, one file per scenario with both providers' levels, so each scenario is reviewed and calibrated on its own. `levels.go` adds them to both providers.
+
 A provider that starts from another provider's levels declares only the differences:
 
 ```go
