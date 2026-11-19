@@ -53,7 +53,10 @@ type Scenario struct {
 	Vectors map[Vector]int
 	Sweep   map[Vector][]int
 	Phases  []PhaseSpec
-	Run     func(*Run)
+	// Requires reports why a provider can't run the scenario, for example a Catalog dimension it needs. Validate
+	// fails a provider that enables a scenario it can't run, so the gap shows in cmd/inventory rather than as a skip.
+	Requires func(*Provider) error
+	Run      func(*Run)
 }
 
 type PhaseSpec struct {
@@ -108,7 +111,7 @@ func (r *Run) Deployment(name string, replicas int, cpu, memory string, opts ...
 		cpu, memory = lo.CoalesceOrEmpty(sh.CPU, cpu), lo.CoalesceOrEmpty(sh.Memory, memory)
 	}
 	opts = append(opts, test.WithLabels(map[string]string{ScenarioLabel: r.Scenario.Name}))
-	return test.Deployment(test.CreateDeploymentOptions(fmt.Sprintf("%s-%s", r.Scenario.Name, name), int32(replicas), cpu, memory, opts...)) //nolint:gosec // scenario sizes are far below MaxInt32
+	return test.Deployment(test.CreateDeploymentOptions(strings.ToLower(fmt.Sprintf("%s-%s", r.Scenario.Name, name)), int32(replicas), cpu, memory, opts...)) //nolint:gosec // scenario sizes are far below MaxInt32
 }
 
 func (r *Run) label(o client.Object) {
@@ -206,6 +209,39 @@ func (r *Run) Scale(replicas int, deps ...*appsv1.Deployment) {
 		Expect(r.Provider.Client.Patch(r.ctx, d, client.MergeFrom(base))).To(Succeed())
 	}
 }
+
+// Patch applies mutate to o and merge-patches the change, for example to drift a NodePool by changing its template.
+func (r *Run) Patch(o client.Object, mutate func()) {
+	GinkgoHelper()
+	base := o.DeepCopyObject().(client.Object)
+	mutate()
+	Expect(r.Provider.Client.Patch(r.ctx, o, client.MergeFrom(base))).To(Succeed())
+}
+
+// AwaitHealthyPods waits for the scenario to have exactly n healthy pods without ending a phase, for scenarios that
+// change the workload several times inside one phase.
+func (r *Run) AwaitHealthyPods(n int, timeout time.Duration) {
+	GinkgoHelper()
+	r.awaitHealthyPods(n, r.timeout(timeout))
+}
+
+// Replicas is the scenario's pod count: the replicas of every deployment the run created, as last set by Create or
+// Scale. It's what the Await methods wait for, so scenarios don't sum pod counts by hand.
+func (r *Run) Replicas() int {
+	n := 0
+	for _, o := range r.created {
+		if d, ok := o.(*appsv1.Deployment); ok {
+			n += int(lo.FromPtr(d.Spec.Replicas))
+		}
+	}
+	return n
+}
+
+// Nodes returns the nodes in the run's NodePools.
+func (r *Run) Nodes() []corev1.Node { return r.nodes() }
+
+// Pods returns the scenario's pods.
+func (r *Run) Pods() []corev1.Pod { return r.scenarioPods() }
 
 func (r *Run) cleanup(ctx context.Context) {
 	c := r.Provider.Client
