@@ -40,3 +40,11 @@ func TestIsKWOK(t *testing.T) {
 		}
 	}
 }
+
+func TestFrac(t *testing.T) {
+	for _, tc := range []struct{ n, num, den, want int }{{1000, 35, 1000, 35}, {100, 35, 1000, 3}, {10, 1, 11, 1}, {0, 1, 2, 1}} {
+		if got := frac(tc.n, tc.num, tc.den); got != tc.want {
+			t.Errorf("frac(%d, %d, %d) = %d, want %d", tc.n, tc.num, tc.den, got, tc.want)
+		}
+	}
+}
