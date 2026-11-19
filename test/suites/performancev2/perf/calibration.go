@@ -100,9 +100,7 @@ func MustLoadCalibrations(fsys fs.FS, dir string) *Calibration {
 		}
 		c := MustLoadCalibration(b)
 		out.Provider = c.Provider
-		for id, ev := range c.Phases {
-			out.Phases[id] = ev
-		}
+		maps.Copy(out.Phases, c.Phases)
 		maps.Copy(out.Kinds, c.Kinds)
 		out.provenance[strings.TrimSuffix(path.Base(p), ".json")] = c.provenanceLine()
 	}
