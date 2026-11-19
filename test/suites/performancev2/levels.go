@@ -35,6 +35,7 @@ var migrated = []scenarioLevels{
 	doNotDisruptLevels,
 	hostnameSpreadLevels,
 	interferenceLevels,
+	wideDeploymentsLevels,
 }
 
 // withMigrated adds every migrated scenario's levels, picked by pick, to base.

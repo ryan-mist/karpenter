@@ -36,6 +36,7 @@ var All = []perf.Scenario{
 	DoNotDisrupt,
 	HostnameSpread,
 	Interference,
+	WideDeployments,
 }
 
 var Pods = perf.Scenario{
