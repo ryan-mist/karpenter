@@ -34,6 +34,7 @@ var All = []perf.Scenario{
 	Topology,
 	Drift,
 	DoNotDisrupt,
+	HostnameSpread,
 }
 
 var Pods = perf.Scenario{

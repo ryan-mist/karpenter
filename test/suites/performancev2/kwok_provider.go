@@ -56,6 +56,8 @@ func KWOK(c env.Clients) *perf.Provider {
 			MetricsPort: "8080",
 		},
 		NodeClass: func(*perf.Scenario) client.Object { return env.KWOKNodeClass() },
+		// hostnameSpread runs at perfv1's XL size on the reference cluster; kwok-ci runs its default (perfv1's Reg).
+		Sizes: map[string]map[perf.Vector]int{"hostnameSpread": {perf.VectorPods: 2000}},
 		NodePool: func(_ *perf.Scenario, nc client.Object) *v1.NodePool {
 			np := env.NodePool(nc)
 			test.ReplaceRequirements(np, v1.NodeSelectorRequirementWithMinValues{
