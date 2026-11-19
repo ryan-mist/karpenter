@@ -80,6 +80,7 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `nodepools` | nodepools=1000, pods=100 | `scheduling`, `startup` | per-NodePool cost: N-1 NodePools carry a tenant taint the pods don't tolerate |
 | `topology` | pods=1000 | `scaleOut` | hard constraints: hostname anti-affinity, zonal and hostname topology spread |
 | `drift` | pods=600 | `initial`, `drift` | drift replacement under hostname spread: every node is replaced after a NodePool template change (perfv1 Drift) |
+| `doNotDisrupt` | pods=1100 | `scaleOut`, `consolidation` | consolidation around nodes hosting `karpenter.sh/do-not-disrupt` pods, which must survive (perfv1 Do Not Disrupt) |
 
 ## Writing a scenario
 

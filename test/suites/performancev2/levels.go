@@ -32,6 +32,7 @@ type scenarioLevels struct{ KWOK, KWOKCI perf.Levels }
 
 var migrated = []scenarioLevels{
 	driftLevels,
+	doNotDisruptLevels,
 }
 
 // withMigrated adds every migrated scenario's levels, picked by pick, to base.
