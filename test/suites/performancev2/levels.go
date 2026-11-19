@@ -36,6 +36,8 @@ var migrated = []scenarioLevels{
 	hostnameSpreadLevels,
 	interferenceLevels,
 	wideDeploymentsLevels,
+	diverseNodePoolsLevels,
+	targetedNodePoolsLevels,
 }
 
 // withMigrated adds every migrated scenario's levels, picked by pick, to base.

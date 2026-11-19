@@ -84,6 +84,8 @@ All three model a run as normal around the baseline median with the baseline CV,
 | `hostnameSpread` | pods=1000 (kwok: 2000) | `scaleOut`, `consolidation` | hostname topology spread, whose domains grow with every node (perfv1 Host Name Spreading Reg and XL) |
 | `interference` | pods=1000 | `scaleOut`, `interference`, `consolidation` | two self anti-affine deployments scaled in opposite directions at once (perfv1 Self Anti-Affinity Interference) |
 | `wideDeployments` | pods=1000 | `scaleOut`, `consolidation` | 30 deployments with varied shapes and zonal spread, some anti-affine or hostname-spread (perfv1 Wide Deployments) |
+| `diverseNodePools` | nodepools=500, pods=100 | `scaleOut`, `consolidation` | NodePool cardinality: diverse pools that pods can all use, a third tainted (perfv1 Many Diverse NodePools) |
+| `targetedNodePools` | nodepools=500, pods=150 | `scaleOut`, `consolidation` | one pinned single-pod deployment per targeted pool, so many pools provision at once (perfv1 Many NodePools Targeted) |
 
 ## Writing a scenario
 

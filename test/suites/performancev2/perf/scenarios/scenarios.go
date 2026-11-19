@@ -37,6 +37,8 @@ var All = []perf.Scenario{
 	HostnameSpread,
 	Interference,
 	WideDeployments,
+	DiverseNodePools,
+	TargetedNodePools,
 }
 
 var Pods = perf.Scenario{
