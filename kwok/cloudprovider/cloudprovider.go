@@ -209,8 +209,8 @@ func (c CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *v1.NodePo
 }
 
 // Return nothing since there's no cloud provider drift.
-func (c CloudProvider) IsDrifted(ctx context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftReason, error) {
-	return "", nil
+func (c CloudProvider) GetDriftStatus(ctx context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftStatus, error) {
+	return cloudprovider.NotDrifted, nil
 }
 
 // Reboot simulates an in-place restart. KWOK has no instance to restart, so it gives the Node a new boot ID,

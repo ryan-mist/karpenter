@@ -66,8 +66,10 @@ type CloudProvider struct {
 	RebootOperationIDs []string
 	GetCalls           []string
 
-	CreatedNodeClaims         map[string]*v1.NodeClaim
-	Drifted                   cloudprovider.DriftReason
+	CreatedNodeClaims map[string]*v1.NodeClaim
+	Drifted           cloudprovider.DriftReason
+	// DriftAction is returned with Drifted; empty means ReplaceNode.
+	DriftAction               cloudprovider.DisruptionAction
 	NodeClassGroupVersionKind []schema.GroupVersionKind
 	RepairPolicy              []cloudprovider.RepairPolicy
 }
@@ -100,6 +102,7 @@ func (c *CloudProvider) Reset() {
 	c.RebootOperationIDs = nil
 	c.GetCalls = nil
 	c.Drifted = ""
+	c.DriftAction = ""
 	c.NodeClassGroupVersionKind = []schema.GroupVersionKind{
 		{
 			Group:   "",
@@ -313,11 +316,14 @@ func (c *CloudProvider) Delete(_ context.Context, nc *v1.NodeClaim) error {
 	return cloudprovider.NewNodeClaimNotFoundError(serrors.Wrap(fmt.Errorf("no nodeclaim exists with provider id"), "provider-id", nc.Status.ProviderID))
 }
 
-func (c *CloudProvider) IsDrifted(context.Context, *v1.NodeClaim) (cloudprovider.DriftReason, error) {
+func (c *CloudProvider) GetDriftStatus(context.Context, *v1.NodeClaim) (cloudprovider.DriftStatus, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.Drifted, nil
+	if c.Drifted == "" {
+		return cloudprovider.NotDrifted, nil
+	}
+	return cloudprovider.DriftStatus{Action: lo.Ternary(c.DriftAction == "", cloudprovider.ReplaceNode, c.DriftAction), Reason: c.Drifted}, nil
 }
 
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
