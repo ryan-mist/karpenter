@@ -1,0 +1,170 @@
+{
+  "provider": "kwok",
+  "source": "EKS us-east-2, tier-xl provisioned control plane, controller 8 CPU / 24Gi",
+  "baseline_commit": "1763b53e",
+  "generated": "2026-11-07T07:37:44Z",
+  "phases": {
+    "nodepools/scheduling": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 0.708,
+        "min": 0.66,
+        "max": 0.749,
+        "cv": 0.045,
+        "suggested_bound": 0.899,
+        "variants": {
+          "mconc1": 0.701
+        }
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.911,
+        "min": 0.911,
+        "max": 0.911,
+        "cv": 0,
+        "suggested_bound": 0.792,
+        "variants": {
+          "mconc1": 0.911
+        }
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 64.52,
+        "min": 58.942,
+        "max": 102.292,
+        "cv": 0.232,
+        "suggested_bound": 123,
+        "variants": {
+          "mconc1": 63.221
+        }
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.896,
+        "min": 0.896,
+        "max": 0.896,
+        "cv": 0,
+        "suggested_bound": 0.779,
+        "variants": {
+          "mconc1": 0.896
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 6,
+        "min": 6,
+        "max": 6,
+        "cv": 0,
+        "suggested_bound": 8,
+        "variants": {
+          "mconc1": 6
+        }
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 4,
+        "min": 3,
+        "max": 4,
+        "cv": 0.105,
+        "suggested_bound": 5,
+        "variants": {
+          "mconc1": 14
+        }
+      },
+      "pod_ready_seconds_p50": {
+        "n": 5,
+        "median": 3,
+        "min": 3,
+        "max": 4,
+        "cv": 0.144,
+        "suggested_bound": 6,
+        "variants": {
+          "mconc1": 11
+        }
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 4,
+        "min": 3,
+        "max": 4,
+        "cv": 0.105,
+        "suggested_bound": 6,
+        "variants": {
+          "mconc1": 14
+        }
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 4,
+        "min": 3,
+        "max": 4,
+        "cv": 0.105,
+        "suggested_bound": 6,
+        "variants": {
+          "mconc1": 14
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 4,
+        "min": 3,
+        "max": 4,
+        "cv": 0.105,
+        "suggested_bound": 4.979,
+        "variants": {
+          "mconc1": 14
+        }
+      }
+    },
+    "nodepools/startup": {
+      "heap_mb": {
+        "n": 5,
+        "median": 51.847,
+        "min": 49.12,
+        "max": 62.129,
+        "cv": 0.098,
+        "suggested_bound": 74.6,
+        "variants": {
+          "mconc1": 48.589
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 6,
+        "min": 6,
+        "max": 6,
+        "cv": 0,
+        "suggested_bound": 8,
+        "variants": {
+          "mconc1": 6
+        }
+      },
+      "startup_seconds": {
+        "n": 5,
+        "median": 2.595,
+        "min": 2.565,
+        "max": 4.095,
+        "cv": 0.225,
+        "suggested_bound": 4.914,
+        "variants": {
+          "mconc1": 3.524
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 2.595,
+        "min": 2.565,
+        "max": 4.095,
+        "cv": 0.225,
+        "suggested_bound": 4.914,
+        "variants": {
+          "mconc1": 3.524
+        }
+      }
+    }
+  },
+  "kinds": {
+    "nodepools/scheduling": "scale-out",
+    "nodepools/startup": "startup"
+  }
+}

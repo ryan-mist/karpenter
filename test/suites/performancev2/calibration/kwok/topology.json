@@ -1,0 +1,93 @@
+{
+  "provider": "kwok",
+  "source": "EKS us-east-2, tier-xl provisioned control plane, controller 8 CPU / 24Gi",
+  "baseline_commit": "1763b53e",
+  "generated": "2026-11-07T07:37:44Z",
+  "phases": {
+    "topology/scaleOut": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 1.018,
+        "min": 0.945,
+        "max": 1.054,
+        "cv": 0.04,
+        "suggested_bound": 1.265
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.539,
+        "min": 0.509,
+        "max": 0.557,
+        "cv": 0.036,
+        "suggested_bound": 0.443
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 234.935,
+        "min": 216.863,
+        "max": 263.292,
+        "cv": 0.079,
+        "suggested_bound": 316
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.558,
+        "min": 0.541,
+        "max": 0.579,
+        "cv": 0.026,
+        "suggested_bound": 0.47
+      },
+      "nodes": {
+        "n": 5,
+        "median": 650,
+        "min": 617,
+        "max": 728,
+        "cv": 0.066,
+        "suggested_bound": 874
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 31,
+        "min": 30,
+        "max": 34,
+        "cv": 0.051,
+        "suggested_bound": 41
+      },
+      "pod_ready_seconds_p50": {
+        "n": 5,
+        "median": 16,
+        "min": 15,
+        "max": 20,
+        "cv": 0.113,
+        "suggested_bound": 30
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 28,
+        "min": 26,
+        "max": 29,
+        "cv": 0.042,
+        "suggested_bound": 44
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 29,
+        "min": 27,
+        "max": 30,
+        "cv": 0.036,
+        "suggested_bound": 45
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 34,
+        "min": 33,
+        "max": 35,
+        "cv": 0.019,
+        "suggested_bound": 42
+      }
+    }
+  },
+  "kinds": {
+    "topology/scaleOut": "scale-out"
+  }
+}

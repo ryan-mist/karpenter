@@ -1,0 +1,236 @@
+{
+  "provider": "kwok",
+  "source": "EKS us-east-2, tier-xl provisioned control plane, controller 8 CPU / 24Gi",
+  "baseline_commit": "1763b53e",
+  "generated": "2026-11-07T07:37:44Z",
+  "phases": {
+    "pods/consolidation": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 0.227,
+        "min": 0.195,
+        "max": 0.261,
+        "cv": 0.099,
+        "suggested_bound": 0.313,
+        "variants": {
+          "mconc1": 0.194
+        }
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.947,
+        "min": 0.942,
+        "max": 0.947,
+        "cv": 0.003,
+        "suggested_bound": 0.819,
+        "variants": {
+          "mconc1": 0.936
+        }
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 94.451,
+        "min": 91.473,
+        "max": 96.53,
+        "cv": 0.017,
+        "suggested_bound": 116,
+        "variants": {
+          "mconc1": 85.075
+        }
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.834,
+        "min": 0.83,
+        "max": 0.838,
+        "cv": 0.004,
+        "suggested_bound": 0.722,
+        "variants": {
+          "mconc1": 0.892
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 130,
+        "min": 127,
+        "max": 141,
+        "cv": 0.04,
+        "suggested_bound": 170,
+        "variants": {
+          "mconc1": 125
+        }
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 3,
+        "min": 3,
+        "max": 3,
+        "cv": 0,
+        "suggested_bound": 4,
+        "variants": {
+          "mconc1": 3
+        }
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 2,
+        "min": 2,
+        "max": 2,
+        "cv": 0,
+        "suggested_bound": 3,
+        "variants": {
+          "mconc1": 2
+        }
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 2,
+        "min": 2,
+        "max": 3,
+        "cv": 0.204,
+        "suggested_bound": 5,
+        "variants": {
+          "mconc1": 2
+        }
+      },
+      "pods_disrupted": {
+        "n": 5,
+        "median": 348,
+        "min": 294,
+        "max": 437,
+        "cv": 0.137,
+        "suggested_bound": 525,
+        "variants": {
+          "mconc1": 469
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 1096.66,
+        "min": 904.156,
+        "max": 1202.871,
+        "cv": 0.107,
+        "suggested_bound": 1443,
+        "variants": {
+          "mconc1": 1204.092
+        }
+      }
+    },
+    "pods/scaleOut": {
+      "cpu_cores": {
+        "n": 5,
+        "median": 0.61,
+        "min": 0.588,
+        "max": 0.654,
+        "cv": 0.037,
+        "suggested_bound": 0.785,
+        "variants": {
+          "mconc1": 0.174
+        }
+      },
+      "cpu_util": {
+        "n": 5,
+        "median": 0.871,
+        "min": 0.852,
+        "max": 0.884,
+        "cv": 0.014,
+        "suggested_bound": 0.741,
+        "variants": {
+          "mconc1": 0.846
+        }
+      },
+      "heap_mb": {
+        "n": 5,
+        "median": 81.271,
+        "min": 78.101,
+        "max": 85.127,
+        "cv": 0.034,
+        "suggested_bound": 102,
+        "variants": {
+          "mconc1": 76.032
+        }
+      },
+      "memory_util": {
+        "n": 5,
+        "median": 0.813,
+        "min": 0.792,
+        "max": 0.824,
+        "cv": 0.016,
+        "suggested_bound": 0.689,
+        "variants": {
+          "mconc1": 0.811
+        }
+      },
+      "nodes": {
+        "n": 5,
+        "median": 162,
+        "min": 158,
+        "max": 166,
+        "cv": 0.018,
+        "suggested_bound": 200,
+        "variants": {
+          "mconc1": 165
+        }
+      },
+      "pod_ready_seconds_max": {
+        "n": 5,
+        "median": 16,
+        "min": 14,
+        "max": 17,
+        "cv": 0.068,
+        "suggested_bound": 21,
+        "variants": {
+          "mconc1": 342
+        }
+      },
+      "pod_ready_seconds_p50": {
+        "n": 5,
+        "median": 9,
+        "min": 9,
+        "max": 9,
+        "cv": 0,
+        "suggested_bound": 14,
+        "variants": {
+          "mconc1": 208
+        }
+      },
+      "pod_ready_seconds_p95": {
+        "n": 5,
+        "median": 14,
+        "min": 14,
+        "max": 15,
+        "cv": 0.028,
+        "suggested_bound": 23,
+        "variants": {
+          "mconc1": 316
+        }
+      },
+      "pod_ready_seconds_p99": {
+        "n": 5,
+        "median": 14,
+        "min": 14,
+        "max": 15,
+        "cv": 0.034,
+        "suggested_bound": 23,
+        "variants": {
+          "mconc1": 340
+        }
+      },
+      "total_time_seconds": {
+        "n": 5,
+        "median": 17,
+        "min": 15,
+        "max": 17,
+        "cv": 0.048,
+        "suggested_bound": 20.4,
+        "variants": {
+          "mconc1": 344
+        }
+      }
+    }
+  },
+  "kinds": {
+    "pods/consolidation": "consolidation",
+    "pods/scaleOut": "scale-out"
+  }
+}

@@ -45,6 +45,9 @@ type Metric struct {
 	Measures string
 	OnBreach string
 	Value    func(*Result) float64
+	// ExperimentalOnly keeps SuggestLevels from making the metric Stable, for metrics too noisy across
+	// environments to block a change on.
+	ExperimentalOnly bool
 }
 
 var (
@@ -55,7 +58,9 @@ var (
 	HeapMB = Metric{Name: "heap_mb", Kind: KindResource, Unit: "MB", Upper: true,
 		Measures: "P95 of the leader's go_gc_heap_live_bytes, sampled every 2s. Nearest rank, so a phase with fewer than 20 samples (40 s) reports its max.",
 		OnBreach: "Karpenter retains more per pod, node or NodePool (caches, cluster state, per-NodePool offerings). Diff the report's counters and latency_stats against the last green run.",
-		Value:    func(r *Result) float64 { return r.Resources.P95HeapMB }}
+		Value:    func(r *Result) float64 { return r.Resources.P95HeapMB },
+		// Heap P95 is GC-noisy under load and moved 24-33% between EKS environments with the same core.
+		ExperimentalOnly: true}
 	CPUCores = Metric{Name: "cpu_cores", Kind: KindResource, Unit: "cores", Upper: true,
 		Measures: "Average CPU of the leader over the phase (process_cpu_seconds_total delta over wall time).",
 		OnBreach: "More work per event: scheduler Solve, disruption simulation, or extra reconciles (controller_runtime_reconcile_total in the report's counters shows which controller).",
@@ -110,7 +115,11 @@ func podReadyMetrics() QuantileMetrics {
 		P50: q("p50", "Median", typical, func(x Quantiles) float64 { return x.P50 }),
 		P95: q("p95", "P95", typical, func(x Quantiles) float64 { return x.P95 }),
 		P99: q("p99", "P99", tail, func(x Quantiles) float64 { return x.P99 }),
-		Max: q("max", "Max (p100)", tail, func(x Quantiles) float64 { return x.Max }),
+		Max: func() Metric {
+			m := q("max", "Max (p100)", tail, func(x Quantiles) float64 { return x.Max })
+			m.ExperimentalOnly = true // the single slowest pod: gate p95 and p99, warn on max
+			return m
+		}(),
 	}
 }
 

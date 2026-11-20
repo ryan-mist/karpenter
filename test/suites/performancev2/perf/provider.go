@@ -58,9 +58,27 @@ type Provider struct {
 	// Sinks get every phase's Result after it's written, for example to push it to a metrics backend.
 	Sinks []func(context.Context, *Result) error
 	// ReproEnv names the provider's own environment variables, such as CLUSTER_NAME, to include in repro lines.
-	ReproEnv    []string
+	ReproEnv []string
+	// Catalog names the instance type dimensions NodePools can be restricted on, for scenarios that build diverse
+	// or family-restricted NodePools. Scenarios skip a dimension left empty, and a scenario that can't run without
+	// one says so in Scenario.Requires.
+	Catalog     Catalog
 	Levels      Levels
 	Calibration *Calibration
+}
+
+// Catalog describes a provider's instance types well enough to build NodePools that differ from each other.
+type Catalog struct {
+	// Zones are zone sets to rotate NodePools across.
+	Zones [][]string
+	// Arches are architectures to rotate NodePools across.
+	Arches []string
+	// SizeKey is a numeric instance size label, and SizeCeilings are values to rotate a "less than" requirement on.
+	SizeKey      string
+	SizeCeilings []string
+	// FamilyKey is an instance family label, and Families are values of it with different instance shapes.
+	FamilyKey string
+	Families  []string
 }
 
 // Shape is a deployment's per-pod requests.
