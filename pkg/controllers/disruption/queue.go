@@ -377,6 +377,16 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 	return markedCandidates, multierr.Combine(errs...)
 }
 
+// unmarkPendingDisruption moves static candidates that markDisrupted marked PendingDisruption back to Active. It's for a
+// command that fails to start: the command never enters the queue, so CompleteCommand never unmarks them.
+func (q *Queue) unmarkPendingDisruption(candidates []*Candidate) {
+	for _, c := range candidates {
+		if c.OwnedByStaticNodePool() {
+			q.cluster.NodePoolState.MarkNodeClaimActive(c.NodePool.Name, c.NodeClaim.Name)
+		}
+	}
+}
+
 // createReplacementNodeClaims creates replacement NodeClaims
 func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
 	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
@@ -440,6 +450,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
+		q.unmarkPendingDisruption(markedCandidates)
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
 	}
 
@@ -456,6 +467,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		if cmd.Reason() == v1.DisruptionReasonDrifted {
 			q.observeDriftOutcome(ctx, cmd, false)
 		}
+		q.unmarkPendingDisruption(cmd.Candidates)
 		return serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID)
 	}
 	// IMPORTANT

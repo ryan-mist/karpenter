@@ -281,6 +281,48 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			// Verify StateNodePool Has been updated
 			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 3, 0)
 		})
+		It("should not delete a drift replacement when the candidate's NodeClaim is updated", func() {
+			nodePool := test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(1))
+			nodeClaims, nodes := test.NodeClaimsAndNodes(1, v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						v1.NodeInitializedLabelKey:     "true",
+						corev1.LabelInstanceTypeStable: "stable.instance",
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10"),
+						corev1.ResourceMemory: resource.MustParse("1000Mi"),
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0])
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+
+			// The disruption queue marks the candidate PendingDisruption, sets its DisruptionReason condition, then creates
+			// an unlaunched replacement
+			cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaims[0].Name)
+			nodeClaims[0].StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[0]))
+			replacement := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+			ExpectApplied(ctx, env.Client, replacement)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(replacement))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 1)
+
+			// The candidate is PendingDisruption, so only the replacement is running and nothing is over the replica count
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			remainingNodeClaims := &v1.NodeClaimList{}
+			Expect(env.Client.List(ctx, remainingNodeClaims)).To(Succeed())
+			Expect(remainingNodeClaims.Items).To(HaveLen(2))
+			for _, nc := range remainingNodeClaims.Items {
+				Expect(nc.DeletionTimestamp.IsZero()).To(BeTrue())
+			}
+		})
 		It("should terminate excess nodeclaims when current count exceeds desired replicas", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(2))
