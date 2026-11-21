@@ -56,9 +56,9 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodeSubsystem,
 			Name:      "reboots_total",
-			Help:      "Number of node reboots carried out by Karpenter, labeled by terminal result (succeeded, provider_error, recovery_timeout).",
+			Help:      "Number of node reboots carried out by Karpenter, labeled by terminal result (succeeded, provider_error, recovery_timeout) and the disruption reason that committed the reboot.",
 		},
-		[]opmetrics.Label{Result},
+		[]opmetrics.Label{Result, metrics.DisruptionReason},
 		opmetrics.Beta,
 	)
 	// Measures the full reboot lifecycle from request to terminal outcome.
@@ -68,10 +68,10 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodeSubsystem,
 			Name:      "reboot_duration_seconds",
-			Help:      "Duration of the full reboot action from request to terminal outcome, labeled by result.",
+			Help:      "Duration of the full reboot action from request to terminal outcome, labeled by result and the disruption reason that committed the reboot.",
 			Buckets:   rebootDurationBuckets,
 		},
-		[]opmetrics.Label{Result},
+		[]opmetrics.Label{Result, metrics.DisruptionReason},
 		opmetrics.Beta,
 	)
 	// Measures issuance-to-recovery time for successful reboots.
@@ -81,8 +81,20 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodeSubsystem,
 			Name:      "reboot_recovery_duration_seconds",
-			Help:      "Time from issuing a reboot until the node proved a new boot and rejoined (bootID changed + Ready). Recorded on successful reboots only.",
+			Help:      "Time from issuing a reboot until the node proved a new boot and rejoined (bootID changed + Ready), labeled by the disruption reason that committed the reboot. Recorded on successful reboots only.",
 			Buckets:   rebootDurationBuckets,
+		},
+		[]opmetrics.Label{metrics.DisruptionReason},
+		opmetrics.Beta,
+	)
+	// Counts reboots that succeeded but whose node still hadn't initialized one observation window later.
+	RebootUninitializedTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodeSubsystem,
+			Name:      "reboot_uninitialized_total",
+			Help:      "Number of successful reboots whose node had not initialized one observation window after the reboot succeeded. Such a node keeps counting against disruption budgets.",
 		},
 		[]opmetrics.Label{},
 		opmetrics.Beta,

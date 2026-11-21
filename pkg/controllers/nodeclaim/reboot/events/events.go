@@ -19,6 +19,7 @@ limitations under the License.
 package events
 
 import (
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -56,4 +57,9 @@ func RebootObserved(nodeClaim *v1.NodeClaim) events.Event {
 
 func RebootFailed(nodeClaim *v1.NodeClaim, message string) events.Event {
 	return event(nodeClaim, corev1.EventTypeWarning, events.RebootFailed, message)
+}
+
+func RebootUninitialized(nodeClaim *v1.NodeClaim, window time.Duration) events.Event {
+	return event(nodeClaim, corev1.EventTypeWarning, events.RebootUninitialized,
+		fmt.Sprintf("Node rebooted but has not initialized within %s; it keeps counting against disruption budgets until it initializes or is removed", window))
 }
