@@ -202,7 +202,13 @@ func validateRepairPolicy(index int, policy cloudprovider.RepairPolicy, supporte
 			maxRepairPolicyPriority,
 		))
 	}
-	if !supportedActions.Has(policy.Action) {
+	// An unsupported action must never reach the matcher, since ranking it panics. NoOp is rejected rather than
+	// ignored: dropping the policy would hand its nodes to the ReplaceNode fallback, which is more disruptive than
+	// the provider asked for.
+	switch {
+	case policy.Action == cloudprovider.NoOp:
+		appendError(fmt.Errorf("%s has action %q, which is only valid in a DriftStatus", policyValue, policy.Action))
+	case !supportedActions.Has(policy.Action):
 		appendError(fmt.Errorf("%s has unsupported action %q", policyValue, policy.Action))
 	}
 	return errs
