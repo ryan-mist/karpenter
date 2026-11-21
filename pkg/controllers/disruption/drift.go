@@ -19,18 +19,23 @@ package disruption
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	nodeclaimdisruption "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -39,24 +44,28 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolbackoff"
 )
 
-// Drift is a subreconciler that deletes drifted candidates.
+// Drift is a subreconciler that replaces drifted candidates, or reboots them in place when the cloud provider resolves
+// their drift that way.
 type Drift struct {
-	kubeClient  client.Client
-	cluster     *state.Cluster
-	provisioner *provisioning.Provisioner
-	recorder    events.Recorder
-	clock       clock.Clock
-	backoff     *nodepoolbackoff.State
+	kubeClient    client.Client
+	cluster       *state.Cluster
+	provisioner   *provisioning.Provisioner
+	cloudProvider cloudprovider.CloudProvider
+	recorder      events.Recorder
+	clock         clock.Clock
+	backoff       *nodepoolbackoff.State
 }
 
-func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock, backoff *nodepoolbackoff.State) *Drift {
+func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudProvider cloudprovider.CloudProvider,
+	recorder events.Recorder, clk clock.Clock, backoff *nodepoolbackoff.State) *Drift {
 	return &Drift{
-		kubeClient:  kubeClient,
-		cluster:     cluster,
-		provisioner: provisioner,
-		recorder:    recorder,
-		clock:       clk,
-		backoff:     backoff,
+		kubeClient:    kubeClient,
+		cluster:       cluster,
+		provisioner:   provisioner,
+		cloudProvider: cloudProvider,
+		recorder:      recorder,
+		clock:         clk,
+		backoff:       backoff,
 	}
 }
 
@@ -90,6 +99,21 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		}
 		if isDriftBackedOff(ctx, d.backoff, d.recorder, candidate.NodePool) {
 			continue
+		}
+		driftStatus, ok := resolveDriftStatus(ctx, d.cloudProvider, candidate)
+		if !ok {
+			continue
+		}
+		// An in-place reboot keeps the node, so it needs no rescheduling simulation or replacement.
+		if driftStatus.Action == cloudprovider.RebootNode {
+			committed, err := commitDriftReboot(ctx, d.kubeClient, d.cluster, d.clock, candidate, driftStatus)
+			if err != nil {
+				return []Command{}, err
+			}
+			if !committed {
+				continue
+			}
+			return []Command{rebootCommand(candidate)}, nil
 		}
 		// Simulate rescheduling the candidate's pods. When they can't be replaced-first and the candidate holds a full
 		// reservation, this reports terminate-first (RFC #3203): delete the candidate and let reactive provisioning
@@ -128,6 +152,56 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 
 	}
 	return []Command{}, nil
+}
+
+// coreDriftReasons are the drift reasons core detects before asking the cloud provider. A provider's in-place action
+// can't resolve them, so candidates drifted for one of these reasons are always replaced.
+var coreDriftReasons = sets.New(
+	string(nodeclaimdisruption.NodePoolDrifted),
+	string(nodeclaimdisruption.RequirementsDrifted),
+	string(nodeclaimdisruption.InstanceTypeNotFound),
+)
+
+// resolveDriftStatus returns how to resolve the candidate's drift, and false when the candidate should be skipped this
+// pass. The Drifted condition can lag, so for provider-detected drift the provider is asked again at commit time:
+// an error (for example an in-place operation that is still unresolved) or a NoOp skips the candidate, and the drift
+// subcontroller clears a stale condition. Drift that core detected itself is replaced without asking the provider.
+func resolveDriftStatus(ctx context.Context, cloudProvider cloudprovider.CloudProvider, candidate *Candidate) (cloudprovider.DriftStatus, bool) {
+	reason := candidate.NodeClaim.StatusConditions().Get(v1.ConditionTypeDrifted).Reason
+	if coreDriftReasons.Has(reason) {
+		return cloudprovider.DriftStatus{Action: cloudprovider.ReplaceNode, Reason: cloudprovider.DriftReason(reason)}, true
+	}
+	driftStatus, err := cloudProvider.GetDriftStatus(ctx, candidate.NodeClaim)
+	if err != nil {
+		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate.NodeClaim)).V(1).Info(fmt.Sprintf("skipping drift candidate, failed getting drift status, %s", err))
+		return cloudprovider.DriftStatus{}, false
+	}
+	switch driftStatus.Action {
+	case cloudprovider.ReplaceNode, cloudprovider.RebootNode:
+		return driftStatus, true
+	case cloudprovider.NoOp, "":
+		return cloudprovider.DriftStatus{}, false
+	default:
+		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate.NodeClaim), "action", driftStatus.Action).Error(
+			fmt.Errorf("unsupported drift action %q", driftStatus.Action), "skipping drift candidate")
+		return cloudprovider.DriftStatus{}, false
+	}
+}
+
+// commitDriftReboot commits an in-place reboot that the cloud provider resolves the candidate's drift with.
+func commitDriftReboot(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, clk clock.Clock, candidate *Candidate,
+	driftStatus cloudprovider.DriftStatus) (bool, error) {
+	return commitReboot(ctx, kubeClient, cluster, clk, candidate, v1.DisruptionReasonDrifted,
+		fmt.Sprintf("rebooting to resolve drift (%s)", driftStatus.Reason))
+}
+
+// rebootCommand records a committed reboot. The reboot controller already owns it, so the queue only records it.
+func rebootCommand(candidate *Candidate) Command {
+	return Command{
+		Candidates:          []*Candidate{candidate},
+		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+		Reboot:              true,
+	}
 }
 
 func (d *Drift) Reason() v1.DisruptionReason {

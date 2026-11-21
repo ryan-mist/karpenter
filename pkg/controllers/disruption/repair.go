@@ -165,11 +165,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 				continue
 			}
 			r.rebootHistory.RecordCommittedReboot(candidate.NodeClaim.UID)
-			return []Command{{
-				Candidates:          []*Candidate{candidate},
-				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-				Reboot:              true,
-			}}, nil
+			return []Command{rebootCommand(candidate)}, nil
 		}
 		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
 

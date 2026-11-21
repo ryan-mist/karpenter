@@ -21,6 +21,9 @@ import (
 	"math"
 
 	"github.com/samber/lo"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -36,21 +39,27 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
-// StaticDrift is a subreconciler that deletes drifted static candidates.
+// StaticDrift is a subreconciler that replaces drifted static candidates, or reboots them in place when the cloud
+// provider resolves their drift that way.
 type StaticDrift struct {
+	kubeClient    client.Client
 	cluster       *state.Cluster
 	provisioner   *provisioning.Provisioner
 	cloudprovider cloudprovider.CloudProvider
 	recorder      events.Recorder
+	clock         clock.Clock
 	backoff       *nodepoolbackoff.State
 }
 
-func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, recorder events.Recorder, backoff *nodepoolbackoff.State) *StaticDrift {
+func NewStaticDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider,
+	recorder events.Recorder, clk clock.Clock, backoff *nodepoolbackoff.State) *StaticDrift {
 	return &StaticDrift{
+		kubeClient:    kubeClient,
 		cluster:       cluster,
 		provisioner:   provisioner,
 		cloudprovider: cloudprovider,
 		recorder:      recorder,
+		clock:         clk,
 		backoff:       backoff,
 	}
 }
@@ -77,6 +86,16 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			continue
 		}
 
+		// A reboot keeps the node, so the replica, limits.nodes and terminate-first gates below, which guard a pre-spun
+		// replacement, don't apply to it. Reboots are committed first and consume the budget; only candidates the
+		// provider replaces, and the budget left over, go on to the replacement path.
+		rebootCmds, replaceCandidates, budget := d.commitReboots(ctx, npCandidates, disruptionBudgetMapping[npName])
+		cmds = append(cmds, rebootCmds...)
+		if len(replaceCandidates) == 0 || budget == 0 {
+			continue
+		}
+		npCandidates = replaceCandidates
+
 		limit, ok := np.Spec.Limits[resources.Node]
 		nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
 		// Current nodes (includes in‑flight per your cluster state)
@@ -88,7 +107,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		}
 
 		maxDrifts := lo.Min([]int64{
-			int64(disruptionBudgetMapping[np.Name]),
+			int64(budget),
 			int64(len(npCandidates)),
 		})
 
@@ -146,6 +165,38 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		}
 	}
 	return cmds, nil
+}
+
+// commitReboots asks the cloud provider how to resolve each candidate's drift until the reboots it commits use up the
+// budget. It returns the reboot commands, the ReplaceNode candidates, and the budget left for them. Every replacement
+// candidate seen is returned, not just as many as the budget allows, since the replacement path picks its own
+// candidates (for example the one holding a reservation slot). Candidates the provider can't decide on yet are skipped
+// this pass. A failed commit only skips its candidate, so the reboots already committed in this pass are still recorded.
+func (d *StaticDrift) commitReboots(ctx context.Context, candidates []*Candidate, budget int) ([]Command, []*Candidate, int) {
+	var cmds []Command
+	var replace []*Candidate
+	for _, c := range candidates {
+		if len(cmds) >= budget {
+			break
+		}
+		driftStatus, ok := resolveDriftStatus(ctx, d.cloudprovider, c)
+		if !ok {
+			continue
+		}
+		if driftStatus.Action != cloudprovider.RebootNode {
+			replace = append(replace, c)
+			continue
+		}
+		committed, err := commitDriftReboot(ctx, d.kubeClient, d.cluster, d.clock, c, driftStatus)
+		if err != nil {
+			log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(c.NodeClaim)).Error(err, "skipping static drift candidate, failed committing reboot")
+			continue
+		}
+		if committed {
+			cmds = append(cmds, rebootCommand(c))
+		}
+	}
+	return cmds, replace, budget - len(cmds)
 }
 
 // unreplaceableCommands handles a NodePool's candidates when it can't stage a replacement: with TerminateFirstDrift, each

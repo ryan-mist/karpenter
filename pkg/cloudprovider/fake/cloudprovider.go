@@ -69,7 +69,11 @@ type CloudProvider struct {
 	CreatedNodeClaims map[string]*v1.NodeClaim
 	Drifted           cloudprovider.DriftReason
 	// DriftAction is returned with Drifted; empty means ReplaceNode.
-	DriftAction               cloudprovider.DisruptionAction
+	DriftAction cloudprovider.DisruptionAction
+	// DriftStatuses and DriftStatusErrors override Drifted and DriftAction per NodeClaim name.
+	DriftStatuses             map[string]cloudprovider.DriftStatus
+	DriftStatusErrors         map[string]error
+	GetDriftStatusCalls       []string
 	NodeClassGroupVersionKind []schema.GroupVersionKind
 	RepairPolicy              []cloudprovider.RepairPolicy
 }
@@ -80,6 +84,8 @@ func NewCloudProvider() *CloudProvider {
 		CreatedNodeClaims:        map[string]*v1.NodeClaim{},
 		InstanceTypesForNodePool: map[string][]*cloudprovider.InstanceType{},
 		ErrorsForNodePool:        map[string]error{},
+		DriftStatuses:            map[string]cloudprovider.DriftStatus{},
+		DriftStatusErrors:        map[string]error{},
 	}
 }
 
@@ -103,6 +109,9 @@ func (c *CloudProvider) Reset() {
 	c.GetCalls = nil
 	c.Drifted = ""
 	c.DriftAction = ""
+	c.DriftStatuses = map[string]cloudprovider.DriftStatus{}
+	c.DriftStatusErrors = map[string]error{}
+	c.GetDriftStatusCalls = nil
 	c.NodeClassGroupVersionKind = []schema.GroupVersionKind{
 		{
 			Group:   "",
@@ -316,10 +325,17 @@ func (c *CloudProvider) Delete(_ context.Context, nc *v1.NodeClaim) error {
 	return cloudprovider.NewNodeClaimNotFoundError(serrors.Wrap(fmt.Errorf("no nodeclaim exists with provider id"), "provider-id", nc.Status.ProviderID))
 }
 
-func (c *CloudProvider) GetDriftStatus(context.Context, *v1.NodeClaim) (cloudprovider.DriftStatus, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func (c *CloudProvider) GetDriftStatus(_ context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	c.GetDriftStatusCalls = append(c.GetDriftStatusCalls, nodeClaim.Name)
+	if err, ok := c.DriftStatusErrors[nodeClaim.Name]; ok {
+		return cloudprovider.DriftStatus{}, err
+	}
+	if s, ok := c.DriftStatuses[nodeClaim.Name]; ok {
+		return s, nil
+	}
 	if c.Drifted == "" {
 		return cloudprovider.NotDrifted, nil
 	}
