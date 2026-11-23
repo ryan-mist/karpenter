@@ -387,6 +387,27 @@ var _ = Context("Scheduling", func() {
 				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 				ExpectScheduled(ctx, env.Client, pod)
 			})
+			DescribeTable("should schedule pods with negative preferences on restricted label keys",
+				func(key string, operator corev1.NodeSelectorOperator, values ...string) {
+					ExpectApplied(ctx, env.Client, nodePool)
+					pod := test.UnschedulablePod(test.PodOptions{
+						NodePreferences: []corev1.NodeSelectorRequirement{{Key: key, Operator: operator, Values: values}},
+					})
+					results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					Expect(results.PodErrors).To(BeEmpty())
+					Expect(results.NewNodeClaims).To(HaveLen(1))
+					_, err := prov.Create(ctx, results.NewNodeClaims[0])
+					Expect(err).ToNot(HaveOccurred())
+					nodeClaims := ExpectNodeClaims(ctx, env.Client)
+					Expect(nodeClaims).To(HaveLen(1))
+					Expect(lo.Map(nodeClaims[0].Spec.Requirements, func(r v1.NodeSelectorRequirementWithMinValues, _ int) string { return r.Key })).ToNot(ContainElement(key))
+					Expect(nodeClaims[0].Labels).ToNot(HaveKey(key))
+				},
+				Entry("annotation key used as a label, DoesNotExist", v1.NodePoolHashAnnotationKey, corev1.NodeSelectorOpDoesNotExist),
+				Entry("legacy provisioner-name label, DoesNotExist", "karpenter.sh/provisioner-name", corev1.NodeSelectorOpDoesNotExist),
+				Entry("unknown karpenter.sh label, NotIn", "karpenter.sh/foo", corev1.NodeSelectorOpNotIn, "bar"),
+				Entry("subdomain of karpenter.sh, DoesNotExist", "sub.karpenter.sh/foo", corev1.NodeSelectorOpDoesNotExist),
+			)
 			It("should schedule compatible node selectors, preferences and requirements", func() {
 				ExpectApplied(ctx, env.Client, nodePool)
 				pod := test.UnschedulablePod(

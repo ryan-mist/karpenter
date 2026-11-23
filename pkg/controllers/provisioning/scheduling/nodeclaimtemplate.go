@@ -96,7 +96,7 @@ func NewNodeClaimTemplate(nodePool *v1.NodePool) *NodeClaimTemplate {
 func (i *NodeClaimTemplate) resolveCustomLabelsFromRequirements() map[string]string {
 	labels := map[string]string{}
 	for key, requirement := range i.Requirements {
-		if v1.WellKnownLabels.Has(key) || v1.RestrictedLabels.Has(key) || schedulingSimulationKeys.Has(key) {
+		if v1.WellKnownLabels.Has(key) || v1.IsRestrictedLabel(key) != nil || schedulingSimulationKeys.Has(key) {
 			continue
 		}
 		if value := requirement.Any(); value != "" {
@@ -147,9 +147,9 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	// Karpenter can't reason about which label domains would belong to each instance type.
 	i.Labels = lo.Assign(i.Labels, i.resolveCustomLabelsFromRequirements())
 
-	// Exclude scheduling-simulation-only requirements from the actual NodeClaim.
+	// Exclude scheduling-simulation-only requirements and vacuous restricted requirements from the actual NodeClaim.
 	requirements := scheduling.NewRequirements(lo.Filter(i.Requirements.Values(), func(req *scheduling.Requirement, _ int) bool {
-		return !schedulingSimulationKeys.Has(req.Key)
+		return !schedulingSimulationKeys.Has(req.Key) && !isVacuousRestrictedRequirement(req)
 	})...)
 
 	nc := &v1.NodeClaim{
@@ -175,4 +175,17 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	}
 
 	return nc
+}
+
+// isVacuousRestrictedRequirement returns true for a NotIn/DoesNotExist requirement on a restricted label key (e.g. any
+// non-well-known key in the karpenter.sh domain). Pods can't require these keys (see Provisioner.Validate), but a
+// preferred node affinity such as "karpenter.sh/nodepool-hash DoesNotExist" is compatible with every NodeClaimTemplate
+// and so is merged into the NodeClaim's requirements during scheduling. Since NodePools can't set labels in restricted
+// domains, such a requirement is always satisfied and carries no information; persisting it would only cause the
+// NodeClaim to be rejected by the API server ('label domain "karpenter.sh" is restricted').
+func isVacuousRestrictedRequirement(req *scheduling.Requirement) bool {
+	if op := req.Operator(); op != corev1.NodeSelectorOpNotIn && op != corev1.NodeSelectorOpDoesNotExist {
+		return false
+	}
+	return v1.IsRestrictedLabel(req.Key) != nil
 }

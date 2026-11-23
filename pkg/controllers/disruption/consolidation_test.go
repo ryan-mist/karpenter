@@ -1059,6 +1059,59 @@ var _ = Describe("Consolidation", func() {
 			Entry("if the candidate is on-demand node", false),
 			Entry("if the candidate is spot node", true),
 		)
+		DescribeTable("can replace node when a pod has a negative preference on a restricted label",
+			func(spotToSpot bool) {
+				nodeClaim = lo.Ternary(spotToSpot, spotNodeClaim, nodeClaim)
+				node = lo.Ternary(spotToSpot, spotNode, node)
+				rs := test.ReplicaSet()
+				ExpectApplied(ctx, env.Client, rs)
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+				pod := test.Pod(test.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         "apps/v1",
+								Kind:               "ReplicaSet",
+								Name:               rs.Name,
+								UID:                rs.UID,
+								Controller:         new(true),
+								BlockOwnerDeletion: new(true),
+							},
+						}},
+					NodePreferences: []corev1.NodeSelectorRequirement{
+						{Key: "karpenter.sh/provisioner-name", Operator: corev1.NodeSelectorOpDoesNotExist},
+					}})
+				ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
+
+				ExpectManualBinding(ctx, env.Client, pod, node)
+
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+				ExpectSingletonReconciled(ctx, disruptionController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+
+				nodeClaims := ExpectNodeClaims(ctx, env.Client)
+				nodes := ExpectNodes(ctx, env.Client)
+				Expect(nodeClaims).To(HaveLen(1))
+				Expect(nodes).To(HaveLen(1))
+
+				Expect(nodeClaims[0].Name).ToNot(Equal(nodeClaim.Name))
+				Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Has(corev1.LabelInstanceTypeStable)).To(BeTrue())
+				Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Has(mostExpensiveInstance.Name)).To(BeFalse())
+
+				Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Has("karpenter.sh/provisioner-name")).To(BeFalse())
+
+				ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			},
+			Entry("if the candidate is on-demand node", false),
+			Entry("if the candidate is spot node", true),
+		)
 		DescribeTable("only requires Spot for an on-demand replacement when a Spot offering is available", func(spotAvailable bool) {
 			offerings := func(price float64) []cloudprovider.Offering {
 				return []cloudprovider.Offering{
