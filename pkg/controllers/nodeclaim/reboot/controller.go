@@ -23,11 +23,13 @@ package reboot
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reasonable"
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -48,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	rebootevents "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/reboot/events"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -63,6 +66,8 @@ const (
 	// Minimum graceful drain window, including forceful reboots, to catch late pod bindings.
 	// Mirrors the minimum-drain behavior from kubernetes-sigs/karpenter#2709.
 	minDrainTime = 5 * time.Second
+	// How long a reboot episode whose node never initialized is remembered, so it is counted once.
+	uninitializedTTL = 24 * time.Hour
 )
 
 // Controller drives the reboot lifecycle for NodeClaims carrying an active Rebooting condition.
@@ -77,6 +82,10 @@ type Controller struct {
 	// Process-local; a restart re-seeds the timeout in reconcileRequested.
 	issuanceStartedMu sync.Mutex
 	issuanceStarted   map[types.UID]time.Time
+
+	// Reboot episodes already reported as uninitialized after success. Process-local, so a restart may count an
+	// episode again.
+	uninitialized *cache.Cache
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, t *terminator.Terminator, recorder events.Recorder) *Controller {
@@ -87,6 +96,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		terminator:      t,
 		recorder:        recorder,
 		issuanceStarted: map[types.UID]time.Time{},
+		uninitialized:   cache.New(uninitializedTTL, time.Hour),
 	}
 }
 
@@ -113,8 +123,14 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	}
 
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-	// Only active reboots are reconciled here.
-	if cond == nil || !cond.IsTrue() {
+	if cond == nil {
+		return reconcile.Result{}, nil
+	}
+	if cond.IsFalse() && cond.Reason == v1.RebootReasonSucceeded {
+		return c.reconcileSucceeded(ctx, nodeClaim), nil
+	}
+	// Only active reboots are driven here.
+	if !cond.IsTrue() {
 		return reconcile.Result{}, nil
 	}
 	// Deleting NodeClaims are handled by termination.
@@ -155,6 +171,29 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	default:
 		return reconcile.Result{}, nil
 	}
+}
+
+// reconcileSucceeded reports a node that rebooted successfully but still hasn't initialized one observation window
+// after the reboot succeeded. Such a node keeps counting against its NodePool's disruption budgets and is excluded
+// from most disruption, so it is made visible rather than left to hold the budget silently.
+func (c *Controller) reconcileSucceeded(ctx context.Context, nodeClaim *v1.NodeClaim) reconcile.Result {
+	if !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() {
+		return reconcile.Result{}
+	}
+	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+	if remaining := cond.LastTransitionTime.Add(observationWindow).Sub(c.clock.Now()); remaining > 0 {
+		return reconcile.Result{RequeueAfter: remaining}
+	}
+	key := fmt.Sprintf("%s/%s", nodeClaim.UID, cond.LastTransitionTime.UTC().Format(time.RFC3339Nano))
+	if _, reported := c.uninitialized.Get(key); reported {
+		return reconcile.Result{}
+	}
+	c.uninitialized.SetDefault(key, nil)
+	c.recorder.Publish(rebootevents.RebootUninitialized(nodeClaim, observationWindow))
+	// No reason label: the disruption controller clears DisruptionReason as soon as the reboot ends.
+	RebootUninitializedTotal.Inc(map[string]string{})
+	log.FromContext(ctx).WithValues("window", observationWindow).Info("node rebooted but has not initialized")
+	return reconcile.Result{}
 }
 
 // reconcileRequested applies the scheduling fence, drains, then issues the provider reboot.
@@ -334,8 +373,9 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 	if err := c.removeRebootTaint(ctx, node); err != nil {
 		return reconcile.Result{}, err
 	}
-	// Capture durations before the terminal transition resets transition time.
+	// Capture durations and the reason before the terminal transition resets transition time.
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
+	reason := disruptionReason(nodeClaim)
 	recovery, hasRecovery := time.Duration(0), false
 	if issuedAt, ok := c.issuedAt(nodeClaim); ok {
 		recovery, hasRecovery = c.clock.Since(issuedAt), true
@@ -344,10 +384,10 @@ func (c *Controller) transitionToSucceeded(ctx context.Context, nodeClaim *v1.No
 		return reconcile.Result{}, err
 	}
 	// Record metrics only after the terminal state is persisted.
-	recordTerminalMetrics(resultSucceeded, duration)
+	recordTerminalMetrics(resultSucceeded, reason, duration)
 	if hasRecovery {
 		// Recovery time is measured from issuance to rejoin.
-		RebootRecoveryDurationSeconds.Observe(recovery.Seconds(), map[string]string{})
+		RebootRecoveryDurationSeconds.Observe(recovery.Seconds(), map[string]string{metrics.ReasonLabel: reason})
 	}
 	return reconcile.Result{}, nil
 }
@@ -360,6 +400,7 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 		}
 	}
 	duration := c.clock.Since(rebootRequestedAt(nodeClaim))
+	reason := disruptionReason(nodeClaim)
 	if result == resultInvalidRequest {
 		// Invalid requests fail without replacing the node.
 		if err := c.setTerminal(ctx, nodeClaim, v1.RebootReasonFailed, msg); err != nil {
@@ -381,7 +422,7 @@ func (c *Controller) transitionToFailed(ctx context.Context, nodeClaim *v1.NodeC
 	}
 	// Record events and metrics only after the terminal write succeeds.
 	c.recorder.Publish(rebootevents.RebootFailed(nodeClaim, msg))
-	recordTerminalMetrics(result, duration)
+	recordTerminalMetrics(result, reason, duration)
 	return reconcile.Result{}, nil
 }
 
@@ -515,7 +556,18 @@ func rebootOperationID(nodeClaim *v1.NodeClaim) string {
 }
 
 // Records the terminal result and total reboot duration.
-func recordTerminalMetrics(result string, duration time.Duration) {
-	RebootsTotal.Inc(map[string]string{resultLabel: result})
-	RebootDurationSeconds.Observe(duration.Seconds(), map[string]string{resultLabel: result})
+func recordTerminalMetrics(result, reason string, duration time.Duration) {
+	labels := map[string]string{resultLabel: result, metrics.ReasonLabel: reason}
+	RebootsTotal.Inc(labels)
+	RebootDurationSeconds.Observe(duration.Seconds(), labels)
+}
+
+// Returns the disruption reason that committed the reboot as a metric label value, or empty if there is none. The
+// disruption controller clears the condition once the reboot ends, so read it before the terminal transition.
+func disruptionReason(nodeClaim *v1.NodeClaim) string {
+	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason)
+	if !cond.IsTrue() {
+		return ""
+	}
+	return strings.ToLower(cond.Reason)
 }

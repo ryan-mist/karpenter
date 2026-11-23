@@ -100,6 +100,7 @@ var _ = Describe("Reboot Lifecycle", func() {
 		reboot.RebootsTotal.Reset()
 		reboot.RebootDurationSeconds.Reset()
 		reboot.RebootRecoveryDurationSeconds.Reset()
+		reboot.RebootUninitializedTotal.Reset()
 
 		nodePool = test.NodePool()
 		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
@@ -677,6 +678,92 @@ var _ = Describe("Reboot Lifecycle", func() {
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonIssued))
+		})
+	})
+
+	Context("Reason label", func() {
+		BeforeEach(func() {
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "reboot issued")
+			nodeClaim.Annotations[v1.RebootPreBootIDAnnotationKey] = "boot-1"
+			nodeClaim.Annotations[v1.RebootIssuedAtAnnotationKey] = env.Clock.Now().UTC().Format(time.RFC3339Nano)
+		})
+
+		It("labels a successful reboot with the disruption reason that committed it", func() {
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			node.Status.NodeInfo.BootID = "boot-2"
+			node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "succeeded", "reason": "drifted"})
+			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_duration_seconds", 1, map[string]string{"result": "succeeded", "reason": "drifted"})
+			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_recovery_duration_seconds", 1, map[string]string{"reason": "drifted"})
+		})
+
+		It("labels a failed reboot with the disruption reason that committed it", func() {
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonUnhealthy), string(v1.DisruptionReasonUnhealthy))
+			env.Clock.Step(21 * time.Minute)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "recovery_timeout", "reason": "unhealthy"})
+			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_duration_seconds", 1, map[string]string{"result": "recovery_timeout", "reason": "unhealthy"})
+		})
+
+		It("leaves the reason empty when the reboot carries no disruption reason", func() {
+			node.Status.NodeInfo.BootID = "boot-2"
+			node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+
+			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "succeeded", "reason": ""})
+		})
+	})
+
+	Context("RebootSucceeded", func() {
+		BeforeEach(func() {
+			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+			delete(nodeClaim.Annotations, v1.RebootTerminationGracePeriodAnnotationKey)
+		})
+
+		It("warns once when the node has not initialized one observation window after the reboot succeeded", func() {
+			nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+
+			// Within the window the controller only waits for initialization.
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(result.RequeueAfter).To(BeNumerically("~", 20*time.Minute, time.Second))
+			Expect(recorder.Calls(events.RebootUninitialized)).To(BeZero())
+			_, found := FindMetricWithLabelValues("karpenter_nodes_reboot_uninitialized_total", map[string]string{})
+			Expect(found).To(BeFalse())
+
+			env.Clock.Step(21 * time.Minute)
+			result = ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(result.IsZero()).To(BeTrue())
+			Expect(recorder.Calls(events.RebootUninitialized)).To(Equal(1))
+			ExpectMetricCounterValue(reboot.RebootUninitializedTotal, 1, map[string]string{})
+
+			// Later reconciles of the same episode don't count it again.
+			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			ExpectMetricCounterValue(reboot.RebootUninitializedTotal, 1, map[string]string{})
+
+			// The reboot itself is left alone.
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonSucceeded))
+			Expect(cloudProvider.RebootCalls).To(BeEmpty())
+		})
+
+		It("does not warn when the node initialized after the reboot", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			env.Clock.Step(21 * time.Minute)
+
+			result := ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
+			Expect(result.IsZero()).To(BeTrue())
+			Expect(recorder.Calls(events.RebootUninitialized)).To(BeZero())
+			_, found := FindMetricWithLabelValues("karpenter_nodes_reboot_uninitialized_total", map[string]string{})
+			Expect(found).To(BeFalse())
 		})
 	})
 })

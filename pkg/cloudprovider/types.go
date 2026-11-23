@@ -61,28 +61,54 @@ var (
 
 type DriftReason string
 
-// RepairAction identifies the operation requested by a repair policy.
-type RepairAction string
+// DisruptionAction identifies how core should disrupt a NodeClaim, for repair policies and drift.
+type DisruptionAction string
+
+// RepairAction is the action requested by a repair policy.
+//
+// Deprecated: use DisruptionAction.
+type RepairAction = DisruptionAction
 
 const (
+	// NoOp means no disruption is needed. It is only valid in a DriftStatus; repair policies must not use it.
+	NoOp DisruptionAction = "NoOp"
 	// RebootNode requests recovery of the existing Node through the provider reboot lifecycle.
-	RebootNode RepairAction = "RebootNode"
-	// ReplaceNode requests replacement of the unhealthy Node.
-	ReplaceNode RepairAction = "ReplaceNode"
+	RebootNode DisruptionAction = "RebootNode"
+	// ReplaceNode requests replacement of the Node.
+	ReplaceNode DisruptionAction = "ReplaceNode"
 )
 
-// IsMoreDisruptiveThan returns whether the repair action is more disruptive than another action.
+// DriftStatus is a CloudProvider's answer to whether, why and how a NodeClaim drifted.
+type DriftStatus struct {
+	// Action is NoOp when the NodeClaim has not drifted, ReplaceNode to replace it, or RebootNode when the provider
+	// resolves the drift in place through the reboot lifecycle.
+	Action DisruptionAction
+	// Reason is written as the Drifted condition reason. It is empty only when Action is NoOp.
+	Reason DriftReason
+}
+
+// NotDrifted is the DriftStatus for a NodeClaim that has not drifted.
+var NotDrifted = DriftStatus{Action: NoOp}
+
+// Drifted returns whether the status reports drift.
+func (s DriftStatus) Drifted() bool {
+	return s.Action != "" && s.Action != NoOp
+}
+
+// IsMoreDisruptiveThan returns whether the action is more disruptive than another action.
 // It panics if either action is unsupported.
-func (a RepairAction) IsMoreDisruptiveThan(other RepairAction) bool {
+func (a DisruptionAction) IsMoreDisruptiveThan(other DisruptionAction) bool {
 	return repairActionRank(a) > repairActionRank(other)
 }
 
-func repairActionRank(action RepairAction) int {
+func repairActionRank(action DisruptionAction) int {
 	switch action {
 	case ReplaceNode:
 		return 1
 	case RebootNode:
 		return 0
+	case NoOp:
+		return -1
 	default:
 		panic(fmt.Sprintf("unsupported repair action %q", action))
 	}
@@ -132,9 +158,11 @@ type CloudProvider interface {
 	// availability, the GetInstanceTypes method should always return all instance types,
 	// even those with no offerings available.
 	GetInstanceTypes(context.Context, *v1.NodePool) ([]*InstanceType, error)
-	// IsDrifted returns whether a NodeClaim has drifted from the provisioning requirements
-	// it is tied to.
-	IsDrifted(context.Context, *v1.NodeClaim) (DriftReason, error)
+	// GetDriftStatus returns whether a NodeClaim has drifted from the provisioning requirements it is tied to, why,
+	// and how core should resolve it. Providers that do not support in-place remediation never return RebootNode.
+	// A provider must return an error, not NoOp, while an in-place operation it started for the NodeClaim is
+	// unresolved, and must return ReplaceNode once that operation has failed toward the current target.
+	GetDriftStatus(context.Context, *v1.NodeClaim) (DriftStatus, error)
 	// Reboot restarts the instance backing the NodeClaim in place without terminating it.
 	// operationID identifies a logical reboot operation; providers with native idempotency should
 	// use it to make repeated calls for the same operation replay-safe. Reboot returns once the

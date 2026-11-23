@@ -194,10 +194,11 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 		return candidates
 	}
 
-	// Get all StateNodes for this NodePool
+	// Get all StateNodes for this NodePool. A rebooting node is drained and so looks empty, but it keeps its instance
+	// and comes back, so it is never picked; neither is one re-initializing after a reboot. Scale-down waits for them.
 	nodes := make([]*state.StateNode, 0)
 	for n := range c.cluster.Nodes() {
-		if n.Labels()[v1.NodePoolLabelKey] == np.Name && n.NodeClaim != nil && !n.MarkedForDeletion() {
+		if n.Labels()[v1.NodePoolLabelKey] == np.Name && n.NodeClaim != nil && !n.MarkedForDeletion() && !n.RebootInProgress() && !n.RebootReinitializing() {
 			nodes = append(nodes, n.DeepCopy())
 		}
 	}

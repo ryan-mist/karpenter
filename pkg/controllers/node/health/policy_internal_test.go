@@ -17,6 +17,7 @@ limitations under the License.
 package health
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"time"
@@ -29,6 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 var _ = Describe("Repair Policies", func() {
@@ -47,6 +51,21 @@ var _ = Describe("Repair Policies", func() {
 		Action:             cloudprovider.RebootNode,
 	}
 	negativeDuration := -time.Second
+
+	It("returns an error rather than panicking when a provider's repair policy uses NoOp", func() {
+		ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}}))
+		cp := fake.NewCloudProvider()
+		cp.RepairPolicy = []cloudprovider.RepairPolicy{{
+			ConditionType:   "AcceleratorReady",
+			ConditionStatus: corev1.ConditionFalse,
+			Action:          cloudprovider.NoOp,
+		}}
+		var matcher *RepairPolicyMatcher
+		var err error
+		Expect(func() { matcher, err = NewRepairPolicyMatcher(ctx, cp) }).NotTo(Panic())
+		Expect(err).To(MatchError(ContainSubstring(`action "NoOp"`)))
+		Expect(matcher).To(BeNil())
+	})
 
 	DescribeTable("validating complete policy sets",
 		func(policies []cloudprovider.RepairPolicy, actions sets.Set[cloudprovider.RepairAction], errorSubstring string) {
@@ -118,6 +137,44 @@ var _ = Describe("Repair Policies", func() {
 			[]cloudprovider.RepairPolicy{validSpecific, defaultFallback},
 			sets.New(cloudprovider.ReplaceNode),
 			`unsupported action "RebootNode"`,
+		),
+		Entry("rejects a NoOp action on a specific policy",
+			[]cloudprovider.RepairPolicy{{
+				ConditionType:   "AcceleratorReady",
+				ConditionStatus: corev1.ConditionFalse,
+				ReasonRegex:     "Ignorable",
+				Action:          cloudprovider.NoOp,
+			}, defaultFallback},
+			supportedRepairActions,
+			`action "NoOp", which is only valid in a DriftStatus`,
+		),
+		Entry("rejects a NoOp action on the default fallback",
+			[]cloudprovider.RepairPolicy{{
+				ConditionType:   "AcceleratorReady",
+				ConditionStatus: corev1.ConditionFalse,
+				Action:          cloudprovider.NoOp,
+			}},
+			supportedRepairActions,
+			`action "NoOp", which is only valid in a DriftStatus`,
+		),
+		Entry("rejects an empty action",
+			[]cloudprovider.RepairPolicy{{
+				ConditionType:   "AcceleratorReady",
+				ConditionStatus: corev1.ConditionFalse,
+				ReasonRegex:     "Empty",
+			}, defaultFallback},
+			supportedRepairActions,
+			`unsupported action ""`,
+		),
+		Entry("rejects an unknown action",
+			[]cloudprovider.RepairPolicy{{
+				ConditionType:   "AcceleratorReady",
+				ConditionStatus: corev1.ConditionFalse,
+				ReasonRegex:     "Unknown",
+				Action:          "Teleport",
+			}, defaultFallback},
+			supportedRepairActions,
+			`unsupported action "Teleport"`,
 		),
 		Entry("rejects a negative toleration",
 			[]cloudprovider.RepairPolicy{{

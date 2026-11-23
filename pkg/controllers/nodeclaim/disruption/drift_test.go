@@ -46,8 +46,8 @@ type erroringCloudProvider struct {
 	err error
 }
 
-func (e *erroringCloudProvider) IsDrifted(context.Context, *v1.NodeClaim) (cloudprovider.DriftReason, error) {
-	return "", e.err
+func (e *erroringCloudProvider) GetDriftStatus(context.Context, *v1.NodeClaim) (cloudprovider.DriftStatus, error) {
+	return cloudprovider.DriftStatus{}, e.err
 }
 
 var _ = Describe("Drift", func() {

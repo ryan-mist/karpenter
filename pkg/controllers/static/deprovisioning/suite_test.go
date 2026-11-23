@@ -576,6 +576,57 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 2, 0)
 
 			})
+			DescribeTable("should not pick rebooting nodes for scale-down",
+				func(markRebooting func(*v1.NodeClaim, *corev1.Node)) {
+					nodePool := test.StaticNodePool()
+					nodePool.Spec.Replicas = new(int64(2))
+
+					nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								v1.NodePoolLabelKey:            nodePool.Name,
+								v1.NodeInitializedLabelKey:     "true",
+								corev1.LabelInstanceTypeStable: "stable.instance",
+							},
+						},
+						Status: v1.NodeClaimStatus{
+							Capacity: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10"),
+								corev1.ResourceMemory: resource.MustParse("1000Mi"),
+							},
+						},
+					})
+					ExpectApplied(ctx, env.Client, nodePool)
+					// Nodes 1 and 2 carry workload, so the drained rebooting node 0 would otherwise be picked first.
+					for i := range 3 {
+						ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+						if i > 0 {
+							ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[i].Name}))
+						}
+					}
+					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
+					markRebooting(nodeClaims[0], nodes[0])
+					ExpectApplied(ctx, env.Client, nodeClaims[0], nodes[0])
+					ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[0]))
+					ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(nodes[0]))
+
+					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+					// One workload node is scaled down instead; the rebooting node is kept.
+					remainingNodeClaims := &v1.NodeClaimList{}
+					Expect(env.Client.List(ctx, remainingNodeClaims)).To(Succeed())
+					Expect(remainingNodeClaims.Items).To(HaveLen(2))
+					Expect(ExpectExists(ctx, env.Client, nodeClaims[0]).DeletionTimestamp.IsZero()).To(BeTrue())
+				},
+				Entry("while the reboot is in progress", func(nc *v1.NodeClaim, _ *corev1.Node) {
+					nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "rebooting")
+				}),
+				Entry("while the node re-initializes after the reboot", func(nc *v1.NodeClaim, node *corev1.Node) {
+					nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+					nc.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+					delete(node.Labels, v1.NodeInitializedLabelKey)
+				}),
+			)
 			It("should terminate non-empty nodes when empty nodes are insufficient", func() {
 				nodePool := test.StaticNodePool()
 				nodePool.Spec.Replicas = new(int64(1))
